@@ -4,6 +4,16 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- Projects and Repos scans are much lighter on the machine. They share one walk of the home folder (kept for about 10 minutes, dropped by any deletion, a rescan or a change of protected folders) instead of walking it twice, look at most 8 levels deep, and no longer enter package-like folders (`.app`, `.framework`, photo and music libraries, virtual machines, ...) or folders with more than 5,000 entries.
+- The walk compares paths against a precomputed protected list instead of resolving every path, reads up to 4 folders at a time at low priority, and runs at most 3 `du` or `git` processes at once.
+- Progress names the folder being searched, with running counts (`Searching Desktop/work/api… 1,240 folders, 37 found`).
+- The app starts the Projects and Repos scans when their screens are first opened (or a rescan is pressed), not at launch.
+- Measured sizes are remembered in `scan-cache.json` next to `settings.json` and reused while the build folder and its project are unchanged (7 days at most). The cache only holds numbers for display; the list of folders always comes from a real walk, and a project's idle time is always read from disk.
+
 ## [0.1.2] - 2026-11-14
 
 ### Changed

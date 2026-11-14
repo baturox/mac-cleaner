@@ -127,6 +127,8 @@ To grant it: **System Settings > Privacy & Security > Full Disk Access**, add *M
 5. **Explore** drills into any folder by size.
 6. **History** lists every deletion newest first (when, by which client, what, how much, how many failed), with a search over paths and names, filters by client and date, the items of each operation with *Reveal in Finder* for those that still exist, *Export…* (JSON or CSV) and *Clear history…*. Overview shows *Freed so far* from the same log. See [History and privacy](#history-and-privacy).
 
+The Projects and Repos scans walk your folders, which is the heavy part, so the app starts each one when you first open its screen (or press its rescan button), not at launch. Both use one shared walk of the scan roots, kept in memory for about 10 minutes; the rescan buttons, any deletion and a change of the protected folders start a fresh one. See [How Projects and Repos scan](#how-projects-and-repos-scan).
+
 Settings hold the protected folders and how old AI session data must be before it is offered (default 30 days). Both are stored in `~/Library/Application Support/MacCleaner/settings.json`, which the command-line tool reads too, so a folder you protect in the app is protected in the CLI. Deleting can be permanent or move items to the Trash.
 
 ## Using the CLI
@@ -201,6 +203,12 @@ Total 3.3 GB  in 3 folders - all rebuildable (npm install, cargo build, …)
 ```
 
 Options: `--days N` (default 30), `--min-mb N` (default 50), `--kind node_modules,target`, `--trash`, `-n`, `-y`. A folder inside a git repository is listed only when git reports no tracked file in it; that also holds when you scan a sub-folder of a repository (`projects app/ios`), because the repository above the folder you named is looked up first. The build folders of a repository whose git configuration is not trusted (see *Repos*), or in which git fails, are not listed, because checking them would mean running git there. *Idle* is the newest change anywhere in the project outside its build folders and `.git/objects`; a project too big to check completely (more than 100,000 entries) counts as touched today.
+
+#### How Projects and Repos scan
+
+Both scans use one walk of the scan root (the home folder by default) that finds build folders and git working copies together. The walk looks at most 8 levels below the root, never enters hidden folders, symbolic links, protected folders, `Library` and the other skipped top-level folders, or package-like folders (`.app`, `.framework`, `.photoslibrary`, virtual machine bundles and similar), and skips any folder with more than 5,000 entries (a data dump, not a project). Up to 4 folders are read at a time at low priority, and at most 3 `du` or `git` processes run at once. Progress shows the folder being searched, for example `Searching Desktop/work/api… 1,240 folders, 37 found`.
+
+The finished walk is kept in memory for about 10 minutes and shared, so opening Projects and Repos together reads the disk once. The CLI starts a fresh walk in every run. Measured sizes are remembered in `~/Library/Application Support/MacCleaner/scan-cache.json` (readable by you only) and reused for up to 7 days while the build folder and its project folder keep the same inode and modification time. A project's *idle* time is always read from disk; only a project already found too big to check (counted as touched today) is remembered as that for a day. That file only holds numbers for display: which folders are listed always comes from a real walk, and deleting re-checks the folder on disk. A damaged cache file is ignored and rewritten; deleting it is harmless. Because a folder's modification time does not change when a file deep inside it does, a size shown from the cache can be a little behind: rescan from the app, or remove the cache file, to measure everything again.
 
 ### Repos
 
