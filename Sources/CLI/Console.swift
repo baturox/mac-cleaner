@@ -108,10 +108,24 @@ final class StandardConsole: Console, @unchecked Sendable {
         return 100
     }
 
-    func out(_ line: String) { FileHandle.standardOutput.write(Data((TerminalText.render(line) + "\n").utf8)) }
-    func outRaw(_ text: String) { FileHandle.standardOutput.write(Data((text + "\n").utf8)) }
-    func err(_ line: String) { FileHandle.standardError.write(Data((TerminalText.render(line) + "\n").utf8)) }
-    func errRaw(_ text: String) { FileHandle.standardError.write(Data(text.utf8)) }
+    /// Plain write(2). `FileHandle.write` raises an Objective-C exception when the reader has gone
+    /// away (`mac-cleaner doctor | head`); here a closed stdout just ends the program quietly.
+    private func emit(_ text: String, to fd: Int32) {
+        var bytes = Array(text.utf8)
+        var offset = 0
+        while offset < bytes.count {
+            let n = bytes.withUnsafeMutableBytes { write(fd, $0.baseAddress! + offset, $0.count - offset) }
+            if n > 0 { offset += n; continue }
+            if n < 0 && errno == EINTR { continue }
+            if fd == STDOUT_FILENO && errno == EPIPE { exit(0) }
+            return
+        }
+    }
+
+    func out(_ line: String) { emit(TerminalText.render(line) + "\n", to: STDOUT_FILENO) }
+    func outRaw(_ text: String) { emit(text + "\n", to: STDOUT_FILENO) }
+    func err(_ line: String) { emit(TerminalText.render(line) + "\n", to: STDERR_FILENO) }
+    func errRaw(_ text: String) { emit(text, to: STDERR_FILENO) }
     func readLine() -> String? { Swift.readLine() }
 }
 
