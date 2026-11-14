@@ -181,6 +181,51 @@ struct PathGuard: Sendable {
     func blocks(_ path: String) -> Bool { isProtected(path) || containsProtected(path) }
 }
 
+extension PathGuard {
+    /// A copy of the answers of `isHidden(_:checkAncestors: false)` and `blocks(_:)` for one tree walk. The
+    /// walk starts from a canonical root and never follows a symlink, so every path it produces is already
+    /// canonical and `canonicalPath` (several `realpath` calls) is not needed per entry.
+    func walkGuard(root: String) -> WalkGuard {
+        var under = false
+        var dir = root
+        while dir.count > 1 {
+            if let id = FileID.of(dir), subtreeIDs.contains(id) { under = true; break }
+            dir = (dir as NSString).deletingLastPathComponent
+        }
+        return WalkGuard(foldedSubtrees: foldedSubtrees, foldedExact: foldedExact, subtreeIDs: subtreeIDs,
+                         exactIDs: exactIDs, rootUnderProtected: under)
+    }
+}
+
+/// See `PathGuard.walkGuard(root:)`. Names are compared folded; identity is looked up with one `lstat`.
+/// `blocks` assumes that every folder between the root and the path passed `isHidden` (as the walk does);
+/// whether the root or anything above it is a protected subtree is decided once, up front.
+struct WalkGuard: Sendable {
+    fileprivate let foldedSubtrees: [String]
+    fileprivate let foldedExact: Set<String>
+    fileprivate let subtreeIDs: Set<FileID>
+    fileprivate let exactIDs: Set<FileID>
+    fileprivate let rootUnderProtected: Bool
+
+    func isHidden(_ path: String) -> Bool {
+        let folded = foldedPath(path)
+        for root in foldedSubtrees where folded == root || folded.hasPrefix(root + "/") { return true }
+        if let id = FileID.of(path), subtreeIDs.contains(id) { return true }
+        return false
+    }
+
+    func blocks(_ path: String) -> Bool {
+        let folded = foldedPath(path)
+        if foldedExact.contains(folded) { return true }
+        for root in foldedSubtrees where folded == root || folded.hasPrefix(root + "/") { return true }
+        if let id = FileID.of(path), subtreeIDs.contains(id) || exactIDs.contains(id) { return true }
+        if rootUnderProtected { return true }
+        let prefix = folded == "/" ? "/" : folded + "/"
+        for root in foldedSubtrees where root.hasPrefix(prefix) { return true }
+        return false
+    }
+}
+
 /// The locations no code path may delete, for front ends that want to show them (`mac-cleaner doctor`).
 public enum ProtectedLocations {
     /// Built-in protected paths with the home folder written as "~". Entries with "*" are patterns.

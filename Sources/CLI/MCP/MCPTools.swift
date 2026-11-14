@@ -374,6 +374,7 @@ final class MCPTools: @unchecked Sendable {
         let minMB = try a.int("min_size_mb", default: 50, range: 1...1_000_000)
         let idle = try a.int("min_idle_days", default: 0, range: 0...100_000)
         let kinds = try a.strings("kinds", maxCount: 30, maxLength: 60).map { $0.lowercased() }
+        engine.discardScanCache()   // a long-lived server: every call reads the disk afresh
         let found = await engine.scanProjects(root: URL(fileURLWithPath: root, isDirectory: true), minBytes: Int64(minMB) * 1_000_000, progress: progress)
         try Task.checkCancellation()
         let acc = access(s.settings)
@@ -396,6 +397,7 @@ final class MCPTools: @unchecked Sendable {
         let a = try ToolArgs(raw, allowed: ["root", "multiple_only", "limit", "offset"])
         let root = try resolveFolder(try a.string("root"), s.settings)
         let multiple = try a.bool("multiple_only", default: false)
+        engine.discardScanCache()
         var groups = await engine.scanRepos(root: URL(fileURLWithPath: root, isDirectory: true), progress: progress)
         try Task.checkCancellation()
         if multiple { groups = groups.filter { $0.clones.count > 1 } }
@@ -465,6 +467,7 @@ final class MCPTools: @unchecked Sendable {
     private func growth(_ raw: [String: JSONValue], _ s: (settings: EngineSettings, problem: String?), _ progress: @escaping ProgressHandler) async throws -> ToolOutcome {
         _ = try ToolArgs(raw, allowed: [])
         let cats = try await categories(maxAge: 0, progress)
+        engine.discardScanCache()
         let artifacts = await engine.scanProjects(root: home, minBytes: 50_000_000, progress: progress)
         try Task.checkCancellation()
         let report = await engine.recordSnapshot(categories: cats, artifacts: artifacts)
@@ -567,6 +570,7 @@ final class MCPTools: @unchecked Sendable {
         if !ids.isEmpty || !groups.isEmpty { cats = try await categories(maxAge: 0, progress) }
         var artifacts: [ProjectArtifact] = []
         if let root {
+            engine.discardScanCache()
             artifacts = await engine.scanProjects(root: URL(fileURLWithPath: root, isDirectory: true), minBytes: Int64(minMB) * 1_000_000, progress: progress)
             try Task.checkCancellation()
         }
@@ -637,6 +641,7 @@ final class MCPTools: @unchecked Sendable {
             }
             // Build folders: re-scan the root; each folder must still be reported, as the same kind, in a project idle long enough.
             if !plan.artifacts.isEmpty, let root = plan.artifactRoot {
+                engine.discardScanCache()   // the re-check before deleting must read the disk now, never a kept walk
                 let current = await engine.scanProjects(root: URL(fileURLWithPath: root, isDirectory: true), minBytes: 1, progress: progress)
                 var chosen: [ProjectArtifact] = []
                 for planned in plan.artifacts {

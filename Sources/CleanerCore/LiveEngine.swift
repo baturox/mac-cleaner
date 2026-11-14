@@ -7,6 +7,8 @@ public struct LiveEngine: CleanerEngine {
     /// Who is driving this engine; written into every audit record.
     let client: AuditClient
     let appVersion: String
+    /// The finished walk of the Projects and Repos scans, shared by both (a class: this type is a struct).
+    let walkCache = WalkCache()
 
     /// `client` names the front end for the audit log; `appVersion` defaults to the bundle's version.
     public init(client: AuditClient = .cli, appVersion: String? = nil) {
@@ -23,6 +25,8 @@ public struct LiveEngine: CleanerEngine {
     // MARK: Settings & context
 
     public func configure(_ settings: EngineSettings) async {
+        // Protected folders decide what a walk reports, so a kept walk is dropped when they change.
+        if settingsBox.settings.protectedPaths != settings.protectedPaths { walkCache.invalidate() }
         settingsBox.settings = settings
     }
 
@@ -328,6 +332,8 @@ public struct LiveEngine: CleanerEngine {
     /// "started" record (the items about to be handled, fsynced) BEFORE anything is deleted. For a client
     /// that requires the log, a record that cannot be written means the operation does not begin.
     func begin(kind: AuditOperationKind, mode: DeleteMode, intended: [AuditItem]) async -> Beginning {
+        // Whatever happens next, a kept scan no longer describes the disk.
+        walkCache.invalidate()
         func refusal(_ why: String) -> Beginning {
             .refused(CleanResult(freedBytes: 0, failedCount: max(1, intended.count), messages: ["Nothing was deleted: \(why)."]))
         }
@@ -370,6 +376,7 @@ public struct LiveEngine: CleanerEngine {
             }
         }
         AuditActivity.end()
+        walkCache.invalidate()
         return CleanResult(freedBytes: max(after - op.before, 0), failedCount: failed, messages: messages, auditRecorded: recorded)
     }
 }

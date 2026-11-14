@@ -393,6 +393,13 @@ public protocol CleanerEngine: Sendable {
     /// `nestedRisk` describes what removing the folder would lose beyond the copy itself (linked worktrees
     /// that depend on it, nested repositories with unsaved work), which `force` would also remove.
     func inspectClones(_ urls: [URL]) async -> [CloneInspection]
+
+    // ---- v5 (default implementation below) ----
+
+    /// Forget the folder walk the Projects and Repos scans keep for a few minutes and share, so the next
+    /// scan reads the disk again. Front ends call it for an explicit rescan. Deleting and changing the
+    /// protected folders drop it by themselves.
+    func discardScanCache()
 }
 
 /// The current state of one working copy (see `CleanerEngine.inspectClones`).
@@ -426,4 +433,5 @@ public extension CleanerEngine {
     func clearAuditLog() async {}
     func auditLogProblem() async -> String? { nil }
     func inspectClones(_ urls: [URL]) async -> [CloneInspection] { [] }
+    func discardScanCache() {}
 }

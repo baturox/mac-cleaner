@@ -104,46 +104,16 @@ struct ArtifactCandidate: Sendable {
 enum ProjectWalker {
     static let skipTop: Set<String> = ["Library", "Applications", "Pictures", "Music", "Movies", "Public"]
 
-    /// Finds artifact candidates under `root`. Never descends into artifacts, `.git` or hidden folders and
-    /// not into protected paths. With `stopAtNestedRepos`, folders that are their own git working copy
-    /// (other than `root`) are skipped, so a repo's own artifacts are not mixed with nested clones'.
-    /// The scan root may itself lie inside a repository (`app/ios` of a clone at `app`), so the walk starts
-    /// knowing the nearest repository above it.
+    /// Finds artifact candidates under `root` (see `SharedWalker` for what is skipped). Never descends into
+    /// artifacts, `.git`, hidden folders, package folders and not into protected paths. With `stopAtNestedRepos`,
+    /// candidates inside nested git working copies (other than `root`) are left out, so a repo's own artifacts
+    /// are not mixed with nested clones'. The scan root may itself lie inside a repository (`app/ios` of a clone
+    /// at `app`), so candidates carry the nearest repository above it too.
     static func find(root: String, home: String, guardian: PathGuard, stopAtNestedRepos: Bool = false,
-                     flag: CancelFlag, progress: ProgressHandler = { _ in }) -> [ArtifactCandidate] {
-        var hits: [ArtifactCandidate] = []
-        var stack: [(dir: String, repo: String?)] = [(root, enclosingRepository(above: root, home: home))]
-        while let (dir, inheritedRepo) = stack.popLast() {
-            if flag.isSet { break }
-            if dir == root || (dir as NSString).deletingLastPathComponent == root {
-                progress("Searching \((dir as NSString).lastPathComponent)…")
-            }
-            guard let entries = readDir(dir) else { continue }
-            let names = Set(entries.map(\.name))
-            var repo = inheritedRepo
-            if names.contains(".git") {
-                if stopAtNestedRepos && dir != root { continue }
-                repo = dir
-            }
-            func add(_ path: String, _ kind: String, _ risky: Bool) {
-                if guardian.blocks(path) { return }
-                hits.append(ArtifactCandidate(path: path, kind: kind, project: dir, risky: risky, repoRoot: repo))
-            }
-            var descend: [(String, String?)] = []
-            for e in entries where e.isDir && !e.isLink {
-                let path = dir + "/" + e.name
-                if let m = ArtifactRules.match(name: e.name, parent: dir, siblings: names) { add(path, m.kind, m.risky); continue }
-                if e.name == "vendor", ArtifactRules.bundlerVendor(parent: dir, siblings: names) {
-                    add(path + "/bundle", "vendor/bundle", true); continue
-                }
-                if e.name.hasPrefix(".") { continue }
-                if dir == home && skipTop.contains(e.name) { continue }
-                if guardian.isHidden(path, checkAncestors: false) { continue }
-                descend.append((path, repo))
-            }
-            stack += descend
-        }
-        return hits
+                     flag: CancelFlag, progress: @escaping ProgressHandler = { _ in }) -> [ArtifactCandidate] {
+        let found = SharedWalker.walk(root: root, home: home, guardian: guardian, flag: flag, progress: progress).candidates
+        guard stopAtNestedRepos else { return found }
+        return found.filter { c in c.repoRoot.map { $0 == root || !$0.hasPrefix(root + "/") } ?? true }
     }
 
     /// The nearest folder strictly above `dir` that has a `.git` entry (folder or file). The climb ends at the
@@ -163,26 +133,31 @@ enum ProjectWalker {
     /// Fails CLOSED: when more than `maxEntries` entries would have to be examined, or something cannot be
     /// read, the answer is "now", so the project counts as touched today (idle 0 days).
     static func lastTouched(project: String, skipping: Set<String>, maxEntries: Int = 100_000) -> TimeInterval {
-        let now = Date().timeIntervalSince1970
+        let r = lastTouchedResult(project: project, skipping: skipping, maxEntries: maxEntries)
+        return r.failedClosed ? Date().timeIntervalSince1970 : r.newest
+    }
+
+    /// `lastTouched`, telling a real answer from the fail-closed one (so a caller can remember the difference).
+    static func lastTouchedResult(project: String, skipping: Set<String>, maxEntries: Int = 100_000) -> (newest: TimeInterval, failedClosed: Bool) {
         var newest: TimeInterval = 0
         var seen = 0
         var stack = [project]
         while let dir = stack.popLast() {
-            guard let entries = readDir(dir) else { return now }
+            guard let entries = readDir(dir) else { return (0, true) }
             let insideGitDir = (dir as NSString).lastPathComponent == ".git"
             for e in entries {
                 let path = dir + "/" + e.name
                 if skipping.contains(path) { continue }
                 if insideGitDir && e.name == "objects" { continue }
                 seen += 1
-                if seen > maxEntries { return now }
+                if seen > maxEntries { return (0, true) }
                 var st = stat()
-                guard lstat(path, &st) == 0 else { return now }
+                guard lstat(path, &st) == 0 else { return (0, true) }
                 newest = max(newest, TimeInterval(st.st_mtimespec.tv_sec) + TimeInterval(st.st_mtimespec.tv_nsec) / 1e9)
                 if e.isDir && !e.isLink { stack.append(path) }
             }
         }
-        return newest
+        return (newest, false)
     }
 }
 
@@ -202,7 +177,7 @@ enum GitArtifactFilter {
         }
         let grouped = byRepo
         let repos = Array(grouped.keys)
-        let results = await boundedMap(repos, limit: 6) { root -> [ArtifactCandidate] in
+        let results = await boundedMap(repos, limit: 3) { root -> [ArtifactCandidate] in
             let cands = grouped[root] ?? []
             guard case .trusted(let repo) = await Git.open(root, env: env) else { return [] }
             let rels = cands.map { relative($0.path, to: root) }
@@ -259,17 +234,6 @@ enum GitArtifactFilter {
 // MARK: - scanProjects
 
 extension LiveEngine {
-    /// Candidates under `root` that passed the git safety filter, with sizes not yet measured.
-    func artifactCandidates(root: String, stopAtNestedRepos: Bool = false, flag: CancelFlag,
-                            guardian: PathGuard, progress: @escaping ProgressHandler) async -> [ArtifactCandidate] {
-        let home = env.home
-        let raw = await onBackground {
-            ProjectWalker.find(root: root, home: home, guardian: guardian, stopAtNestedRepos: stopAtNestedRepos, flag: flag, progress: progress)
-        }
-        if flag.isSet { return [] }
-        return await GitArtifactFilter.filter(raw, env: env)
-    }
-
     /// Sizes for many paths: chunks measured concurrently, each chunk with one `du` call.
     static func measure(_ paths: [String]) async -> [String: Int64] {
         let chunks = stride(from: 0, to: paths.count, by: 40).map { Array(paths[$0..<min($0 + 40, paths.count)]) }
@@ -279,33 +243,27 @@ extension LiveEngine {
 
     public func scanProjects(root: URL, minBytes: Int64, progress: @escaping ProgressHandler) async -> [ProjectArtifact] {
         let rootPath = realPath(root.path) ?? root.path
-        let flag = CancelFlag()
-        let guardian = context().guardian
-        let candidates = await withTaskCancellationHandler {
-            await artifactCandidates(root: rootPath, flag: flag, guardian: guardian, progress: progress)
-        } onCancel: { flag.set() }
-        if Task.isCancelled { return [] }
-
-        let now = Date().timeIntervalSince1970
-        // Build folders (of this project and of projects nested in it) are not project activity.
-        let artifactPaths = Set(candidates.map(\.path))
-        let projects = Array(Set(candidates.map(\.project)))
-        let idleDays = await boundedMap(projects, limit: 6) { project -> Int in
-            await onBackground {
-                max(0, Int((now - ProjectWalker.lastTouched(project: project, skipping: artifactPaths)) / 86400))
+        guard let snapshot = await walkSnapshot(root: rootPath, progress: progress), !Task.isCancelled else { return [] }
+        let candidates = snapshot.candidates
+        return await PoliteScan.$enabled.withValue(true) {
+            let now = Date().timeIntervalSince1970
+            // Build folders (of this project and of projects nested in it) are not project activity.
+            let artifactPaths = Set(candidates.map(\.path))
+            let projects = Array(Set(candidates.map(\.project)))
+            progress("Checking activity in \(projects.count) projects…")
+            let touched = await self.projectActivity(projects.map { (path: $0, skipping: artifactPaths) })
+            let sizes = await self.measureArtifacts(candidates, progress: progress)
+            if Task.isCancelled { return [] }
+            var out: [ProjectArtifact] = []
+            for c in candidates {
+                let size = sizes[c.path] ?? 0
+                guard size >= minBytes, size > 0 else { continue }
+                let idle = max(0, Int((now - (touched[c.project] ?? now)) / 86400))
+                out.append(ProjectArtifact(url: URL(fileURLWithPath: c.path, isDirectory: true), kind: c.kind,
+                                           projectURL: URL(fileURLWithPath: c.project, isDirectory: true),
+                                           sizeBytes: size, idleDays: idle))
             }
+            return out.sorted { $0.sizeBytes > $1.sizeBytes }
         }
-        let idleByProject = Dictionary(uniqueKeysWithValues: zip(projects, idleDays))
-        progress("Measuring \(candidates.count) build folders…")
-        let sizes = await Self.measure(candidates.map(\.path))
-        var out: [ProjectArtifact] = []
-        for c in candidates {
-            let size = sizes[c.path] ?? 0
-            guard size >= minBytes, size > 0 else { continue }
-            out.append(ProjectArtifact(url: URL(fileURLWithPath: c.path, isDirectory: true), kind: c.kind,
-                                       projectURL: URL(fileURLWithPath: c.project, isDirectory: true),
-                                       sizeBytes: size, idleDays: idleByProject[c.project] ?? 0))
-        }
-        return out.sorted { $0.sizeBytes > $1.sizeBytes }
     }
 }

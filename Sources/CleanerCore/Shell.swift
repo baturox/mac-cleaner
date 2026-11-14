@@ -82,8 +82,9 @@ private final class ProcessHandle: @unchecked Sendable {
 }
 
 private func runBlocking(_ exe: String, _ args: [String], timeout: TimeInterval, environment: [String: String],
-                         directory: String?, handle: ProcessHandle) -> ProcResult {
+                         directory: String?, handle: ProcessHandle, lowPriority: Bool = false) -> ProcResult {
     let p = Process()
+    if lowPriority { p.qualityOfService = .utility }
     p.executableURL = URL(fileURLWithPath: exe)
     p.arguments = args
     p.environment = environment
@@ -123,14 +124,26 @@ private func runBlocking(_ exe: String, _ args: [String], timeout: TimeInterval,
 func runProcess(_ exe: String, _ args: [String], timeout: TimeInterval = 120,
                 environment: [String: String] = ChildEnvironment.system, directory: String? = nil) async -> ProcResult {
     let handle = ProcessHandle()
-    return await withTaskCancellationHandler {
+    // The project and repository scans start many `du` and `git` children: only a few at a time, at low priority.
+    let polite = PoliteScan.enabled
+    if polite { await PoliteScan.limiter.acquire() }
+    let result = await withTaskCancellationHandler {
         await withCheckedContinuation { (cont: CheckedContinuation<ProcResult, Never>) in
             DispatchQueue.global(qos: .utility).async {
                 cont.resume(returning: runBlocking(exe, args, timeout: timeout, environment: environment,
-                                                   directory: directory, handle: handle))
+                                                   directory: directory, handle: handle, lowPriority: polite))
             }
         }
     } onCancel: { handle.cancel() }
+    if polite { await PoliteScan.limiter.release() }
+    return result
+}
+
+/// Marks the work of the project and repository scans (a task-local, so it follows child tasks): child
+/// processes started inside it share a small limit and run at utility priority.
+enum PoliteScan {
+    @TaskLocal static var enabled = false
+    static let limiter = AsyncSemaphore(3)
 }
 
 // MARK: - du
@@ -176,6 +189,12 @@ struct DirEntry { var name: String; var isDir: Bool; var isLink: Bool }
 
 /// Lists a directory (including dotfiles) without following symlinks. nil if unreadable.
 func readDir(_ path: String) -> [DirEntry]? {
+    readDirLimited(path, max: Int.max)?.entries
+}
+
+/// Like `readDir`, but stops reading once more than `max` entries were seen (`overflow`), so a data folder
+/// with a huge entry count costs neither time nor memory.
+func readDirLimited(_ path: String, max: Int) -> (entries: [DirEntry], overflow: Bool)? {
     guard let d = opendir(path) else { return nil }
     defer { closedir(d) }
     var out: [DirEntry] = []
@@ -196,8 +215,9 @@ func readDir(_ path: String) -> [DirEntry]? {
             }
         }
         out.append(DirEntry(name: name, isDir: type == UInt8(DT_DIR), isLink: type == UInt8(DT_LNK)))
+        if out.count > max { return ([], true) }
     }
-    return out
+    return (out, false)
 }
 
 func globPaths(_ pattern: String) -> [String] {

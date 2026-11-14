@@ -338,32 +338,36 @@ extension LiveEngine {
 
     public func scanRepos(root: URL, progress: @escaping ProgressHandler) async -> [RepoGroup] {
         let rootPath = realPath(root.path) ?? root.path
-        let flag = CancelFlag()
-        let guardian = context().guardian
-        let home = env.home
         let env = self.env
-        let found = await withTaskCancellationHandler {
-            await onBackground { RepoWalker.find(root: rootPath, home: home, guardian: guardian, flag: flag, progress: progress) }
-        } onCancel: { flag.set() }
-        if Task.isCancelled { return [] }
+        guard let snapshot = await walkSnapshot(root: rootPath, progress: progress), !Task.isCancelled else { return [] }
+        let found = snapshot.repos
         progress("Inspecting \(found.count) repositories…")
 
+        // A repository's own build folders are the candidates whose nearest enclosing working copy it is, which
+        // leaves out those of nested clones, submodules and worktrees (as before, when each was walked alone).
+        var ownCandidates: [String: [ArtifactCandidate]] = [:]
+        let foundPaths = Set(found.map(\.path))
+        for c in snapshot.candidates { if let r = c.repoRoot, foundPaths.contains(r) { ownCandidates[r, default: []].append(c) } }
+        let own = ownCandidates
+
         struct Detail: Sendable { var state: RepoState; var size: Int64; var artifacts: Int64; var idle: Int }
-        let details = await boundedMap(found, limit: 6) { f -> Detail? in
-            if Task.isCancelled { return nil }
-            async let state = RepoInspector.inspect(path: f.path, isLinkedWorktree: f.isLinkedWorktree, env: env)
-            async let size = duSizes([f.path])
-            let cands = await self.artifactCandidates(root: f.path, stopAtNestedRepos: true, flag: CancelFlag(),
-                                                      guardian: guardian, progress: { _ in })
-            let artifactSizes = await Self.measure(cands.map(\.path))
-            let artifactBytes = artifactSizes.values.reduce(0, +)
-            let artifactPaths = Set(cands.map(\.path))
-            let touched = await onBackground { ProjectWalker.lastTouched(project: f.path, skipping: artifactPaths) }
-            let st = await state
-            let newest = max(touched, st.lastCommit?.timeIntervalSince1970 ?? 0)
-            let idle = max(0, Int((Date().timeIntervalSince1970 - newest) / 86400))
-            return Detail(state: st, size: (await size)[f.path] ?? 0, artifacts: artifactBytes, idle: idle)
+        let details: [Detail?] = await PoliteScan.$enabled.withValue(true) {
+            let artifactSizes = await self.measureArtifacts(own.values.flatMap { $0 }, progress: progress)
+            return await boundedMap(found, limit: 3) { f -> Detail? in
+                if Task.isCancelled { return nil }
+                async let state = RepoInspector.inspect(path: f.path, isLinkedWorktree: f.isLinkedWorktree, env: env)
+                async let size = duSizes([f.path])
+                let cands = own[f.path] ?? []
+                let artifactBytes = cands.reduce(Int64(0)) { $0 + (artifactSizes[$1.path] ?? 0) }
+                let activity = await self.projectActivity([(path: f.path, skipping: Set(cands.map(\.path)))])
+                let touched = activity[f.path] ?? Date().timeIntervalSince1970
+                let st = await state
+                let newest = max(touched, st.lastCommit?.timeIntervalSince1970 ?? 0)
+                let idle = max(0, Int((Date().timeIntervalSince1970 - newest) / 86400))
+                return Detail(state: st, size: (await size)[f.path] ?? 0, artifacts: artifactBytes, idle: idle)
+            }
         }
+        if Task.isCancelled { return [] }
 
         var groups: [String: (name: String, remote: String?, clones: [RepoClone])] = [:]
         var order: [String] = []
