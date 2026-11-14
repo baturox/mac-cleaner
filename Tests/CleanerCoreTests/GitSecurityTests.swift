@@ -26,8 +26,12 @@ final class GitSecurityTests: EngineTestCase {
     }
 
     /// Makes git re-read a tracked file (so content filters run) without waiting for the clock.
+    /// A different timestamp on every call: with one fixed value git may see nothing to refresh, and the
+    /// positive controls (which need git to rewrite its index) then fail now and then.
+    private var touchCount = 0.0
     private func touch(_ f: Fixture, _ rel: String) throws {
-        try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: 1_000_000_000)], ofItemAtPath: f.path(rel))
+        touchCount += 1
+        try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: 1_000_000_000 + touchCount * 60)], ofItemAtPath: f.path(rel))
     }
 
     private func appendConfig(_ path: String, _ text: String) throws {

@@ -78,16 +78,9 @@ Mac Cleaner knows these places. It shows what each one is, how big it is, whethe
 
 Each release also contains a `.zip` of the app, a CLI-only `.tar.gz`, and `SHA256SUMS` to verify the downloads.
 
-### First launch: the app is not notarized
+### Signed and notarized
 
-Release builds are **ad-hoc signed and not notarized by Apple** (notarization needs a paid developer account; see [Releases](#releases-and-signing) below). macOS Gatekeeper therefore warns the first time you open a downloaded copy. To open it anyway, do one of these:
-
-- Try to open the app once, then go to **System Settings > Privacy & Security** and click **Open Anyway** next to the Mac Cleaner message. On macOS 14 you can also right-click the app and choose **Open**.
-- Or remove the quarantine flag in Terminal:
-
-  ```sh
-  xattr -dr com.apple.quarantine "/Applications/Mac Cleaner.app"
-  ```
+Release builds from 0.1.2 on are **signed with a Developer ID and notarized by Apple**, so macOS opens the app and the `mac-cleaner` command without a Gatekeeper warning. Each release's notes say how that build was signed. (0.1.0 was ad-hoc signed and not notarized; use a newer release.)
 
 You are free to read the source and [build it yourself](#build-from-source) instead.
 
@@ -97,7 +90,7 @@ You are free to read the source and [build it yourself](#build-from-source) inst
 brew install --cask baturox/tap/mac-cleaner
 ```
 
-This installs the app into `/Applications` and links the `mac-cleaner` command, from the tap [`baturox/homebrew-tap`](https://github.com/baturox/homebrew-tap). The cask pins the SHA-256 of the release DMG. Because the release is not notarized, macOS blocks both the app and the `mac-cleaner` command until you allow them; see [First launch](#first-launch-the-app-is-not-notarized) above. The cask's source template is in [`packaging/homebrew/`](packaging/homebrew/mac-cleaner.rb).
+This installs the app into `/Applications` and links the `mac-cleaner` command, from the tap [`baturox/homebrew-tap`](https://github.com/baturox/homebrew-tap). The cask pins the SHA-256 of the release DMG. The cask's source template is in [`packaging/homebrew/`](packaging/homebrew/mac-cleaner.rb).
 
 ### Build from source
 

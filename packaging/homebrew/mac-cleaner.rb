@@ -10,8 +10,7 @@
 #   3. Copy dist/mac-cleaner.rb to `Casks/mac-cleaner.rb` in the tap repository, commit and push.
 #   4. Users then run:  brew install --cask baturox/tap/mac-cleaner
 #
-# Note: unless the release is notarized, macOS Gatekeeper blocks the app and the bundled CLI until the
-# user allows them (see the caveats below).
+# Note: a release that is not notarized is blocked by macOS Gatekeeper (app and bundled CLI).
 cask "mac-cleaner" do
   version "__VERSION__"
   sha256 "__SHA256__"
@@ -30,12 +29,4 @@ cask "mac-cleaner" do
 
   app "Mac Cleaner.app"
   binary "#{appdir}/Mac Cleaner.app/Contents/Resources/bin/mac-cleaner"
-
-  caveats <<~EOS
-    Mac Cleaner is not notarized by Apple yet, so macOS blocks it on first use
-    ("Apple could not verify..."). Choose Done, not Move to Trash, then either
-    open System Settings > Privacy & Security and click Open Anyway, or run:
-      xattr -dr com.apple.quarantine "#{appdir}/Mac Cleaner.app"
-    Until then the mac-cleaner command is stopped by macOS as well.
-  EOS
 end
