@@ -3,7 +3,10 @@
 #
 #   dist/MacCleaner-<version>.dmg                      drag-to-Applications disk image
 #   dist/MacCleaner-<version>.zip                      the app, signatures preserved (ditto)
-#   dist/mac-cleaner-<version>-macos-universal.tar.gz  the command-line tool only
+#   dist/mac-cleaner-<version>-macos-universal.tar.gz  the command-line tool only ("universal" only when
+#                                                      the binary really holds arm64 and x86_64; otherwise
+#                                                      the name carries the one architecture, and in CI
+#                                                      a non-universal build is an error)
 #   dist/SHA256SUMS
 #
 # Notarization runs only when credentials are present AND the app was signed with a Developer ID
@@ -16,17 +19,41 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
-case "${1:-}" in -h|--help) sed -n '2,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;; esac
+case "${1:-}" in -h|--help) sed -n '2,18p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;; esac
 
 VERSION="$(tr -d '[:space:]' < VERSION)"
 DIST="$ROOT/dist"
 APP="$DIST/Mac Cleaner.app"
 DMG="$DIST/MacCleaner-$VERSION.dmg"
 ZIP="$DIST/MacCleaner-$VERSION.zip"
-TGZ="$DIST/mac-cleaner-$VERSION-macos-universal.tar.gz"
 VOLNAME="Mac Cleaner"
 
 [ -d "$APP" ] || { echo "Missing $APP; run scripts/build-app.sh first." >&2; exit 1; }
+
+# Name the CLI tarball after what is really in it. "universal" is claimed only when both executables hold
+# both architectures; a single-architecture build made in CI is refused, because CI builds are published.
+has_arch() { lipo -archs "$1" | tr ' ' '\n' | grep -qx "$2"; }
+UNIVERSAL=1
+for bin in "$APP/Contents/MacOS/MacCleaner" "$APP/Contents/Resources/bin/mac-cleaner"; do
+  [ -f "$bin" ] || { echo "Missing $bin; rebuild." >&2; exit 1; }
+  if ! has_arch "$bin" arm64 || ! has_arch "$bin" x86_64; then UNIVERSAL=0; fi
+done
+if [ "$UNIVERSAL" = 1 ]; then
+  ARCH_LABEL=universal
+else
+  ARCH_LABEL="$(lipo -archs "$APP/Contents/Resources/bin/mac-cleaner" | tr ' ' '-')"
+  if [ "${CI:-}" = true ]; then
+    echo "ERROR: the app is not a universal build ($ARCH_LABEL only). In CI only universal builds are packaged." >&2
+    exit 1
+  fi
+  echo "WARNING: not a universal build; the artifacts contain $ARCH_LABEL only." >&2
+fi
+TGZ="$DIST/mac-cleaner-$VERSION-macos-$ARCH_LABEL.tar.gz"
+
+# Every temporary folder is removed on the way out, also when a step fails.
+TMPDIRS=()
+cleanup() { for d in ${TMPDIRS[@]+"${TMPDIRS[@]}"}; do rm -rf "$d"; done; }
+trap cleanup EXIT
 BUILT_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist")"
 [ "$BUILT_VERSION" = "$VERSION" ] || { echo "App is version $BUILT_VERSION but VERSION says $VERSION; rebuild." >&2; exit 1; }
 
@@ -42,16 +69,16 @@ if [ "$NOTARIZE" = 1 ] && [ -z "${CODESIGN_IDENTITY:-}" ]; then
   exit 1
 fi
 
-rm -f "$DMG" "$ZIP" "$TGZ" "$DIST/SHA256SUMS"
+rm -f "$DMG" "$ZIP" "$DIST"/mac-cleaner-"$VERSION"-macos-*.tar.gz "$DIST/SHA256SUMS"
 
 # 1. Notarize the app first so the stapled ticket ends up inside every artifact.
 if [ "$NOTARIZE" = 1 ]; then
   echo "==> Notarizing the app (this waits for Apple, usually a few minutes)"
-  TMPZIP="$(mktemp -d)/notarize.zip"
+  NOTARIZE_DIR="$(mktemp -d)"; TMPDIRS+=("$NOTARIZE_DIR")
+  TMPZIP="$NOTARIZE_DIR/notarize.zip"
   ditto -c -k --sequesterRsrc --keepParent "$APP" "$TMPZIP"
   xcrun notarytool submit "$TMPZIP" "${NOTARY_ARGS[@]}" --wait
   xcrun stapler staple "$APP"
-  rm -f "$TMPZIP"
 fi
 
 # 2. zip (ditto keeps signatures, symlinks and extended attributes intact).
@@ -60,8 +87,7 @@ ditto -c -k --sequesterRsrc --keepParent "$APP" "$ZIP"
 
 # 3. dmg with an /Applications symlink.
 echo "==> $(basename "$DMG")"
-STAGE="$(mktemp -d)"
-trap 'rm -rf "$STAGE"' EXIT
+STAGE="$(mktemp -d)"; TMPDIRS+=("$STAGE")
 cp -R "$APP" "$STAGE/"
 ln -s /Applications "$STAGE/Applications"
 hdiutil create -volname "$VOLNAME" -srcfolder "$STAGE" -fs HFS+ -format UDZO -imagekey zlib-level=9 -ov -quiet "$DMG"
@@ -76,24 +102,33 @@ fi
 
 # 4. CLI-only tarball.
 echo "==> $(basename "$TGZ")"
-CLISTAGE="$(mktemp -d)"
+CLISTAGE="$(mktemp -d)"; TMPDIRS+=("$CLISTAGE")
 cp "$APP/Contents/Resources/bin/mac-cleaner" "$CLISTAGE/mac-cleaner"
 cp LICENSE "$CLISTAGE/LICENSE"
 tar -czf "$TGZ" -C "$CLISTAGE" mac-cleaner LICENSE
-rm -rf "$CLISTAGE"
 
 # 5. Checksums.
 ( cd "$DIST" && shasum -a 256 "$(basename "$DMG")" "$(basename "$ZIP")" "$(basename "$TGZ")" > SHA256SUMS )
 echo "==> SHA256SUMS"
 cat "$DIST/SHA256SUMS"
 
+# What exactly was produced, in one of three states.
 if [ "$NOTARIZE" = 1 ]; then
-  echo "Notarized and stapled."
+  echo "Signed with a Developer ID ($CODESIGN_IDENTITY), notarized by Apple and stapled."
+elif [ -n "${CODESIGN_IDENTITY:-}" ]; then
+  cat <<NOTICE
+
+SIGNED, NOT NOTARIZED: the app and disk image are signed with a Developer ID ($CODESIGN_IDENTITY),
+but they were not submitted to Apple for notarization (no notary credentials were provided).
+Gatekeeper will warn on first launch: right-click the app and choose Open, or run
+  xattr -dr com.apple.quarantine "/Applications/Mac Cleaner.app"
+NOTICE
 else
   cat <<'NOTICE'
 
-NOT NOTARIZED: these artifacts are not notarized by Apple (no credentials were provided).
-Gatekeeper will warn on first launch: right-click the app and choose Open, or run
+AD-HOC SIGNED, NOT NOTARIZED: no signing identity and no notary credentials were provided, so macOS
+cannot tell who built this app. Gatekeeper will warn on first launch: right-click the app and choose
+Open, or run
   xattr -dr com.apple.quarantine "/Applications/Mac Cleaner.app"
 NOTICE
 fi

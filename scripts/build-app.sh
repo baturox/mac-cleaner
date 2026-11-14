@@ -10,6 +10,8 @@
 #   CODESIGN_IDENTITY   e.g. "Developer ID Application: Name (TEAMID)". When set, the app is signed with
 #                       the hardened runtime and a secure timestamp (needed for notarization).
 #                       Otherwise it is ad-hoc signed.
+#   CI                  when "true" (set by GitHub Actions), a release build that cannot be made universal
+#                       FAILS. Outside CI it falls back to the host architecture with a warning.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -21,7 +23,7 @@ for arg in "$@"; do
   case "$arg" in
     --open) OPEN_AFTER=1 ;;
     --debug) CONFIG=debug ;;
-    -h|--help) sed -n '2,13p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "build-app.sh: unknown option '$arg' (try --help)" >&2; exit 2 ;;
   esac
 done
@@ -44,11 +46,16 @@ YEAR="$(date +%Y)"
 
 echo "==> Building $APP_NAME $VERSION ($BUILD_NUMBER), $CONFIG"
 
-# 1. Compile. Universal (arm64 + x86_64) for release; fall back to the host architecture if that fails.
+# 1. Compile. Universal (arm64 + x86_64) for release. On a developer's machine a failed universal build
+#    falls back to the host architecture; in CI it is an error, because what CI builds gets published.
 ARCH_FLAGS=()
 if [ "$CONFIG" = release ]; then ARCH_FLAGS=(--arch arm64 --arch x86_64); fi
 if ! swift build -c "$CONFIG" ${ARCH_FLAGS[@]+"${ARCH_FLAGS[@]}"}; then
   if [ ${#ARCH_FLAGS[@]} -gt 0 ]; then
+    if [ "${CI:-}" = true ]; then
+      echo "ERROR: the universal build failed. In CI there is no fallback to a single architecture." >&2
+      exit 1
+    fi
     echo "WARNING: universal build failed; building for $(uname -m) only." >&2
     ARCH_FLAGS=()
     swift build -c "$CONFIG"
@@ -100,19 +107,19 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 PLIST
 plutil -lint "$APP/Contents/Info.plist" >/dev/null
 
-# 3. Sign. The nested CLI is signed first, then the bundle (no --deep with a real identity).
-if [ -n "${CODESIGN_IDENTITY:-}" ]; then
-  echo "==> Signing with '$CODESIGN_IDENTITY' (hardened runtime)"
-  codesign --force --sign "$CODESIGN_IDENTITY" --options runtime --timestamp \
-    --identifier "$BUNDLE_ID.cli" "$APP/Contents/Resources/bin/mac-cleaner"
-  codesign --force --sign "$CODESIGN_IDENTITY" --options runtime --timestamp \
-    --identifier "$BUNDLE_ID" "$APP"
-else
-  echo "==> Ad-hoc signing (set CODESIGN_IDENTITY for a Developer ID signature)"
-  codesign --force --deep --sign - "$APP"
+# 3. Sign (ad-hoc, or with CODESIGN_IDENTITY).
+"$ROOT/scripts/sign-app.sh" "$APP"
+
+# 4. A release build made in CI must contain both architectures in both executables.
+ARCHS="$(lipo -archs "$APP/Contents/MacOS/$EXECUTABLE")"
+if [ "$CONFIG" = release ] && [ "${CI:-}" = true ]; then
+  for bin in "$APP/Contents/MacOS/$EXECUTABLE" "$APP/Contents/Resources/bin/mac-cleaner"; do
+    for arch in arm64 x86_64; do
+      lipo -archs "$bin" | tr ' ' '\n' | grep -qx "$arch" || { echo "ERROR: $bin has no $arch slice ($(lipo -archs "$bin"))." >&2; exit 1; }
+    done
+  done
 fi
-codesign --verify --deep --strict "$APP"
 
 echo "==> Built: $APP"
-lipo -archs "$APP/Contents/MacOS/$EXECUTABLE" | sed 's/^/    architectures: /'
+echo "    architectures: $ARCHS"
 if [ "$OPEN_AFTER" = 1 ]; then open "$APP"; fi

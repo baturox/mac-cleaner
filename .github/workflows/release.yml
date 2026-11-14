@@ -2,7 +2,20 @@ name: Release
 
 # Runs when a tag like v0.1.0 is pushed. The tag must match the VERSION file.
 #
-# Optional secrets (the release still works without them, but is ad-hoc signed and NOT notarized):
+# Two jobs, so that nothing with access to the signing material ever compiles or tests code:
+#
+#   build    contents: read, no secrets, no environment. Checks the tag, builds, runs the tests, builds the
+#            universal app (ad-hoc signed) and hands it on as a workflow artifact.
+#   publish  the only job with `contents: write` and the only one that can read the signing and notarization
+#            secrets. It downloads the built app, signs it, packages it, notarizes it and creates the release
+#            as a DRAFT, which the maintainer publishes by hand after looking at it.
+#
+# The secrets live in the GitHub Environment `release`, not in the repository. The environment is what
+# decides who may use them: the maintainer must restrict it to `v*` tags and require a reviewer (repository
+# Settings > Environments > release; see CONTRIBUTING.md). A check written in this file could not do that,
+# because a tag can point at a commit that contains a different version of this file.
+#
+# Optional environment secrets (the release still works without them; the release notes say what was done):
 #   MACOS_CERTIFICATE_P12       base64 of a "Developer ID Application" certificate exported as .p12
 #   MACOS_CERTIFICATE_PASSWORD  password of that .p12
 #   MACOS_CODESIGN_IDENTITY     e.g. "Developer ID Application: Your Name (TEAMID)"
@@ -13,40 +26,54 @@ on:
   push:
     tags: ['v*']
 
-permissions:
-  contents: write   # create the release and upload assets
+# No permission by default; each job asks for what it needs.
+permissions: {}
+
+# One release run per tag at a time; a second push of the same tag waits instead of racing the first.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  release:
+  build:
+    name: Build and test (no secrets)
     runs-on: macos-26
-    timeout-minutes: 90
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     env:
-      HAS_CERT: ${{ secrets.MACOS_CERTIFICATE_P12 != '' && secrets.MACOS_CERTIFICATE_PASSWORD != '' && secrets.MACOS_CODESIGN_IDENTITY != '' }}
-      HAS_NOTARY: ${{ secrets.NOTARY_KEY_P8 != '' && secrets.NOTARY_KEY_ID != '' && secrets.NOTARY_ISSUER_ID != '' }}
+      CI: 'true'
     steps:
       # Pinned to a full commit SHA (the tag is in the comment; Dependabot updates both).
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
-      - name: Verify the tag points at a commit on main
+      # A convenience for the maintainer, NOT a security boundary: this file is part of the tagged commit,
+      # so a commit that is not on main could carry a copy without this step. The boundary is the `release`
+      # environment of the publish job.
+      - name: Check that the tag points at a commit on main
         run: |
-          # A tag can be pushed for any commit. Only what has been merged into main may be released.
           git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
           if ! git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main; then
             echo "::error::$GITHUB_REF_NAME ($GITHUB_SHA) is not an ancestor of origin/main. Merge first, then tag the merged commit."
             exit 1
           fi
 
-      - name: Verify the tag matches VERSION
+      - name: Check that the tag matches VERSION
+        id: version
         run: |
           VERSION="$(tr -d '[:space:]' < VERSION)"
           if [ "$GITHUB_REF_NAME" != "v$VERSION" ]; then
             echo "::error::Tag $GITHUB_REF_NAME does not match VERSION ($VERSION). Bump VERSION (and Sources/CLI/Version.swift) first."
             exit 1
           fi
-          scripts/changelog-section.sh "$VERSION" > "$RUNNER_TEMP/notes.md"
-          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          mkdir -p handoff
+          scripts/changelog-section.sh "$VERSION" > handoff/notes.md
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Toolchain
         run: |
@@ -59,6 +86,68 @@ jobs:
       - name: Test
         run: swift test
 
+      # CI=true: a build that is not universal fails here instead of falling back to one architecture.
+      - name: Build the app bundle (universal, ad-hoc signed)
+        run: scripts/build-app.sh
+
+      - name: Verify the bundle
+        run: |
+          codesign --verify --deep --strict "dist/Mac Cleaner.app"
+          plutil -lint "dist/Mac Cleaner.app/Contents/Info.plist"
+          "dist/Mac Cleaner.app/Contents/Resources/bin/mac-cleaner" --version
+          for bin in "dist/Mac Cleaner.app/Contents/MacOS/MacCleaner" "dist/Mac Cleaner.app/Contents/Resources/bin/mac-cleaner"; do
+            archs="$(lipo -archs "$bin")"
+            echo "$bin: $archs"
+            case " $archs " in *" arm64 "*) ;; *) echo "::error::$bin has no arm64 slice"; exit 1 ;; esac
+            case " $archs " in *" x86_64 "*) ;; *) echo "::error::$bin has no x86_64 slice"; exit 1 ;; esac
+          done
+
+      # tar keeps modes and the bundle's layout; the artifact store alone would not.
+      - name: Pack the app for the publish job
+        run: tar -cf handoff/app.tar -C dist "Mac Cleaner.app"
+
+      - name: Hand the build over
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-build
+          path: handoff/
+          retention-days: 3
+          if-no-files-found: error
+
+  publish:
+    name: Sign, notarize and draft the release
+    needs: build
+    runs-on: macos-26
+    timeout-minutes: 90
+    # The secrets below exist only in this environment. Its protection rules (allowed tags, required
+    # reviewer) are set in the repository settings and gate this job before any step runs.
+    environment: release
+    permissions:
+      contents: write   # create the draft release and upload its assets
+    env:
+      CI: 'true'
+      VERSION: ${{ needs.build.outputs.version }}
+      HAS_CERT: ${{ secrets.MACOS_CERTIFICATE_P12 != '' && secrets.MACOS_CERTIFICATE_PASSWORD != '' && secrets.MACOS_CODESIGN_IDENTITY != '' }}
+      HAS_NOTARY: ${{ secrets.NOTARY_KEY_P8 != '' && secrets.NOTARY_KEY_ID != '' && secrets.NOTARY_ISSUER_ID != '' }}
+    steps:
+      # Only for the packaging scripts, VERSION and LICENSE. Nothing is compiled or tested in this job.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Fetch the build
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-build
+          path: handoff
+
+      - name: Unpack the app
+        run: |
+          mkdir -p dist
+          tar -xf handoff/app.tar -C dist
+          cp handoff/notes.md "$RUNNER_TEMP/notes.md"
+          codesign --verify --deep --strict "dist/Mac Cleaner.app"
+
       - name: Import signing certificate
         if: env.HAS_CERT == 'true'
         env:
@@ -66,11 +155,13 @@ jobs:
           MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
           MACOS_CODESIGN_IDENTITY: ${{ secrets.MACOS_CODESIGN_IDENTITY }}
         # About the passwords on command lines below: `security` only accepts them as arguments (-p / -P);
-        # it has no option to read them from stdin or a file. They are therefore visible in the process list
-        # of this single-use runner for the fraction of a second each command runs. They are never echoed
-        # (no `set -x`; GitHub masks secret values in logs), the keychain password is random and used once,
-        # and the keychain and every key file are deleted by the "Remove signing material" step below, which
-        # runs even when the job fails.
+        # it has no option to read them from stdin or a file. Three commands are affected: create-keychain
+        # and unlock-keychain and set-key-partition-list take the keychain password (random, used once),
+        # and import takes the certificate password. They are visible in the process list of this
+        # single-use runner for the fraction of a second each command runs. They are never echoed (no
+        # `set -x`; GitHub masks secret values in logs), the output of set-key-partition-list (which lists
+        # key attributes) is discarded, and the keychain and every key file are deleted by the "Remove
+        # signing material" step below, which runs even when the job fails.
         run: |
           set +x
           umask 077
@@ -81,7 +172,7 @@ jobs:
           security set-keychain-settings -lut 21600 "$KEYCHAIN"
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
           security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
-          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" > /dev/null
           security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
           rm -f "$RUNNER_TEMP/cert.p12"
           echo "CODESIGN_IDENTITY=$MACOS_CODESIGN_IDENTITY" >> "$GITHUB_ENV"
@@ -100,38 +191,46 @@ jobs:
           echo "NOTARY_KEY_ID=$KEY_ID" >> "$GITHUB_ENV"
           echo "NOTARY_ISSUER_ID=$ISSUER_ID" >> "$GITHUB_ENV"
 
-      - name: Build the app bundle
-        run: scripts/build-app.sh
+      # Replaces the ad-hoc signature of the build job with the Developer ID signature (when there is one).
+      - name: Sign the app
+        if: env.HAS_CERT == 'true'
+        run: scripts/sign-app.sh "dist/Mac Cleaner.app"
 
       - name: Package (and notarize when credentials exist)
         run: scripts/package.sh
 
       - name: Release notes
         run: |
-          if [ "$HAS_CERT" != 'true' ] || [ "$HAS_NOTARY" != 'true' ]; then
-            {
-              echo
-              echo "> **Not notarized.** This build is ad-hoc signed. On first launch macOS will warn:"
+          {
+            echo
+            if [ "$HAS_CERT" = 'true' ] && [ "$HAS_NOTARY" = 'true' ]; then
+              echo "> **Signed and notarized.** This build is signed with a Developer ID and notarized by Apple."
+            elif [ "$HAS_CERT" = 'true' ]; then
+              echo "> **Signed, not notarized.** This build is signed with a Developer ID but was not notarized by Apple."
+              echo "> On first launch macOS will warn: right-click the app and choose **Open**, or run"
+              echo "> \`xattr -dr com.apple.quarantine \"/Applications/Mac Cleaner.app\"\`."
+            else
+              echo "> **Ad-hoc signed, not notarized.** macOS cannot tell who built this app. On first launch it will warn:"
               echo "> right-click the app and choose **Open**, or run"
               echo "> \`xattr -dr com.apple.quarantine \"/Applications/Mac Cleaner.app\"\`."
-            } >> "$RUNNER_TEMP/notes.md"
-          fi
-          {
+            fi
             echo
             echo "SHA-256 checksums are in \`SHA256SUMS\`."
           } >> "$RUNNER_TEMP/notes.md"
 
-      - name: Create the GitHub release
+      # A draft: nothing is public until the maintainer has looked at the assets and pressed Publish.
+      - name: Create the draft GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          FLAGS=()
+          FLAGS=(--draft)
           case "$VERSION" in *-*) FLAGS+=(--prerelease) ;; esac
           gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
             --title "Mac Cleaner $GITHUB_REF_NAME" \
             --notes-file "$RUNNER_TEMP/notes.md" \
             --verify-tag \
-            ${FLAGS[@]+"${FLAGS[@]}"} \
+            "${FLAGS[@]}" \
             "dist/MacCleaner-$VERSION.dmg" \
             "dist/MacCleaner-$VERSION.zip" \
             "dist/mac-cleaner-$VERSION-macos-universal.tar.gz" \

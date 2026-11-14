@@ -35,7 +35,7 @@ body:
     id: level
     attributes:
       label: Safe or caution?
-      description: "Safe = rebuilt or re-downloaded automatically with nothing lost. Caution = real data a user may want (models, archives, history)."
+      description: "Safe = a cache or build output that the tool creates again when it needs it, with nothing lost. Caution = real data a user may want, or anything nothing rebuilds (models, archives, history, devices, snapshots)."
       options:
         - Safe
         - Caution
