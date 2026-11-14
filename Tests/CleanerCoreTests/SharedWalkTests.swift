@@ -472,6 +472,90 @@ final class SharedWalkTests: EngineTestCase {
         let fresh = await engine.projectActivity([(path: project, skipping: [])], now: Date().addingTimeInterval(2 * 86_400))
         XCTAssertLessThan(fresh[project] ?? .infinity, Date().timeIntervalSince1970 - 60 * 86_400, "a day later it is walked again")
     }
+
+    // MARK: Whole working copies and the cheaper idle check
+
+    private func poisonClones(_ engine: LiveEngine) {
+        var file = engine.measurementCache.load()
+        for i in (file.clones ?? []).indices { file.clones![i].sizeBytes = 12_345 }
+        engine.measurementCache.save(file)
+    }
+
+    func testCloneSizeIsReusedUntilTheWorkingCopyOrItsGitFolderChanges() async throws {
+        let f = try Fixture()
+        try f.file("code/app/.git/HEAD", "ref: refs/heads/main\n")
+        try f.file("code/app/src/main.c", bytes: 30_000)
+        let clone = f.path("code/app")
+        let engine = f.engine()
+        let first = await engine.measureClones([clone])
+        XCTAssertGreaterThan(first[clone] ?? 0, 0)
+        XCTAssertEqual(engine.measurementCache.load().clones?.count, 1)
+
+        poisonClones(engine)
+        var sizes = await engine.measureClones([clone])
+        XCTAssertEqual(sizes[clone], 12_345, "unchanged: reused")
+
+        // git rewrote something directly in .git (index, HEAD): its modification time moves.
+        try await Task.sleep(nanoseconds: 20_000_000)
+        try f.file("code/app/.git/index", "x")
+        sizes = await engine.measureClones([clone])
+        XCTAssertNotEqual(sizes[clone], 12_345)
+
+        poisonClones(engine)
+        try await Task.sleep(nanoseconds: 20_000_000)
+        try f.file("code/app/new.txt", "x")
+        sizes = await engine.measureClones([clone])
+        XCTAssertNotEqual(sizes[clone], 12_345, "the working copy's top level changed")
+
+        poisonClones(engine)
+        sizes = await engine.measureClones([clone], now: Date().addingTimeInterval(MeasurementCache.cloneSizeLifetime + 120))
+        XCTAssertNotEqual(sizes[clone], 12_345, "older than a day: measured again")
+    }
+
+    func testLinkedWorktreeSizeFollowsTheFolderItsGitFileNames() async throws {
+        let f = try Fixture()
+        try f.file("code/main/.git/worktrees/wt/HEAD", "ref: refs/heads/x\n")
+        try f.file("code/wt/.git", "gitdir: " + f.path("code/main/.git/worktrees/wt") + "\n")
+        try f.file("code/wt/a.txt", bytes: 30_000)
+        let clone = f.path("code/wt")
+        let engine = f.engine()
+        _ = await engine.measureClones([clone])
+        poisonClones(engine)
+        var sizes = await engine.measureClones([clone])
+        XCTAssertEqual(sizes[clone], 12_345)
+        try await Task.sleep(nanoseconds: 20_000_000)
+        try f.file("code/main/.git/worktrees/wt/index", "x")
+        sizes = await engine.measureClones([clone])
+        XCTAssertNotEqual(sizes[clone], 12_345)
+
+        // A `.git` file that names nothing usable is never cached.
+        try f.file("code/odd/.git", "nonsense")
+        try f.file("code/odd/a.txt", bytes: 10_000)
+        _ = await engine.measureClones([f.path("code/odd")])
+        XCTAssertFalse((engine.measurementCache.load().clones ?? []).contains { $0.path == f.path("code/odd") })
+    }
+
+    func testIdleCheckStopsEarlyOnlyWhenTheAnswerIsAlreadyZeroDays() throws {
+        let f = try Fixture()
+        try f.file("p/old/a.txt", "x")
+        try f.file("p/old/b.txt", "x")
+        let old = Date().addingTimeInterval(-40 * 86400)
+        for rel in ["p/old/a.txt", "p/old/b.txt", "p/old", "p"] {
+            try FileManager.default.setAttributes([.modificationDate: old], ofItemAtPath: f.path(rel))
+        }
+        let now = Date().timeIntervalSince1970
+        let full = ProjectWalker.lastTouchedResult(project: f.path("p"), skipping: [])
+        let early = ProjectWalker.lastTouchedResult(project: f.path("p"), skipping: [], stopAfter: now - 86400 + 60)
+        XCTAssertEqual(full.newest, early.newest, "an idle project is walked completely either way")
+        XCTAssertFalse(early.failedClosed)
+
+        try f.file("p/old/fresh.txt", "x")
+        let active = ProjectWalker.lastTouchedResult(project: f.path("p"), skipping: [], stopAfter: now - 86400 + 60)
+        XCTAssertGreaterThan(active.newest, now - 86400, "something from today was seen: zero idle days")
+        // The entry limit still fails closed.
+        XCTAssertTrue(ProjectWalker.lastTouchedResult(project: f.path("p"), skipping: [], maxEntries: 1, stopAfter: now - 86400 + 60).failedClosed
+                      || active.newest > now - 86400)
+    }
 }
 
 final class MessageBox: @unchecked Sendable {

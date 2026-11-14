@@ -138,23 +138,35 @@ enum ProjectWalker {
     }
 
     /// `lastTouched`, telling a real answer from the fail-closed one (so a caller can remember the difference).
-    static func lastTouchedResult(project: String, skipping: Set<String>, maxEntries: Int = 100_000) -> (newest: TimeInterval, failedClosed: Bool) {
+    /// With `stopAfter`, the walk ends as soon as something newer than that moment is seen: a caller that only
+    /// needs whole idle days gets the same answer (zero) without walking the rest of an active project.
+    /// Each folder is read once and its entries are examined relative to that open folder, which costs far
+    /// less than resolving every full path again.
+    static func lastTouchedResult(project: String, skipping: Set<String>, maxEntries: Int = 100_000,
+                                  stopAfter: TimeInterval? = nil) -> (newest: TimeInterval, failedClosed: Bool) {
         var newest: TimeInterval = 0
         var seen = 0
         var stack = [project]
         while let dir = stack.popLast() {
-            guard let entries = readDir(dir) else { return (0, true) }
+            guard let d = opendir(dir) else { return (0, true) }
+            defer { closedir(d) }
+            let fd = dirfd(d)
             let insideGitDir = (dir as NSString).lastPathComponent == ".git"
-            for e in entries {
-                let path = dir + "/" + e.name
+            while let ent = readdir(d) {
+                let name = withUnsafePointer(to: &ent.pointee.d_name) {
+                    $0.withMemoryRebound(to: CChar.self, capacity: Int(ent.pointee.d_namlen) + 1) { String(cString: $0) }
+                }
+                if name == "." || name == ".." { continue }
+                let path = dir + "/" + name
                 if skipping.contains(path) { continue }
-                if insideGitDir && e.name == "objects" { continue }
+                if insideGitDir && name == "objects" { continue }
                 seen += 1
                 if seen > maxEntries { return (0, true) }
                 var st = stat()
-                guard lstat(path, &st) == 0 else { return (0, true) }
+                guard fstatat(fd, name, &st, AT_SYMLINK_NOFOLLOW) == 0 else { return (0, true) }
                 newest = max(newest, TimeInterval(st.st_mtimespec.tv_sec) + TimeInterval(st.st_mtimespec.tv_nsec) / 1e9)
-                if e.isDir && !e.isLink { stack.append(path) }
+                if let stopAfter, newest > stopAfter { return (newest, false) }
+                if st.st_mode & S_IFMT == S_IFDIR { stack.append(path) }
             }
         }
         return (newest, false)
@@ -249,10 +261,13 @@ extension LiveEngine {
             let now = Date().timeIntervalSince1970
             // Build folders (of this project and of projects nested in it) are not project activity.
             let artifactPaths = Set(candidates.map(\.path))
-            let projects = Array(Set(candidates.map(\.project)))
+            let sizes = await self.measureArtifacts(candidates, progress: progress)
+            if Task.isCancelled { return [] }
+            // Activity is only looked up for projects that will be listed: walking a project is the slow part.
+            let listed = candidates.filter { let size = sizes[$0.path] ?? 0; return size >= minBytes && size > 0 }
+            let projects = Array(Set(listed.map(\.project)))
             progress("Checking activity in \(projects.count) projects…")
             let touched = await self.projectActivity(projects.map { (path: $0, skipping: artifactPaths) })
-            let sizes = await self.measureArtifacts(candidates, progress: progress)
             if Task.isCancelled { return [] }
             var out: [ProjectArtifact] = []
             for c in candidates {

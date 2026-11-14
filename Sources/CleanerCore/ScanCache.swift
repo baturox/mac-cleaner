@@ -41,6 +41,8 @@ struct ScanCacheFile: Codable, Equatable, Sendable {
     var version = 1
     var artifacts: [ArtifactMeasurement] = []
     var projects: [ProjectActivity] = []
+    /// Whole working copies (the Repos screen). `folder` is the working copy, `project` its `.git` folder.
+    var clones: [ArtifactMeasurement]? = nil
 }
 
 struct MeasurementCache: Sendable {
@@ -52,6 +54,9 @@ struct MeasurementCache: Sendable {
     static let sizeLifetime: TimeInterval = 7 * 86400
     /// How long a "too big to check" project stays remembered as touched today.
     static let activityLifetime: TimeInterval = 86400
+    /// A working copy's total size is reused for a day at most: edits deep inside it do not show in the
+    /// stamps of the two folders that are compared.
+    static let cloneSizeLifetime: TimeInterval = 86400
 
     /// Saves from the app's two scans (and several engines in a test run) are serialized, and merged with what
     /// is on disk, so one scan does not drop the other's entries.
@@ -80,6 +85,9 @@ struct MeasurementCache: Sendable {
         for p in file.projects where (projects[p.path]?.measuredAt ?? 0) <= p.measuredAt { projects[p.path] = p }
         merged.artifacts = Array(artifacts.values.sorted { $0.measuredAt > $1.measuredAt }.prefix(Self.maxEntries))
         merged.projects = Array(projects.values.sorted { $0.measuredAt > $1.measuredAt }.prefix(Self.maxEntries))
+        var clones = Dictionary((merged.clones ?? []).map { ($0.path, $0) }, uniquingKeysWith: { a, _ in a })
+        for c in file.clones ?? [] where (clones[c.path]?.measuredAt ?? 0) <= c.measuredAt { clones[c.path] = c }
+        merged.clones = Array(clones.values.sorted { $0.measuredAt > $1.measuredAt }.prefix(Self.maxEntries))
         do {
             try DataFolder.prepare(fileURL.deletingLastPathComponent())
             try JSONEncoder().encode(merged).write(to: fileURL, options: [.atomic])
@@ -134,6 +142,60 @@ extension LiveEngine {
         return sizes
     }
 
+    /// Total sizes of working copies, for display on the Repos screen: remembered for up to a day while the
+    /// working copy folder and its `.git` folder are unchanged (git rewrites files in `.git` whenever the
+    /// index or HEAD changes), `du` for the rest.
+    func measureClones(_ paths: [String], now: Date = Date()) async -> [String: Int64] {
+        let cache = measurementCache
+        let stored = Dictionary((cache.load().clones ?? []).map { ($0.path, $0) }, uniquingKeysWith: { a, _ in a })
+        let t = now.timeIntervalSince1970
+        // The second stamp is the folder git keeps this working copy's index and HEAD in: `.git` itself, or for
+        // a linked worktree the folder its `.git` file names. That text only picks a folder to lstat for the
+        // cache key; nothing is read from or run in it.
+        func stamps(_ path: String) -> (FileStamp, FileStamp)? {
+            let dotGit = path + "/.git"
+            var st = stat()
+            guard lstat(dotGit, &st) == 0, let f = FileStamp.of(path) else { return nil }
+            var gitDir = dotGit
+            if (st.st_mode & S_IFMT) == S_IFREG {
+                guard st.st_size < 4096, let data = FileManager.default.contents(atPath: dotGit),
+                      let text = String(data: data, encoding: .utf8), text.hasPrefix("gitdir: ") else { return nil }
+                let target = text.dropFirst("gitdir: ".count).trimmingCharacters(in: .newlines)
+                gitDir = target.hasPrefix("/") ? target : path + "/" + target
+            } else if (st.st_mode & S_IFMT) != S_IFDIR {
+                return nil
+            }
+            guard lstat(gitDir, &st) == 0, (st.st_mode & S_IFMT) == S_IFDIR, let g = FileStamp.of(gitDir) else { return nil }
+            return (f, g)
+        }
+        var sizes: [String: Int64] = [:]
+        var misses: [String] = []
+        var before: [String: (FileStamp, FileStamp)] = [:]
+        for path in Set(paths) {
+            let now2 = stamps(path)
+            if let e = stored[path], let now2, t - e.measuredAt < MeasurementCache.cloneSizeLifetime, e.measuredAt <= t + 60,
+               now2.0 == e.folder, now2.1 == e.project {
+                sizes[path] = e.sizeBytes
+            } else {
+                misses.append(path)
+                if let now2 { before[path] = now2 }
+            }
+        }
+        if misses.isEmpty { return sizes }
+        let measured = await Self.measure(misses)
+        if Task.isCancelled { return sizes }
+        var fresh = ScanCacheFile()
+        for path in misses {
+            guard let size = measured[path] else { continue }
+            sizes[path] = size
+            if let (f, g) = before[path] {
+                fresh.clones = (fresh.clones ?? []) + [ArtifactMeasurement(path: path, sizeBytes: size, folder: f, project: g, measuredAt: t)]
+            }
+        }
+        if fresh.clones != nil { cache.save(fresh) }
+        return sizes
+    }
+
     /// Newest modification time inside each project (see `ProjectWalker.lastTouched`). Always read from disk,
     /// except that a project already found too big to check is remembered (for a day, while its folder is
     /// unchanged) as "touched now", so it is not walked to the limit again at every scan.
@@ -151,7 +213,8 @@ extension LiveEngine {
                t - e.measuredAt < MeasurementCache.activityLifetime, e.measuredAt <= t + 60 {
                 return (t, nil)
             }
-            let r = await onBackground { ProjectWalker.lastTouchedResult(project: p.path, skipping: p.skipping, maxEntries: maxEntries) }
+            let r = await onBackground { ProjectWalker.lastTouchedResult(project: p.path, skipping: p.skipping, maxEntries: maxEntries,
+                                                                       stopAfter: t - 86400 + 60) }
             guard r.failedClosed else { return (r.newest, nil) }
             guard let stamp else { return (t, nil) }
             return (t, ProjectActivity(path: p.path, newest: 0, project: stamp, measuredAt: t, failedClosed: true))

@@ -353,10 +353,11 @@ extension LiveEngine {
         struct Detail: Sendable { var state: RepoState; var size: Int64; var artifacts: Int64; var idle: Int }
         let details: [Detail?] = await PoliteScan.$enabled.withValue(true) {
             let artifactSizes = await self.measureArtifacts(own.values.flatMap { $0 }, progress: progress)
+            progress("Measuring \(found.count) working copies…")
+            let cloneSizes = await self.measureClones(found.map(\.path))
             return await boundedMap(found, limit: 3) { f -> Detail? in
                 if Task.isCancelled { return nil }
                 async let state = RepoInspector.inspect(path: f.path, isLinkedWorktree: f.isLinkedWorktree, env: env)
-                async let size = duSizes([f.path])
                 let cands = own[f.path] ?? []
                 let artifactBytes = cands.reduce(Int64(0)) { $0 + (artifactSizes[$1.path] ?? 0) }
                 let activity = await self.projectActivity([(path: f.path, skipping: Set(cands.map(\.path)))])
@@ -364,7 +365,7 @@ extension LiveEngine {
                 let st = await state
                 let newest = max(touched, st.lastCommit?.timeIntervalSince1970 ?? 0)
                 let idle = max(0, Int((Date().timeIntervalSince1970 - newest) / 86400))
-                return Detail(state: st, size: (await size)[f.path] ?? 0, artifacts: artifactBytes, idle: idle)
+                return Detail(state: st, size: cloneSizes[f.path] ?? 0, artifacts: artifactBytes, idle: idle)
             }
         }
         if Task.isCancelled { return [] }

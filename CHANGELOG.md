@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.1.3] - 2026-11-14
 
 ### Changed
 
@@ -13,6 +13,8 @@ All notable changes to this project are documented here. The format is based on
 - Progress names the folder being searched, with running counts (`Searching Desktop/work/api… 1,240 folders, 37 found`).
 - The app starts the Projects and Repos scans when their screens are first opened (or a rescan is pressed), not at launch.
 - Measured sizes are remembered in `scan-cache.json` next to `settings.json` and reused while the build folder and its project are unchanged (7 days at most). The cache only holds numbers for display; the list of folders always comes from a real walk, and a project's idle time is always read from disk.
+- The Repos screen remembers each working copy's total size for up to a day while the working copy folder and its git folder are unchanged, and measures the rest in batches.
+- The idle check of a project stops as soon as it sees a change from the last day (the answer is already "today"), and only runs for projects that are listed.
 
 ## [0.1.2] - 2026-11-14
 
