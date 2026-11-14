@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en" data-resolution="square">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=1080, height=1080" />
+    <script src="https://cdn.jsdelivr.net/npm/gsap@3.15.0/dist/gsap.min.js"></script>
+    <style>
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+      html, body { width: 1080px; height: 1080px; overflow: hidden; background: #090a1a; }
+      #root { position: relative; width: 1080px; height: 1080px; }
+      .scene { position: absolute; inset: 0; overflow: hidden; }
+      .abs { position: absolute; }
+
+      /* Shared ground: deep ink with two soft colour fields. */
+      .ground {
+        position: absolute; inset: 0;
+        background:
+          radial-gradient(120% 85% at 50% -5%, #3a418c 0%, #171a3d 46%, #090a1a 100%);
+      }
+      .blob { position: absolute; border-radius: 50%; filter: blur(110px); }
+      .blob.mint { width: 620px; height: 620px; left: -160px; top: 600px; background: #2fe0b0; opacity: 0.34; }
+      .blob.violet { width: 560px; height: 560px; left: 700px; top: -180px; background: #8f7bff; opacity: 0.42; }
+      .sheen {
+        position: absolute; inset: 0;
+        background: linear-gradient(180deg, rgba(255,255,255,0.10) 0%, rgba(255,255,255,0) 38%);
+      }
+      svg { position: absolute; inset: 0; width: 1080px; height: 1080px; overflow: visible; }
+
+      /* A: gauge ring */
+      .ring {
+        position: absolute; left: 180px; top: 180px; width: 720px; height: 720px; border-radius: 50%;
+        -webkit-mask: radial-gradient(circle, transparent 0 275px, #000 276px 359px, transparent 360px);
+                mask: radial-gradient(circle, transparent 0 275px, #000 276px 359px, transparent 360px);
+      }
+      .ring.track { background: conic-gradient(from 222deg, #2a2e5c 0 276deg, transparent 276deg); }
+      .ring.fill { background: conic-gradient(from 222deg, #5cf5ba 0deg, #38c8fa 105deg, #8b84ff 200deg, transparent 200.2deg); }
+      .cap { position: absolute; width: 84px; height: 84px; border-radius: 50%; margin: -42px 0 0 -42px; }
+      .glow { filter: blur(34px); opacity: 0.75; }
+    </style>
+  </head>
+  <body>
+    <div id="root" data-composition-id="main" data-start="0" data-duration="3" data-width="1080" data-height="1080">
+
+      <!-- A: storage gauge + sparkle -->
+      <div class="scene clip" id="a" data-start="0" data-duration="1" data-track-index="0">
+        <div class="ground"></div><div class="blob mint"></div><div class="blob violet"></div><div class="sheen"></div>
+        <div class="ring track"></div>
+        <div class="cap" style="left:752.8px; top:776.3px; background:#2a2e5c"></div>
+        <div class="abs glow" style="inset:0">
+          <div class="ring fill"></div>
+          <div class="cap" style="left:327.2px; top:776.3px; background:#5cf5ba"></div>
+          <div class="cap" style="left:820.8px; top:390.7px; background:#8b84ff"></div>
+        </div>
+        <div class="ring fill"></div>
+        <div class="cap" style="left:327.2px; top:776.3px; background:#5cf5ba"></div>
+        <div class="cap" style="left:820.8px; top:390.7px; background:#8b84ff"></div>
+        <svg viewBox="0 0 1080 1080">
+          <defs>
+            <filter id="ga" x="-50%" y="-50%" width="200%" height="200%">
+              <feGaussianBlur stdDeviation="26" result="b" />
+              <feColorMatrix in="b" type="matrix" values="0 0 0 0 0.36  0 0 0 0 0.96  0 0 0 0 0.78  0 0 0 0.75 0" result="g" />
+              <feMerge><feMergeNode in="g" /><feMergeNode in="SourceGraphic" /></feMerge>
+            </filter>
+          </defs>
+          <g filter="url(#ga)" fill="#ffffff">
+            <path data-sparkle="530,560,196" />
+            <path data-sparkle="672,404,66" />
+          </g>
+        </svg>
+      </div>
+
+      <!-- B: usage bars shrinking to a sparkle -->
+      <div class="scene clip" id="b" data-start="1" data-duration="1" data-track-index="0">
+        <div class="ground"></div><div class="blob mint"></div><div class="blob violet"></div><div class="sheen"></div>
+        <svg viewBox="0 0 1080 1080">
+          <defs>
+            <linearGradient id="gb" x1="0" y1="0" x2="1" y2="0">
+              <stop offset="0" stop-color="#5cf5ba" /><stop offset="0.55" stop-color="#38c8fa" /><stop offset="1" stop-color="#8b84ff" />
+            </linearGradient>
+            <filter id="gbg" x="-50%" y="-50%" width="200%" height="200%">
+              <feGaussianBlur stdDeviation="28" result="b" />
+              <feColorMatrix in="b" type="matrix" values="0 0 0 0 0.30  0 0 0 0 0.85  0 0 0 0 0.95  0 0 0 0.7 0" result="g" />
+              <feMerge><feMergeNode in="g" /><feMergeNode in="SourceGraphic" /></feMerge>
+            </filter>
+          </defs>
+          <rect x="230" y="268" width="620" height="124" rx="62" fill="#2a2e5c" />
+          <rect x="230" y="478" width="440" height="124" rx="62" fill="#3a4080" />
+          <g filter="url(#gbg)">
+            <rect x="230" y="688" width="250" height="124" rx="62" fill="url(#gb)" />
+            <path data-sparkle="690,750,150" fill="#ffffff" />
+            <path data-sparkle="822,634,54" fill="#ffffff" />
+          </g>
+        </svg>
+      </div>
+
+      <!-- C: disk platter with a cleared wedge + sparkle -->
+      <div class="scene clip" id="c" data-start="2" data-duration="1" data-track-index="0">
+        <div class="ground"></div><div class="blob mint"></div><div class="blob violet"></div><div class="sheen"></div>
+        <svg viewBox="0 0 1080 1080">
+          <defs>
+            <linearGradient id="gc" x1="0" y1="1" x2="1" y2="0">
+              <stop offset="0" stop-color="#5cf5ba" /><stop offset="0.5" stop-color="#38c8fa" /><stop offset="1" stop-color="#8b84ff" />
+            </linearGradient>
+            <filter id="gcg" x="-50%" y="-50%" width="200%" height="200%">
+              <feGaussianBlur stdDeviation="30" result="b" />
+              <feColorMatrix in="b" type="matrix" values="0 0 0 0 0.30  0 0 0 0 0.80  0 0 0 0 0.98  0 0 0 0.6 0" result="g" />
+              <feMerge><feMergeNode in="g" /><feMergeNode in="SourceGraphic" /></feMerge>
+            </filter>
+            <mask id="mc">
+              <rect width="1080" height="1080" fill="#fff" />
+              <circle cx="540" cy="540" r="96" fill="#000" />
+              <!-- wedge cut to the upper right -->
+              <path d="M540 540 L540 120 A420 420 0 0 1 960 540 Z" fill="#000" />
+            </mask>
+          </defs>
+          <g filter="url(#gcg)">
+            <circle cx="540" cy="540" r="330" fill="url(#gc)" mask="url(#mc)" />
+            <path data-sparkle="716,364,150" fill="#ffffff" />
+          </g>
+        </svg>
+      </div>
+    </div>
+    <script>
+      // Four-point sparkle: data-sparkle="cx,cy,R".
+      document.querySelectorAll("[data-sparkle]").forEach((el) => {
+        const [cx, cy, R] = el.dataset.sparkle.split(",").map(Number);
+        const k = R * 0.15;
+        el.setAttribute("d",
+          `M${cx} ${cy - R} Q${cx + k} ${cy - k} ${cx + R} ${cy} Q${cx + k} ${cy + k} ${cx} ${cy + R} ` +
+          `Q${cx - k} ${cy + k} ${cx - R} ${cy} Q${cx - k} ${cy - k} ${cx} ${cy - R} Z`);
+      });
+      const tl = gsap.timeline({ paused: true });
+      tl.to({}, { duration: 3 }, 0);
+      window.__timelines = window.__timelines || {};
+      window.__timelines["main"] = tl;
+      tl.seek(0);
+    </script>
+  </body>
+</html>
