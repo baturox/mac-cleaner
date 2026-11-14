@@ -74,11 +74,24 @@ If you are unsure, open a "New cleanup target" issue first.
 
 These exist because the app usually has Full Disk Access and deletes irreversibly. See SECURITY.md.
 
-- **Deleting** goes through `Deleter` only. Never `FileManager.removeItem`, never a path-based walk.
+- **Deleting** goes through `Deleter` only. Never `FileManager.removeItem`, never a path-based walk, and
+  never a program that is handed a path to delete (linked worktrees included: the folder is removed by
+  `Deleter`, git only prunes the registration afterwards).
+- **Every deleting entry point** starts with `LiveEngine.begin` and ends with `finish`. `begin` refuses when
+  the home folder was relocated or a protected path is invalid, and writes the "started" audit record
+  before anything is touched.
+- **"Protected" has two meanings; pick the right one.** `PathGuard.isProtected` answers "may this be
+  deleted?" (hidden subtrees and the user's top-level folders). `PathGuard.isHidden` answers "may this be
+  listed, measured or walked into?" (hidden subtrees only). Scans and read tools use `isHidden`.
+- **Fail closed.** A git command that fails or times out, a folder that cannot be read, a bound that is hit:
+  each must end in "not offered" / "not backed up" / "in use", never in the permissive answer.
 - **Listing things to delete** goes through `env.expandPattern` / `SafeGlob`, which refuse symlinked
   folders and, in shared temp areas, anything the user does not own.
-- **git** is run only through `Git.open` (the configuration audit) followed by `Git.run`. There is no other
-  way to obtain the `GitRepo` value `Git.run` needs; do not add one. New read-only git commands must pass
+- **git** is run only through `Git.open` (the layout check and the configuration audit) followed by
+  `Git.run`. There is no other way to obtain the `GitRepo` value `Git.run` needs; do not add one. Files that
+  say where a repository lives are parsed in `GitLayout` exactly the way git parses them; never trim or
+  normalize them differently. The config allowlist (`GitConfigPolicy`) is per key: add a whole section only
+  after checking every key git documents for it. New read-only git commands must pass
   `--ignore-submodules=all` where git would otherwise enter a submodule.
 - **Other programs** are run through `env.run([...])`, which resolves the tool with the ownership checks and
   gives it the constructed environment. Do not read `ProcessInfo.processInfo.environment` to build a child
@@ -101,6 +114,27 @@ These exist because the app usually has Full Disk Access and deletes irreversibl
 - `swift build` and `swift test` must pass with no new warnings.
 - Add a line to `CHANGELOG.md` under *Unreleased* for anything user-visible.
 - Releases: bump `VERSION` and `Sources/CLI/Version.swift`, move the changelog section, tag `vX.Y.Z`. The
-  release workflow checks that the tag matches `VERSION`.
+  release workflow checks that the tag matches `VERSION`, builds and tests in a job without secrets, then
+  signs and packages in the `publish` job and creates a **draft** release. Look at the draft's assets and
+  notes, then publish it by hand.
+- A safety claim in `SECURITY.md`, the README or a tool description is part of the change: when the code
+  changes what is true, change the text in the same pull request, and add or adjust the test named next to
+  the property in `SECURITY.md`.
+
+### One-time repository setup for releases (maintainer)
+
+The signing and notarization secrets must not be repository secrets. Create a GitHub **Environment named
+`release`** (Settings > Environments) and put them there (`MACOS_CERTIFICATE_P12`,
+`MACOS_CERTIFICATE_PASSWORD`, `MACOS_CODESIGN_IDENTITY`, `NOTARY_KEY_P8`, `NOTARY_KEY_ID`,
+`NOTARY_ISSUER_ID`). Then, on that environment:
+
+1. *Deployment branches and tags*: "Selected branches and tags", with one rule of type **tag**: `v*`.
+2. *Required reviewers*: yourself (or the maintainers). Every release run then waits for an approval before
+   the `publish` job, the only job that can read the secrets, starts.
+3. Delete the same secrets from the repository-level secrets if they were ever stored there.
+
+Protect the tags as well (Settings > Rules > Rulesets: restrict creation of `v*` tags to maintainers). Without
+steps 1 and 2 the environment protects nothing: the "tag is on `main`" step in the workflow is only a
+convenience, because the workflow file is part of the commit being released.
 
 By contributing you agree that your contribution is licensed under the MIT license.

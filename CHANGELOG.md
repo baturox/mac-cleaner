@@ -18,7 +18,7 @@ First public release.
   per model with last-used dates), Language toolchains (old Node/Rust/Python versions, Android SDK pieces),
   Containers & VMs (Docker breakdown) and Personal data.
 - Projects: stale build folders (`node_modules`, `target`, `.next`, `Pods`, `.venv`, ...) across all projects
-  with idle time. Build folders containing git-tracked files are never reported.
+  with idle time. A build folder inside a git repository is reported only when git lists no tracked file in it.
 - Repos: every clone and worktree grouped by repository with "clean & pushed" status, so leftover agent
   worktrees can be removed safely.
 - Explore: drill down by size.
@@ -32,9 +32,11 @@ First public release.
   signing and notarization; generated app icon; Homebrew cask template.
 - GitHub Actions for CI and tagged releases.
 
-- **History / audit log.** Every clean, delete and clone removal is recorded in
-  `~/Library/Application Support/MacCleaner/audit.jsonl` (append-only JSON Lines, mode 0600, `flock` + `fsync`,
-  rotated at ~10 MB, corrupt lines skipped). New *History* screen in the app (search, client and date filters,
+- **History / audit log.** Unless turned off, every clean, delete and clone removal is recorded in
+  `~/Library/Application Support/MacCleaner/audit.jsonl` (append-only JSON Lines, mode 0600 in a 0700 folder,
+  `flock` + `fsync`, rotated at ~10 MB, corrupt lines skipped): a "started" record before anything is deleted
+  and a "finished" record afterwards, so an interrupted operation is visible with the items it intended to
+  remove. New *History* screen in the app (search, client and date filters,
   items with Reveal in Finder, JSON/CSV export, clear), "Freed so far" on the Overview, `mac-cleaner history`
   and `mac-cleaner history clear`, and a setting to turn recording off. New engine API: `auditLog`, `auditStats`,
   `clearAuditLog`, `AuditRecord`/`AuditItem`, `LiveEngine(client:appVersion:)` and
@@ -42,8 +44,9 @@ First public release.
 - **MCP server for AI agents.** `mac-cleaner mcp` (MCP 2026-07-28, with `initialize`-based negotiation down to
   2024-11-05): read-only tools for disk status, cleanup categories, build folders, repositories, folder sizes,
   growth and the audit history. With `--allow-clean` the user can opt in to a two-step `plan_cleanup` /
-  `apply_cleanup` limited to safe categories and idle projects' build folders, with expiring single-use plans,
-  size ceilings, a rate limit and audit records. See the README and SECURITY.md.
+  `apply_cleanup` limited to safe categories (including five fixed package-manager cache-prune commands) and
+  idle projects' build folders, with expiring single-use plans, size ceilings, a rate limit, and a refusal to
+  delete when the audit log cannot be written. See the README and SECURITY.md.
 - `mac-cleaner doctor` mentions the MCP command.
 
 ### Security
@@ -83,9 +86,51 @@ Hardening after a security review, before the first release. Details and the rem
   names are validated before use. Docker categories appear only for a local daemon and name it explicitly.
 - CLI output replaces control characters and escape sequences found in file names and labels.
 - The mock engine and the `MACCLEANER_*` screenshot hooks are compiled out of release builds.
-- Release workflow: actions pinned to commit SHAs, the tag must point at a commit on `main`, signing material
-  is removed even when the job fails. `scripts/install-cli.sh` copies (never links) and does not run the
-  binary when used as root.
+- Release workflow: actions pinned to commit SHAs; signing material is removed even when the job fails.
+  `scripts/install-cli.sh`, when used as root or into a folder owned by another account, copies instead of
+  linking and does not run the binary (for your own folders it links by default; `--copy` copies).
+
+Fixes after a second, pre-release verification pass. Each has a regression test; SECURITY.md now carries a
+numbered list of the safety properties with the tests behind them.
+
+- **Git layout files are parsed exactly like git parses them.** A linked worktree whose `commondir` ended in
+  a space made Mac Cleaner audit one configuration file while git read another. `.git` files, `commondir` and
+  `gitdir` with surrounding whitespace, control characters, invalid UTF-8 or a target that is not a directory
+  now make the repository untrusted, and git is asked to confirm the layout after the audit.
+- **Git-tracked build folders are no longer offered when the scan starts inside a repository.**
+  `mac-cleaner projects app/ios` (and the app's and MCP server's scan roots) now find the repository above the
+  folder and check its tracked files.
+- **"Fully backed up" no longer trusts files hidden from `git status`.** Tracked files on disk that are
+  flagged skip-worktree or assume-unchanged count as "cannot verify" (`hiddenFromStatusCount`, shown as
+  "N files hidden from git status"); `core.ignoreStat` is no longer on the allowlist. A stash check that fails,
+  and submodules nested deeper than the engine follows, also count against a copy.
+- **The audit log is written before the deletion,** not only after it (see *Added*). On Ctrl-C the CLI lets a
+  running deletion stop and record its outcome. The MCP server checks that the log can be written before an
+  apply, reports the real result (`audit_logged`), and records an apply in which everything was skipped.
+- **`CFFIXED_USER_HOME` (and `HOME`) can no longer relocate the home folder.** It comes from the user
+  database; if the process was given a different one, every deleting operation refuses. `TMPDIR` does not
+  move the temp root.
+- **Linked worktrees are removed by the engine's own descriptor walk,** not by `git worktree remove`; only
+  `git worktree prune` runs afterwards, and not in a protected or untrusted main repository. The nested-
+  repository check applies to worktrees too.
+- **Git config allowlist is per key.** `gc.recentObjectsHook`, `pull.twohead`, `init.templateDir` and the
+  rest of the previously whole-section entries that could name programs are no longer accepted.
+- **Idle time** is the newest change anywhere in the project (bounded, failing closed), not just at its top
+  level; a project edited in `src/deep/` is no longer "idle for months".
+- **Protected paths that are not absolute** are rejected (settings file invalid, deleting refused) instead of
+  being ignored. **Trash mode** looks through the tree for protected items, other volumes and foreign folders
+  before moving it. The settings/history folder is 0700 whichever file is written first.
+- **MCP read tools** list and accept `~/Documents`, `~/Library` and the other top-level folders (they were
+  hidden by mistake); only credential locations and your protected folders are hidden. `project_root` must be
+  inside the home folder. The session ceiling counts removed bytes. Simulator devices for removed runtimes and
+  Time Machine local snapshots are now *caution* and can never be part of an agent's plan.
+- **App:** before a forced clone removal is confirmed, and again right before it runs, the copy is inspected
+  afresh; the sheet shows current losses (including nested repositories), and a copy that changed is kept.
+- **Release workflow:** a build-and-test job without secrets and a publish job that alone can sign, behind
+  the GitHub Environment `release` (the maintainer must restrict it to `v*` tags with a required reviewer);
+  releases are created as drafts; CI builds must be universal or fail; release notes state exactly how the
+  build was signed. `install-cli.sh` resolves `--from`, and as root never creates folders in, or installs
+  into, a normal account's folders.
 
 ### Changed
 
@@ -99,4 +144,9 @@ Hardening after a security review, before the first release. Details and the rem
 
 ### Notes
 
-- Release builds are ad-hoc signed and not notarized unless the maintainer configures signing secrets.
+- Release builds are ad-hoc signed and not notarized unless the maintainer configures signing secrets; the
+  release notes say which of the three cases (notarized, signed only, ad-hoc) a build is.
+- New and changed engine API: `CleanResult.auditRecorded`, `RepoClone.hiddenFromStatusCount`,
+  `AuditRecord.phase`/`isUnfinished`, `AuditOutcome.pending`, `AuditStats.unfinishedOperations`,
+  `CleanerEngine.auditLogProblem()` and `inspectClones(_:)`, `PathAccess.isHidden`/`containsHidden`,
+  `EngineSettings.invalidProtectedPaths`, `AccountEnvironment`, `AuditActivity`.
