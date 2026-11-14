@@ -112,10 +112,11 @@ enum OverrideScanner {
         for spec in specs(home: ctx.home) {
             guard let found = await onBackground({ items(for: spec, env: ctx.env) }) else { continue }
             ctx.progress("Measuring \(spec.name)…")
-            let items = await ctx.items(found.paths)
+            // Not named `items`: older compilers report a circular reference with `items(for:env:)` above.
+            let measured = await ctx.items(found.paths)
             let detail = "Rebuildable: \(spec.regenerate). " + EnvOverride.note(spec.variable, found.dir, home: ctx.home)
             if let c = ctx.category(id: spec.id, name: spec.name, detail: detail, level: .caution, symbol: spec.symbol,
-                                    group: spec.group, items: items, selectable: true) { out.append(c) }
+                                    group: spec.group, items: measured, selectable: true) { out.append(c) }
         }
         return out
     }
