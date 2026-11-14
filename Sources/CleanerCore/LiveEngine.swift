@@ -4,12 +4,20 @@ import Foundation
 public struct LiveEngine: CleanerEngine {
     let env: EngineEnvironment
     let settingsBox: SettingsBox
+    /// Who is driving this engine; written into every audit record.
+    let client: AuditClient
+    let appVersion: String
 
-    public init() { self.init(env: .live) }
+    /// `client` names the front end for the audit log; `appVersion` defaults to the bundle's version.
+    public init(client: AuditClient = .cli, appVersion: String? = nil) {
+        self.init(env: .live, client: client, appVersion: appVersion)
+    }
 
-    init(env: EngineEnvironment, settings: SettingsBox = SettingsBox()) {
+    init(env: EngineEnvironment, settings: SettingsBox = SettingsBox(), client: AuditClient = .cli, appVersion: String? = nil) {
         self.env = env
         self.settingsBox = settings
+        self.client = client
+        self.appVersion = appVersion ?? (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) ?? "unknown"
     }
 
     // MARK: Settings & context
@@ -124,6 +132,7 @@ public struct LiveEngine: CleanerEngine {
     public func clean(categories: [CleanCategory], mode: DeleteMode, progress: @escaping ProgressHandler) async -> CleanResult {
         let before = diskInfo().freeBytes
         let deleter = self.deleter
+        var audit = AuditDraft(kind: .cleanup, mode: mode)
         var failed = 0
         var messages: [String] = []
         for cat in categories {
@@ -132,49 +141,96 @@ public struct LiveEngine: CleanerEngine {
             let pathItems = cat.items.filter { $0.deleteCommand == nil }
             if !pathItems.isEmpty {
                 let paths = pathItems.map { $0.url.path }
-                let r = await onBackground { deleter.remove(paths, mode: mode) }
-                failed += r.failed
-                messages += r.messages
+                let results = await onBackground { deleter.removeEach(paths, mode: mode) }
+                for (item, r) in zip(pathItems, results) {
+                    failed += r.failed
+                    messages += r.messages
+                    audit.add(AuditItem(path: item.url.path, name: item.displayName, categoryID: cat.id, sizeBytes: item.sizeBytes,
+                                        action: r.trashed ? .movedToTrash : .deleted, outcome: r.outcome, reason: r.reason))
+                }
             }
             for item in cat.items {
                 guard let cmd = item.deleteCommand else { continue }
                 progress("Removing \(item.displayName)…")
                 let r = await runAllowed(cmd, timeout: 600)
+                var reason: String?
                 if !r.ok {
                     failed += 1
-                    messages.append("\(item.displayName): \(Self.failureText(cmd, r))")
+                    reason = Self.failureText(cmd, r)
+                    messages.append("\(item.displayName): \(reason ?? "")")
                 }
+                audit.add(AuditItem(path: item.url.path, name: item.displayName, categoryID: cat.id, sizeBytes: item.sizeBytes,
+                                    action: .commandRun, command: cmd,
+                                    outcome: r.ok ? .ok : (r.status == 126 && !r.launched ? .refused : .failed), reason: reason))
             }
             if cat.id == "snapshots" {
                 let r = await GenericScanner.snapshotCleanup(env: env, progress: progress)
                 failed += r.failed
                 messages += r.messages
+                audit.add(AuditItem(path: nil, name: cat.name, categoryID: cat.id, sizeBytes: cat.sizeBytes, action: .commandRun,
+                                    command: ["tmutil", "deletelocalsnapshots", "<each local snapshot date>"],
+                                    outcome: r.failed > 0 ? .failed : .ok, reason: r.messages.first))
             }
-            for cmd in cat.commands {
+            for (i, cmd) in cat.commands.enumerated() {
                 progress("Running \(cmd.joined(separator: " "))…")
                 let r = await runAllowed(cmd, timeout: 1800)
+                var reason: String?
                 if r.ok {
                     messages.append("\(cmd.joined(separator: " ")): \(String(r.lastLine.prefix(100)))")
                 } else {
                     failed += 1
-                    messages.append("\(cmd.joined(separator: " ")): \(Self.failureText(cmd, r))")
+                    reason = Self.failureText(cmd, r)
+                    messages.append("\(cmd.joined(separator: " ")): \(reason ?? "")")
                 }
+                audit.add(AuditItem(path: nil, name: cmd.joined(separator: " "), categoryID: cat.id, sizeBytes: i == 0 ? cat.sizeBytes : 0,
+                                    action: .commandRun, command: cmd,
+                                    outcome: r.ok ? .ok : (r.status == 126 && !r.launched ? .refused : .failed), reason: reason))
             }
         }
-        return await finish(before: before, failed: failed, messages: messages)
+        return await finish(before: before, failed: failed, messages: messages, audit: audit)
     }
 
     public func delete(urls: [URL], progress: @escaping ProgressHandler) async -> CleanResult {
-        await delete(urls: urls, mode: .permanent, progress: progress)
+        await delete(urls: urls, mode: .permanent, purpose: .explorer, progress: progress)
     }
 
     public func delete(urls: [URL], mode: DeleteMode, progress: @escaping ProgressHandler) async -> CleanResult {
+        await delete(urls: urls, mode: mode, purpose: .explorer, progress: progress)
+    }
+
+    public func delete(urls: [URL], mode: DeleteMode, purpose: DeletePurpose, progress: @escaping ProgressHandler) async -> CleanResult {
         let before = diskInfo().freeBytes
         progress("Deleting \(urls.count) \(urls.count == 1 ? "item" : "items")…")
         let paths = urls.map { $0.path }
         let deleter = self.deleter
-        let r = await onBackground { deleter.remove(paths, mode: mode) }
-        return await finish(before: before, failed: r.failed, messages: r.messages)
+        // Sizes are measured now, right before the removal, for the audit record only.
+        var sizes: [String: Int64] = [:]
+        if settingsBox.settings.recordAuditLog { sizes = await Self.measureForAudit(paths) }
+        let results = await onBackground { deleter.removeEach(paths, mode: mode) }
+        var audit = AuditDraft(kind: purpose == .projectArtifacts ? .projectArtifacts : .explorerDelete, mode: mode)
+        for r in results {
+            let parts = r.path.split(separator: "/")
+            let last = String(parts.last ?? "")
+            let name = purpose == .projectArtifacts && parts.count >= 2 ? "\(parts[parts.count - 2])/\(last)" : last
+            audit.add(AuditItem(path: r.path, name: name, artifactKind: purpose == .projectArtifacts ? last : nil,
+                                sizeBytes: sizes[r.path] ?? 0, action: r.trashed ? .movedToTrash : .deleted,
+                                outcome: r.outcome, reason: r.reason))
+        }
+        return await finish(before: before, failed: results.reduce(0) { $0 + $1.failed },
+                            messages: results.flatMap { $0.messages }, audit: audit)
+    }
+
+    private static func measureForAudit(_ paths: [String]) async -> [String: Int64] {
+        guard paths.count <= 2000 else { return [:] }
+        var dirs: [String] = []
+        var out: [String: Int64] = [:]
+        for p in paths {
+            var st = stat()
+            guard lstat(p, &st) == 0 else { continue }
+            if (st.st_mode & S_IFMT) == S_IFDIR { dirs.append(p) } else { out[p] = Int64(st.st_blocks) * 512 }
+        }
+        for (k, v) in await duSizes(dirs) { out[k] = v }
+        return out
     }
 
     /// Runs a command only if its whole argv has an allowed shape (see `CommandPolicy`).
@@ -195,9 +251,11 @@ public struct LiveEngine: CleanerEngine {
         return "failed (exit \(r.status))" + (tail.isEmpty ? "" : ": " + String(tail.prefix(200)))
     }
 
-    func finish(before: Int64, failed: Int, messages: [String]) async -> CleanResult {
+    func finish(before: Int64, failed: Int, messages: [String], audit: AuditDraft? = nil) async -> CleanResult {
         try? await Task.sleep(nanoseconds: 1_000_000_000)
         let after = diskInfo().freeBytes
+        var messages = messages
+        if let audit, let problem = await writeAudit(audit, freeBefore: before, freeAfter: after) { messages.append(problem) }
         return CleanResult(freedBytes: max(after - before, 0), failedCount: failed, messages: messages)
     }
 }

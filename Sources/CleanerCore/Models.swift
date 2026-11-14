@@ -247,6 +247,12 @@ public enum DeleteMode: String, Sendable, Codable {
     case trash       // recoverable, but frees nothing until the Trash is emptied
 }
 
+/// Why `delete(urls:)` is being called; only used to label the audit record.
+public enum DeletePurpose: String, Sendable, Codable {
+    case explorer          // a folder or file picked in the disk explorer
+    case projectArtifacts  // build folders found by the project scan
+}
+
 public struct CleanResult: Sendable, Codable {
     /// Change in really-free bytes on the volume, measured before/after.
     public var freedBytes: Int64
@@ -266,8 +272,12 @@ public struct EngineSettings: Sendable, Codable, Equatable {
     public var protectedPaths: [String]
     /// AI tool sessions/transcripts newer than this are never offered for deletion.
     public var sessionRetentionDays: Int
-    public init(protectedPaths: [String] = [], sessionRetentionDays: Int = 30) {
+    /// Write a record of every deletion to the local audit log (default on). Turning it off stops new records;
+    /// existing ones stay until cleared.
+    public var recordAuditLog: Bool
+    public init(protectedPaths: [String] = [], sessionRetentionDays: Int = 30, recordAuditLog: Bool = true) {
         self.protectedPaths = protectedPaths; self.sessionRetentionDays = sessionRetentionDays
+        self.recordAuditLog = recordAuditLog
     }
 }
 
@@ -328,6 +338,20 @@ public protocol CleanerEngine: Sendable {
     /// Save the current scan as a snapshot and return what changed since the previous snapshot that is
     /// at least one hour old. Keeps a bounded history on disk.
     func recordSnapshot(categories: [CleanCategory], artifacts: [ProjectArtifact]) async -> GrowthReport
+
+    // ---- v3: audit log (default implementations: an engine without a log reports an empty one) ----
+
+    /// Like `delete(urls:mode:progress:)`, telling the engine what the paths are (for the audit record).
+    func delete(urls: [URL], mode: DeleteMode, purpose: DeletePurpose, progress: @escaping ProgressHandler) async -> CleanResult
+
+    /// Records of past deletions, newest first. `before` (exclusive) pages backwards by start time.
+    func auditLog(limit: Int, before: Date?) async -> [AuditRecord]
+
+    /// Totals over the whole log (or since `since`), plus how many unreadable lines were skipped.
+    func auditStats(since: Date?) async -> AuditStats
+
+    /// Removes every audit record.
+    func clearAuditLog() async
 }
 
 public extension CleanerEngine {
@@ -344,4 +368,10 @@ public extension CleanerEngine {
         CleanResult(freedBytes: 0, failedCount: clones.count, messages: ["Removing clones is not supported by this engine."])
     }
     func recordSnapshot(categories: [CleanCategory], artifacts: [ProjectArtifact]) async -> GrowthReport { .empty }
+    func delete(urls: [URL], mode: DeleteMode, purpose: DeletePurpose, progress: @escaping ProgressHandler) async -> CleanResult {
+        await delete(urls: urls, mode: mode, progress: progress)
+    }
+    func auditLog(limit: Int, before: Date?) async -> [AuditRecord] { [] }
+    func auditStats(since: Date?) async -> AuditStats { AuditStats() }
+    func clearAuditLog() async {}
 }
