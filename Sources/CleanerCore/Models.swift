@@ -24,8 +24,9 @@ public struct DiskInfo: Sendable, Equatable, Codable {
 // MARK: - Cleanup categories
 
 public enum SafetyLevel: String, Sendable, Codable {
-    case safe      // rebuilt or re-downloaded automatically
-    case caution   // real data the user may want (Trash, backups, archives, models, chat history)
+    case safe      // caches and build output that the tools that made them create again when needed
+    case caution   // real data the user may want, or things nothing rebuilds (Trash, backups, archives, models,
+                   // chat history, simulator devices, Time Machine local snapshots)
 }
 
 /// Sections the Cleanup screen is grouped by, in display order.
@@ -96,14 +97,17 @@ public struct CleanCategory: Identifiable, Sendable, Codable {
 // MARK: - Projects
 
 /// A rebuildable folder inside a project: node_modules, .next, target, Pods, .venv, …
-/// The engine never reports a folder that contains git-tracked files.
+/// The engine does not report a folder when git, asked in the enclosing repository (at or above the scan
+/// root), lists tracked files in it, or when that repository is untrusted or git cannot answer.
 public struct ProjectArtifact: Identifiable, Hashable, Sendable, Codable {
     public var id: String { url.path }
     public var url: URL
     public var kind: String             // folder name, e.g. "node_modules"
     public var projectURL: URL          // parent folder
     public var sizeBytes: Int64
-    public var idleDays: Int            // days since the project was last touched
+    /// Days since anything in the project (outside its build folders and `.git/objects`) was modified. 0 when
+    /// the project is too big to check completely or cannot be read.
+    public var idleDays: Int
     public init(url: URL, kind: String, projectURL: URL, sizeBytes: Int64, idleDays: Int) {
         self.url = url; self.kind = kind; self.projectURL = projectURL
         self.sizeBytes = sizeBytes; self.idleDays = idleDays
@@ -120,15 +124,18 @@ public struct RepoClone: Identifiable, Hashable, Sendable, Codable {
     /// Linked worktree (`git worktree add`). Its commits live in the main clone, so removing it loses
     /// only uncommitted work.
     public var isLinkedWorktree: Bool
-    /// Modified + staged + untracked (not ignored) files, plus one for every submodule that holds work of
-    /// its own (changes, unpushed commits) or could not be inspected.
+    /// Modified + staged + untracked (not ignored) files, plus the files hidden from `git status` by index
+    /// flags (`hiddenFromStatusCount`), plus one for every submodule that holds work of its own (changes,
+    /// unpushed commits), could not be inspected, or is nested deeper than the engine follows.
     public var uncommittedCount: Int
     /// Commits reachable from HEAD, a local branch or a tag that no remote-tracking ref of a NETWORK remote
     /// contains. For a linked worktree: commits reachable from ITS HEAD only.
     /// nil = there is no network remote (a remote that is a local path or a file:// URL is not a backup),
     /// or git could not answer.
     public var unpushedCount: Int?
-    public var hasStash: Bool           // always false for linked worktrees (stashes belong to the main clone)
+    /// A stash exists, or git could not say whether one does. Always false for linked worktrees (stashes
+    /// belong to the main clone).
+    public var hasStash: Bool
     public var lastCommit: Date?
     public var idleDays: Int
     public var sizeBytes: Int64         // whole folder
@@ -142,6 +149,10 @@ public struct RepoClone: Identifiable, Hashable, Sendable, Codable {
     /// git was NOT run in it: branch, counts and dates are unknown, it is never `isFullyBackedUp`, and
     /// `removeClones` refuses it even with `force`.
     public var untrustedConfigKeys: [String]?
+    /// Tracked files that are on disk but flagged skip-worktree or assume-unchanged in git's index: `git status`
+    /// is silent about them whatever they contain, so they cannot be verified. Already included in
+    /// `uncommittedCount`; front ends show it as "N files hidden from git status".
+    public var hiddenFromStatusCount: Int
 
     /// False when git was not run here because of the repository's own configuration.
     public var wasInspected: Bool { untrustedConfigKeys == nil }
@@ -160,12 +171,13 @@ public struct RepoClone: Identifiable, Hashable, Sendable, Codable {
 
     public init(url: URL, branch: String?, isLinkedWorktree: Bool, uncommittedCount: Int, unpushedCount: Int?,
                 hasStash: Bool, lastCommit: Date?, idleDays: Int, sizeBytes: Int64, artifactBytes: Int64,
-                ignoredFileCount: Int = 0, untrustedConfigKeys: [String]? = nil) {
+                ignoredFileCount: Int = 0, untrustedConfigKeys: [String]? = nil, hiddenFromStatusCount: Int = 0) {
         self.url = url; self.branch = branch; self.isLinkedWorktree = isLinkedWorktree
         self.uncommittedCount = uncommittedCount; self.unpushedCount = unpushedCount; self.hasStash = hasStash
         self.lastCommit = lastCommit; self.idleDays = idleDays
         self.sizeBytes = sizeBytes; self.artifactBytes = artifactBytes
         self.ignoredFileCount = ignoredFileCount; self.untrustedConfigKeys = untrustedConfigKeys
+        self.hiddenFromStatusCount = hiddenFromStatusCount
     }
 }
 
@@ -260,8 +272,12 @@ public struct CleanResult: Sendable, Codable {
     public var failedCount: Int
     /// Human-readable notes: command output tails, refusals, hints.
     public var messages: [String]
-    public init(freedBytes: Int64, failedCount: Int, messages: [String]) {
+    /// True when the operation's outcome record was appended to the audit log. False when the log is turned
+    /// off, could not be written, the operation was refused before it began, or the engine keeps no log.
+    public var auditRecorded: Bool
+    public init(freedBytes: Int64, failedCount: Int, messages: [String], auditRecorded: Bool = false) {
         self.freedBytes = freedBytes; self.failedCount = failedCount; self.messages = messages
+        self.auditRecorded = auditRecorded
     }
 }
 
@@ -272,13 +288,24 @@ public struct EngineSettings: Sendable, Codable, Equatable {
     public var protectedPaths: [String]
     /// AI tool sessions/transcripts newer than this are never offered for deletion.
     public var sessionRetentionDays: Int
-    /// Write a record of every deletion to the local audit log (default on). Turning it off stops new records;
+    /// Write the records of every deleting operation to the local audit log (default on). Turning it off stops new records;
     /// existing ones stay until cleared.
     public var recordAuditLog: Bool
     public init(protectedPaths: [String] = [], sessionRetentionDays: Int = 30, recordAuditLog: Bool = true) {
         self.protectedPaths = protectedPaths; self.sessionRetentionDays = sessionRetentionDays
         self.recordAuditLog = recordAuditLog
     }
+
+    /// A protected path must be absolute: start with "/" or "~/" (or be "~"). Blank entries are ignored.
+    public static func isValidProtectedPath(_ raw: String) -> Bool {
+        let t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return t.isEmpty || t == "~" || t.hasPrefix("~/") || t.hasPrefix("/")
+    }
+
+    /// Entries of `protectedPaths` that cannot be honored because they are not absolute. While there is one,
+    /// the settings file is rejected and the engine refuses every deleting operation: silently dropping the
+    /// entry would leave the folder the user meant unprotected.
+    public var invalidProtectedPaths: [String] { protectedPaths.filter { !Self.isValidProtectedPath($0) } }
 }
 
 // MARK: - Engine
@@ -325,8 +352,9 @@ public protocol CleanerEngine: Sendable {
     /// Find every git working copy under `root` and group them by repository. Groups sorted by total size.
     func scanRepos(root: URL, progress: @escaping ProgressHandler) async -> [RepoGroup]
 
-    /// Remove whole working copies. Linked worktrees are removed with `git worktree remove --force`
-    /// (then `git worktree prune` in the main clone); normal clones are deleted as folders.
+    /// Remove whole working copies. Clones and linked worktrees alike are deleted as folders by the engine's
+    /// own descriptor walk; for a linked worktree `git worktree prune` is then run in the main clone, unless
+    /// that clone is protected or untrusted (a message then tells the user to run it).
     /// The engine re-checks each clone right before removal and REFUSES any that is not
     /// `isFullyBackedUp` unless `force` is true. `force` applies to EVERY clone passed in one call, so
     /// callers must pass only the clones the user explicitly acknowledged when forcing, and make a
@@ -352,6 +380,28 @@ public protocol CleanerEngine: Sendable {
 
     /// Removes every audit record.
     func clearAuditLog() async
+
+    // ---- v4 (default implementations below) ----
+
+    /// nil when the engine could append a record to its audit log right now; otherwise the reason (turned
+    /// off, folder or file not writable). Front ends that promise "nothing is deleted without a log entry"
+    /// ask this before they start. The default (an engine without a log) answers nil.
+    func auditLogProblem() async -> String?
+
+    /// Fresh state of working copies, read from disk now: the same checks `removeClones` runs, for showing
+    /// current numbers right before a confirmation. Entries that are no longer working copies are left out.
+    /// `nestedRisk` describes what removing the folder would lose beyond the copy itself (linked worktrees
+    /// that depend on it, nested repositories with unsaved work), which `force` would also remove.
+    func inspectClones(_ urls: [URL]) async -> [CloneInspection]
+}
+
+/// The current state of one working copy (see `CleanerEngine.inspectClones`).
+public struct CloneInspection: Sendable, Identifiable {
+    public var id: String { clone.id }
+    /// Freshly inspected; `sizeBytes`, `artifactBytes` and `idleDays` are zero (not measured again).
+    public var clone: RepoClone
+    public var nestedRisk: String?
+    public init(clone: RepoClone, nestedRisk: String?) { self.clone = clone; self.nestedRisk = nestedRisk }
 }
 
 public extension CleanerEngine {
@@ -374,4 +424,6 @@ public extension CleanerEngine {
     func auditLog(limit: Int, before: Date?) async -> [AuditRecord] { [] }
     func auditStats(since: Date?) async -> AuditStats { AuditStats() }
     func clearAuditLog() async {}
+    func auditLogProblem() async -> String? { nil }
+    func inspectClones(_ urls: [URL]) async -> [CloneInspection] { [] }
 }

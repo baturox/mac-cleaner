@@ -1,5 +1,6 @@
-// Project scan: rebuildable folders (node_modules, target, .build, …) found next to marker files,
-// never including anything git tracks.
+// Project scan: rebuildable folders (node_modules, target, .build, …) found next to marker files. A folder
+// inside a git repository (at or ABOVE the scan root) is offered only when git, asked in that repository,
+// lists no tracked file in it; if the repository is untrusted or git cannot answer, it is not offered.
 import Foundation
 
 // MARK: - Rules
@@ -95,7 +96,8 @@ struct ArtifactCandidate: Sendable {
     var kind: String
     var project: String
     var risky: Bool
-    /// Nearest enclosing git working copy (a folder with a `.git` entry), if any.
+    /// Nearest enclosing git working copy (a folder with a `.git` entry), if any. It may lie above the
+    /// folder the scan started in.
     var repoRoot: String?
 }
 
@@ -105,10 +107,12 @@ enum ProjectWalker {
     /// Finds artifact candidates under `root`. Never descends into artifacts, `.git` or hidden folders and
     /// not into protected paths. With `stopAtNestedRepos`, folders that are their own git working copy
     /// (other than `root`) are skipped, so a repo's own artifacts are not mixed with nested clones'.
+    /// The scan root may itself lie inside a repository (`app/ios` of a clone at `app`), so the walk starts
+    /// knowing the nearest repository above it.
     static func find(root: String, home: String, guardian: PathGuard, stopAtNestedRepos: Bool = false,
                      flag: CancelFlag, progress: ProgressHandler = { _ in }) -> [ArtifactCandidate] {
         var hits: [ArtifactCandidate] = []
-        var stack: [(dir: String, repo: String?)] = [(root, nil)]
+        var stack: [(dir: String, repo: String?)] = [(root, enclosingRepository(above: root, home: home))]
         while let (dir, inheritedRepo) = stack.popLast() {
             if flag.isSet { break }
             if dir == root || (dir as NSString).deletingLastPathComponent == root {
@@ -134,7 +138,7 @@ enum ProjectWalker {
                 }
                 if e.name.hasPrefix(".") { continue }
                 if dir == home && skipTop.contains(e.name) { continue }
-                if guardian.isProtected(path, checkAncestors: false) { continue }
+                if guardian.isHidden(path, checkAncestors: false) { continue }
                 descend.append((path, repo))
             }
             stack += descend
@@ -142,17 +146,40 @@ enum ProjectWalker {
         return hits
     }
 
-    /// Newest modification time among a project's own files (artifacts excluded) and its git bookkeeping.
-    static func lastTouched(project: String, artifacts: Set<String>) -> TimeInterval {
-        guard let entries = readDir(project) else { return 0 }
-        var paths = entries.map(\.name).filter { !artifacts.contains($0) }.map { project + "/" + $0 }
-        paths += [".git/index", ".git/HEAD", ".git/logs/HEAD"].map { project + "/" + $0 }
-        if let src = readDir(project + "/src") { paths += src.prefix(200).map { project + "/src/" + $0.name } }
-        var newest: TimeInterval = 0
-        for p in paths {
+    /// The nearest folder strictly above `dir` that has a `.git` entry (folder or file). The climb ends at the
+    /// home folder (which is still looked at) or at "/".
+    static func enclosingRepository(above dir: String, home: String) -> String? {
+        var current = dir
+        while current != home, current.count > 1 {
+            current = (current as NSString).deletingLastPathComponent
             var st = stat()
-            if lstat(p, &st) == 0 {
+            if lstat(current + "/.git", &st) == 0 { return current }
+        }
+        return nil
+    }
+
+    /// Newest modification time of anything inside a project, found by walking it (symlinks are not
+    /// followed). Not looked into: the build folders in `skipping` (full paths) and `.git/objects`.
+    /// Fails CLOSED: when more than `maxEntries` entries would have to be examined, or something cannot be
+    /// read, the answer is "now", so the project counts as touched today (idle 0 days).
+    static func lastTouched(project: String, skipping: Set<String>, maxEntries: Int = 100_000) -> TimeInterval {
+        let now = Date().timeIntervalSince1970
+        var newest: TimeInterval = 0
+        var seen = 0
+        var stack = [project]
+        while let dir = stack.popLast() {
+            guard let entries = readDir(dir) else { return now }
+            let insideGitDir = (dir as NSString).lastPathComponent == ".git"
+            for e in entries {
+                let path = dir + "/" + e.name
+                if skipping.contains(path) { continue }
+                if insideGitDir && e.name == "objects" { continue }
+                seen += 1
+                if seen > maxEntries { return now }
+                var st = stat()
+                guard lstat(path, &st) == 0 else { return now }
                 newest = max(newest, TimeInterval(st.st_mtimespec.tv_sec) + TimeInterval(st.st_mtimespec.tv_nsec) / 1e9)
+                if e.isDir && !e.isLink { stack.append(path) }
             }
         }
         return newest
@@ -162,8 +189,9 @@ enum ProjectWalker {
 // MARK: - Git safety filter
 
 enum GitArtifactFilter {
-    /// Drops candidates that contain git-tracked files and, for risky names, those that are not ignored by git
-    /// or not inside a git repository at all. If git cannot answer, or the repository's configuration is not
+    /// Drops candidates in which git lists tracked files and, for risky names, those that are not ignored by git
+    /// or not inside a git repository at all. Every candidate that lies inside a repository (found at or above
+    /// the scan root) goes through this check. If git cannot answer, or the repository's configuration is not
     /// trusted (git is then not run in it at all), the candidate is dropped.
     static func filter(_ candidates: [ArtifactCandidate], env: EngineEnvironment) async -> [ArtifactCandidate] {
         var byRepo: [String: [ArtifactCandidate]] = [:]
@@ -259,20 +287,15 @@ extension LiveEngine {
         if Task.isCancelled { return [] }
 
         let now = Date().timeIntervalSince1970
-        var matchedByProject: [String: Set<String>] = [:]
-        for c in candidates {
-            let first = c.path.dropFirst(c.project.count + 1).split(separator: "/").first.map(String.init) ?? ""
-            matchedByProject[c.project, default: []].insert(first)
-        }
-        let matchedSnapshot = matchedByProject
-        let idleByProject: [String: Int] = await onBackground {
-            var out: [String: Int] = [:]
-            for (project, matched) in matchedSnapshot {
-                let touched = ProjectWalker.lastTouched(project: project, artifacts: matched)
-                out[project] = max(0, Int((now - touched) / 86400))
+        // Build folders (of this project and of projects nested in it) are not project activity.
+        let artifactPaths = Set(candidates.map(\.path))
+        let projects = Array(Set(candidates.map(\.project)))
+        let idleDays = await boundedMap(projects, limit: 6) { project -> Int in
+            await onBackground {
+                max(0, Int((now - ProjectWalker.lastTouched(project: project, skipping: artifactPaths)) / 86400))
             }
-            return out
         }
+        let idleByProject = Dictionary(uniqueKeysWithValues: zip(projects, idleDays))
         progress("Measuring \(candidates.count) build folders…")
         let sizes = await Self.measure(candidates.map(\.path))
         var out: [ProjectArtifact] = []

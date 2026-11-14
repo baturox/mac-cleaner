@@ -159,32 +159,116 @@ final class GitSecurityTests: EngineTestCase {
         try f.repo("seed-sub")
         try f.git("code/parent", "-c", "protocol.file.allow=always", "submodule", "add", "-q", f.path("seed-sub"), "sub")
         try f.git("code/parent", "commit", "-q", "-m", "add submodule")
+        // The submodule is clean and "pushed": its origin is a network URL and the remote-tracking refs from
+        // the clone are there. So the only thing that can make the parent not backed up is the audit below.
+        try f.git("code/parent/sub", "remote", "set-url", "origin", "https://example.invalid/acme/sub.git")
+        func parent() async throws -> RepoClone {
+            let groups = await f.engine().scanRepos(root: URL(fileURLWithPath: f.path("code")), progress: { _ in })
+            return try XCTUnwrap(groups.flatMap(\.clones).first { $0.url.path == f.path("code/parent") })
+        }
+        // Positive control 1: with an honest submodule the parent has nothing uncommitted. If submodules were
+        // never looked at, this would hold as well, which is why the next step must change it.
+        let honest = try await parent()
+        XCTAssertTrue(honest.wasInspected)
+        XCTAssertEqual(honest.uncommittedCount, 0, "an inspected, clean, pushed submodule adds nothing")
+
         try appendConfig(f.path("code/parent/.git/modules/sub/config"), "[core]\n\tfsmonitor = \(h.script)")
+        // Positive control 2: plain git inside the submodule runs the payload.
+        try assertExploitable(h, in: "code/parent/sub")
+        // So does a plain status of the PARENT that looks into submodules (what the engine must never do).
         h.reset()
-        let groups = await f.engine().scanRepos(root: URL(fileURLWithPath: f.path("code")), progress: { _ in })
-        let parent = try XCTUnwrap(groups.flatMap(\.clones).first { $0.url.path == f.path("code/parent") })
-        XCTAssertTrue(parent.wasInspected, "the parent's own configuration is fine")
-        XCTAssertGreaterThan(parent.uncommittedCount, 0, "a submodule that cannot be inspected counts as unsaved work")
-        XCTAssertFalse(parent.isFullyBackedUp)
-        XCTAssertFalse(h.fired, "git must not have been run inside the submodule")
+        _ = try? f.git("code/parent", "status", "--porcelain=v1")
+        XCTAssertTrue(h.fired, "git recursing into the submodule from the parent is exploitable; the test would prove nothing")
+        h.reset()
+
+        let hostile = try await parent()
+        XCTAssertTrue(hostile.wasInspected, "the parent's own configuration is fine")
+        XCTAssertEqual(hostile.uncommittedCount, 1, "the submodule was audited, found untrusted, and counts as work that cannot be verified")
+        XCTAssertFalse(hostile.isFullyBackedUp)
+        XCTAssertFalse(h.fired, "git must not have been run inside the submodule, directly or through the parent")
+        // The submodule itself is reported as untrusted when asked directly.
+        let sub = await RepoInspector.inspect(path: f.path("code/parent/sub"), isLinkedWorktree: false, env: f.env)
+        XCTAssertEqual(sub.untrustedKeys, ["core.fsmonitor"])
+        XCTAssertFalse(h.fired)
     }
 
     // MARK: Layers 2 and 3 on their own (configuration turns hostile AFTER the audit)
 
-    func testHardenedInvocationStopsFsmonitorHooksAndPagerWithoutTheAudit() async throws {
+    /// Runs plain `/usr/bin/git` (optionally on a pseudo-terminal, which is the only place git starts a pager)
+    /// with exactly the given extra options, in the fixture's clean environment.
+    private func plainGit(_ h: Hostile, tty: Bool = false, _ args: [String]) {
+        let p = Process()
+        let git = ["/usr/bin/git", "-C", h.f.path(h.rel)] + args
+        p.executableURL = URL(fileURLWithPath: tty ? "/usr/bin/script" : git[0])
+        p.arguments = tty ? ["-q", "/dev/null"] + git : Array(git.dropFirst())
+        var env = ChildEnvironment.base(home: h.f.home, tmp: h.f.env.tmp)
+        env["GIT_CONFIG_GLOBAL"] = "/dev/null"; env["GIT_CONFIG_NOSYSTEM"] = "1"; env["TERM"] = "xterm"
+        p.environment = env
+        p.standardInput = FileHandle.nullDevice; p.standardOutput = FileHandle.nullDevice; p.standardError = FileHandle.nullDevice
+        guard (try? p.run()) != nil else { return }
+        p.waitUntilExit()
+    }
+
+    func testHardenedInvocationStopsFsmonitorHooksAndPagerEachOnItsOwnAndTogether() async throws {
         let f = try Fixture()
         let h = try makeRepo(f)
         guard case .trusted(let repo) = await Git.open(f.path(h.rel), env: f.env) else { return XCTFail("clean repo must be trusted") }
+        let hooks = try f.dir(f.root + "/hooks")
+        for hook in ["post-index-change", "reference-transaction", "post-checkout", "pre-commit"] {
+            try f.file(hooks + "/" + hook, "#!/bin/sh\n/usr/bin/touch '\(h.marker)'\nexit 0\n")
+            chmod(hooks + "/" + hook, 0o755)
+        }
+        /// One way in at a time: the setting, the plain command that triggers it, and the single override
+        /// from `Git.hardening` that must defeat it.
+        struct Vector { var name: String; var key: String; var value: String; var command: [String]; var tty: Bool; var override: [String] }
+        let vectors = [
+            Vector(name: "fsmonitor", key: "core.fsmonitor", value: h.script, command: ["status", "--porcelain=v1"], tty: false,
+                   override: ["-c", "core.fsmonitor=false"]),
+            Vector(name: "hook", key: "core.hooksPath", value: hooks, command: ["status", "--porcelain=v1"], tty: false,
+                   override: ["-c", "core.hooksPath=/dev/null"]),
+            Vector(name: "pager (config)", key: "core.pager", value: h.script, command: ["log", "-1"], tty: true,
+                   override: ["-c", "core.pager=cat"]),
+            Vector(name: "pager (switch)", key: "core.pager", value: h.script, command: ["log", "-1"], tty: true,
+                   override: ["--no-pager"]),
+        ]
+        for v in vectors {
+            // The engine really passes this override.
+            XCTAssertTrue(Git.hardening.joined(separator: " ").contains(v.override.joined(separator: " ")), "\(v.name): \(v.override) is not in Git.hardening")
+            try f.git(h.rel, "config", v.key, v.value)
+            // Positive control: without the override the payload runs.
+            try touch(f, h.rel + "/a.txt")
+            h.reset()
+            plainGit(h, tty: v.tty, v.command)
+            XCTAssertTrue(h.fired, "\(v.name): the fixture is not exploitable; the test would prove nothing")
+            // With only that one override it does not.
+            try touch(f, h.rel + "/a.txt")
+            h.reset()
+            plainGit(h, tty: v.tty, v.override + v.command)
+            XCTAssertFalse(h.fired, "\(v.name): \(v.override) did not stop it")
+            try f.git(h.rel, "config", "--unset", v.key)
+        }
+        // All of them at once, through the engine's own entry point, sandbox off, on a pseudo-terminal-free
+        // pipe and with every command the engine uses.
         try f.git(h.rel, "config", "core.fsmonitor", h.script)
         try f.git(h.rel, "config", "core.pager", h.script)
-        try f.git(h.rel, "config", "core.hooksPath", f.root)
+        try f.git(h.rel, "config", "core.hooksPath", hooks)
+        try touch(f, h.rel + "/a.txt")
         try assertExploitable(h)
+        try touch(f, h.rel + "/a.txt")
         var env = f.env
         env.sandboxGit = false
-        for args in [["status", "--porcelain=v1", "-uall"], ["ls-files", "-z"], ["check-ignore", "--", "dist/"], ["log", "-1", "--format=%ct"]] {
-            _ = await Git.run(repo, args, env: env)
+        for args in [["status", "--porcelain=v1", "-uall"], ["status", "--porcelain=v1", "-z", "--untracked-files=normal", "--ignored=matching"],
+                     ["ls-files", "-z"], ["ls-files", "-v", "-z"], ["ls-files", "-s", "-z"], ["check-ignore", "--", "dist/"],
+                     ["log", "-1", "--format=%ct"], ["for-each-ref", "--format=%(refname)", "refs/stash"], ["symbolic-ref", "--short", "-q", "HEAD"],
+                     ["rev-list", "--count", "HEAD"], ["rev-parse", "--git-common-dir", "--absolute-git-dir"]] {
+            let r = await Git.run(repo, args, env: env)
+            XCTAssertTrue(r.launched, "\(args)")
         }
+        _ = await Git.run(repo, ["worktree", "prune"], env: env, mutating: true)
         XCTAssertFalse(h.fired, "command-line overrides must beat the repository's settings")
+        // And the whole hardened argv on a pseudo-terminal: no pager either.
+        plainGit(h, tty: true, Git.hardening + ["log", "-1"])
+        XCTAssertFalse(h.fired, "a pager was started although the engine's options were given")
     }
 
     func testSandboxStopsAFilterEvenWhenTheAuditIsBypassed() async throws {
@@ -215,8 +299,25 @@ final class GitSecurityTests: EngineTestCase {
         let h = try makeRepo(f)
         // What a hostile parent process could set: an fsmonitor through the environment, another git dir.
         setenv("GIT_CONFIG_COUNT", "1", 1); setenv("GIT_CONFIG_KEY_0", "core.fsmonitor", 1); setenv("GIT_CONFIG_VALUE_0", h.script, 1)
-        setenv("GIT_DIR", "/nonexistent", 1)
         defer { for v in ["GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0", "GIT_DIR"] { unsetenv(v) } }
+        // Positive control: a child that simply inherits this process's environment (what `Process` does by
+        // default) runs the payload, in a repository whose own configuration is perfectly clean.
+        func inherit(_ args: [String]) -> Int32 {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+            p.arguments = ["-C", f.path(h.rel)] + args
+            p.standardOutput = FileHandle.nullDevice; p.standardError = FileHandle.nullDevice
+            guard (try? p.run()) != nil else { return -1 }
+            p.waitUntilExit()
+            return p.terminationStatus
+        }
+        h.reset()
+        XCTAssertEqual(inherit(["status", "--porcelain=v1"]), 0)
+        XCTAssertTrue(h.fired, "the inherited variables are not an exploit here; the test would prove nothing")
+        h.reset()
+        setenv("GIT_DIR", "/nonexistent", 1)
+        XCTAssertNotEqual(inherit(["rev-parse", "HEAD"]), 0, "positive control: an inherited GIT_DIR redirects plain git")
+
         let env = Git.environment(f.env)
         XCTAssertTrue(env.keys.filter { $0.hasPrefix("GIT_") }.allSatisfy {
             ["GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_GLOBAL", "GIT_ATTR_NOSYSTEM", "GIT_TERMINAL_PROMPT", "GIT_OPTIONAL_LOCKS",
@@ -224,11 +325,20 @@ final class GitSecurityTests: EngineTestCase {
         }, "\(env.keys.sorted())")
         XCTAssertEqual(env["GIT_CONFIG_GLOBAL"], "/dev/null")
         XCTAssertEqual(env["PATH"], "/usr/bin:/bin:/usr/sbin:/sbin")
-        let groups = await f.engine().scanRepos(root: URL(fileURLWithPath: f.path("code")), progress: { _ in })
+        XCTAssertNil(env["DYLD_INSERT_LIBRARIES"])
+        // End to end, sandbox off so that only the constructed environment stands between the variables and git.
+        var noSandbox = f.env
+        noSandbox.sandboxGit = false
+        try touch(f, h.rel + "/a.txt")
+        let engine = LiveEngine(env: noSandbox, settings: SettingsBox(), client: .cli, appVersion: "t")
+        let groups = await engine.scanRepos(root: URL(fileURLWithPath: f.path("code")), progress: { _ in })
         let c = try XCTUnwrap(groups.flatMap(\.clones).first)
         XCTAssertTrue(c.wasInspected)
         XCTAssertEqual(c.branch, "main", "GIT_DIR from the environment must not redirect git")
-        XCTAssertFalse(h.fired)
+        XCTAssertEqual(c.uncommittedCount, 0)
+        let artifacts = await engine.scanProjects(root: URL(fileURLWithPath: f.path("code")), minBytes: 1, progress: { _ in })
+        XCTAssertEqual(Set(artifacts.map(\.kind)), ["node_modules", "dist"], "git answered (through the engine's own environment)")
+        XCTAssertFalse(h.fired, "a variable inherited from the parent process reached git")
     }
 
     // MARK: The allowlist
@@ -264,6 +374,7 @@ final class GitSecurityTests: EngineTestCase {
             ("log.showsignature", "true"), ("trace2.eventtarget", "/tmp/x"), ("sendemail.smtpserver", "x"), ("man.x.cmd", "x"),
             ("browser.x.cmd", "x"), ("web.browser", "x"), ("instaweb.httpd", "x"), ("trailer.x.command", "x"), ("lfs.extension.x.clean", "x"),
             ("fsmonitor.socketdir", "x"), ("totallyunknown.key", "x"), ("nodot", "x"),
+            ("gc.recentobjectshook", "x"), ("core.ignorestat", "true"), ("pull.twohead", "x"), ("init.templatedir", "/tmp/t"),
         ]
         for (k, v) in dangerous { XCTAssertFalse(GitConfigPolicy.isHarmless(key: k, value: v), "\(k)=\(v ?? "(none)")") }
         XCTAssertEqual(GitConfigPolicy.reportName("credential.https://user:secret@host.helper"), "credential.*.helper",

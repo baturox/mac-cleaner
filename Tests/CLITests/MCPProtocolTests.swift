@@ -196,9 +196,32 @@ final class MCPProtocolTests: XCTestCase {
 
     func testFinalLineWithoutNewlineIsStillServed() async throws {
         let (h, _, _) = try harness()
-        h.send(#"{"jsonrpc":"2.0","id":9,"method":"ping","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}"#.replacingOccurrences(of: "\n", with: ""))
+        // Positive control: a complete line is answered while the input is still open.
+        let first = await h.request("ping")
+        XCTAssertNotNil(first?["result"])
+        // The last message has NO line feed; only the end of input terminates it.
+        h.sendRaw(#"{"jsonrpc":"2.0","id":9,"method":"ping","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}"#)
+        let early = await h.response(id: 9, timeout: 0.3)
+        XCTAssertNil(early, "an unterminated line cannot have been served before the input ended")
+        h.closeInput()
         let r = await h.response(id: 9)
         XCTAssertNotNil(r?["result"])
+        let done = await h.waitUntilFinished()
+        XCTAssertTrue(done)
+    }
+
+    func testDefaultLineLimitIsOneMebibyte() async throws {
+        XCTAssertEqual(MCPOptions().maxLineBytes, 1 << 20)
+        let (h, _, _) = try harness()
+        // Positive control: a line just below the limit is parsed (and rejected as JSON-RPC, not for its size).
+        h.send(String(repeating: "a", count: (1 << 20) - 10))
+        let under = await h.response(id: .null, timeout: 10)
+        XCTAssertFalse((under?["error"]?["message"]?.string ?? "too large").contains("too large"))
+        h.send(String(repeating: "a", count: (1 << 20) + 10))
+        let over = await h.response(id: .null, timeout: 10)
+        XCTAssertTrue((over?["error"]?["message"]?.string ?? "").contains("too large"))
+        let ping = await h.request("ping")
+        XCTAssertNotNil(ping?["result"])
     }
 
     func testInvalidToolArgumentsAreToolErrors() async throws {

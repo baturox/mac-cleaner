@@ -35,6 +35,36 @@ final class HistoryCommandTests: XCTestCase {
         XCTAssertTrue(r.out.contains("~/Library/Caches/cache"))
     }
 
+    func testInterruptedOperationIsShownAsOutcomeUnknownWithItsIntendedItems() async throws {
+        let e = FakeEngine()
+        var unfinished = record(1, name: "victim")
+        unfinished.phase = .started
+        unfinished.freedBytes = 0
+        unfinished.items[0].outcome = .pending
+        var done = record(5, name: "done")
+        done.phase = .finished
+        e.audit = [unfinished, done]
+        var r = await invoke(["history", "--no-color"], engine: e)
+        XCTAssertEqual(r.code, 0)
+        XCTAssertTrue(r.out.contains("cleanup (interrupted)"), r.out)
+        XCTAssertTrue(r.out.contains("unknown"))
+        XCTAssertTrue(r.out.contains("1 operation was interrupted"), r.out)
+        XCTAssertTrue(r.out.contains("outcome is unknown"))
+        r = await invoke(["history", "--items", "--no-color"], engine: e)
+        XCTAssertTrue(r.out.contains("Interrupted - outcome unknown"), r.out)
+        XCTAssertTrue(r.out.contains("~/Library/Caches/victim"), "the intended items are listed")
+        let lines = r.out.split(separator: "\n").map(String.init)
+        XCTAssertTrue(lines.contains { $0.contains("victim") && $0.contains("unknown") && !$0.contains(" ok ") })
+        XCTAssertTrue(lines.contains { $0.contains("Caches/done") && $0.contains("ok") }, "positive control: a finished item is still shown as ok")
+        // JSON: the record carries its phase, and the report counts the unfinished ones.
+        let j = await invoke(["history", "--json"], engine: e)
+        let obj = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(j.out.utf8)) as? [String: Any])
+        XCTAssertEqual(obj["unfinishedOperations"] as? Int, 1)
+        let records = try XCTUnwrap(obj["records"] as? [[String: Any]])
+        XCTAssertEqual(records.map { $0["phase"] as? String }, ["started", "finished"])
+        XCTAssertEqual((records[0]["items"] as? [[String: Any]])?.first?["outcome"] as? String, "pending")
+    }
+
     func testJSONOutputIsExactAndSchemaVersioned() async throws {
         let e = FakeEngine()
         e.audit = [record(1, name: "x\u{1B}[31m")]

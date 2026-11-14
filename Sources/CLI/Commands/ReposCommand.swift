@@ -126,7 +126,11 @@ enum ReposCommand {
     static func statusText(_ c: RepoClone) -> String {
         if !c.wasInspected { return untrustedStatus }
         var parts: [String] = []
-        if c.uncommittedCount > 0 { parts.append("\(c.uncommittedCount) uncommitted") }
+        let visible = c.uncommittedCount - c.hiddenFromStatusCount
+        if visible > 0 { parts.append("\(visible) uncommitted") }
+        if c.hiddenFromStatusCount > 0 {
+            parts.append("\(c.hiddenFromStatusCount) file\(c.hiddenFromStatusCount == 1 ? "" : "s") hidden from git status")
+        }
         let detachedWorktree = c.isLinkedWorktree && c.branch == nil
         if let u = c.unpushedCount {
             // A worktree on a branch keeps its commits in the main clone, so they are not at risk here.
@@ -165,6 +169,9 @@ enum ReposCommand {
                 guard let keys = c.untrustedConfigKeys else { continue }
                 ctx.out(s.yellow("  ! \(c.url.lastPathComponent): its git configuration has settings that can run programs "
                                  + "(\(keys.joined(separator: ", "))). git was not run in it; it is never removed from here."))
+            }
+            if g.clones.contains(where: { $0.hiddenFromStatusCount > 0 }) {
+                ctx.out(s.dim("  \"hidden from git status\": tracked files flagged skip-worktree or assume-unchanged; git does not report edits in them, so they cannot be verified."))
             }
             if g.clones.contains(where: { $0.ignoredFileCount > 0 }) {
                 ctx.out(s.dim("  \"ignored-only\": files git ignores that are not build output (.env, local data); they exist only in that copy."))

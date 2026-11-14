@@ -15,7 +15,8 @@ func runCLI(arguments: [String],
             engine: any CleanerEngine,
             console: Console,
             environment: [String: String] = ProcessInfo.processInfo.environment,
-            home: URL = URL(fileURLWithPath: NSHomeDirectory()),
+            home: URL = URL(fileURLWithPath: AccountEnvironment.home),
+            homeProblem: String? = AccountEnvironment.problem,
             probe: any SystemProbe = LiveProbe(),
             settingsStore: SettingsStore? = nil) async -> Int32 {
     var rest = arguments
@@ -107,6 +108,10 @@ func runCLI(arguments: [String],
         ctx.settingsStore = settingsStore
         ctx.settingsFile = settingsStore.map { abbreviateHome($0.fileURL.path, home: home) }
         ctx.settingsProblem = loaded.problem
+        ctx.homeProblem = homeProblem
+        if let homeProblem {
+            console.err("mac-cleaner: warning: \(homeProblem). Read-only commands work on the account's real home folder.")
+        }
         switch loaded {
         case .missing: ctx.settingsStatus = "missing"
         case .loaded: ctx.settingsStatus = "ok"

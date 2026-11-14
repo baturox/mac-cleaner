@@ -50,6 +50,11 @@ final class MCPHarness: @unchecked Sendable {
         try? inPipe.fileHandleForWriting.write(contentsOf: Data((text + "\n").utf8))
     }
 
+    /// Writes the bytes as they are: no line feed is added.
+    func sendRaw(_ text: String) {
+        try? inPipe.fileHandleForWriting.write(contentsOf: Data(text.utf8))
+    }
+
     func send(_ value: JSONValue) { send(JSON.compactString(value)) }
 
     func closeInput() { try? inPipe.fileHandleForWriting.close() }
@@ -147,9 +152,10 @@ final class MCPScratch {
         try FileManager.default.createDirectory(atPath: home + "/" + rel, withIntermediateDirectories: true)
     }
 
-    func tools(_ engine: any CleanerEngine, _ options: MCPOptions, clock: TestClock = TestClock(), extraProtected: [String] = []) -> MCPTools {
+    func tools(_ engine: any CleanerEngine, _ options: MCPOptions, clock: TestClock = TestClock(), extraProtected: [String] = [],
+               homeProblem: String? = nil) -> MCPTools {
         MCPTools(engine: engine, options: options, home: URL(fileURLWithPath: home), settingsStore: store,
-                 extraProtected: extraProtected, now: { clock.now() })
+                 extraProtected: extraProtected, homeProblem: homeProblem, now: { clock.now() })
     }
 }
 

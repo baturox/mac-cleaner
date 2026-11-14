@@ -135,10 +135,16 @@ struct Context {
     var settingsStatus = "missing"
     /// Set when the settings file exists but cannot be used.
     var settingsProblem: String?
+    /// Non-nil when the process was started with a relocated home folder; every deleting command refuses.
+    var homeProblem: String?
 
     /// Called right before anything is deleted. With an unusable settings file the user's protected folders
     /// are unknown, so deleting would be a guess.
     func requireUsableSettings() throws {
+        if let homeProblem {
+            throw RuntimeFailure("nothing is deleted: \(homeProblem). Start mac-cleaner without CFFIXED_USER_HOME. "
+                + "Read-only commands and -n/--dry-run still work.")
+        }
         guard let problem = settingsProblem else { return }
         throw RuntimeFailure("the settings file \(settingsFile ?? "settings.json") cannot be used (\(problem)), so your protected folders "
             + "are unknown. Nothing is deleted until that is fixed: open the Mac Cleaner app once to rewrite the file, or remove "

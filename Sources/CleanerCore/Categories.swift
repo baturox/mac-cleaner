@@ -78,8 +78,9 @@ func makeCategoryDefs(env: EngineEnvironment) -> [CatDef] {
                excludePaths: dedicatedAppSupportDirs.map { h + "/Library/Application Support/" + $0 }),
         CatDef(id: "xdg-cache", name: "Other CLI caches (~/.cache)", detail: "Rebuilt automatically by command-line tools",
                level: .safe, symbol: "terminal", globs: ["~/.cache/*"], exclude: carvedXDGCaches),
-        CatDef(id: "snapshots", name: "Time Machine local snapshots", detail: "Deleted data stays on disk until these go",
-               level: .safe, symbol: "clock.arrow.circlepath", needs: "tmutil"),
+        // Caution: a local snapshot is a restore point, and nothing recreates one that was removed.
+        CatDef(id: "snapshots", name: "Time Machine local snapshots", detail: "Restore points of the last day; deleted data stays on disk until these go. Not recreated",
+               level: .caution, symbol: "clock.arrow.circlepath", needs: "tmutil"),
 
         // ---- Package managers
         CatDef(id: "npm", name: "npm / npx cache", detail: "Re-downloaded on the next install",
@@ -148,8 +149,9 @@ func makeCategoryDefs(env: EngineEnvironment) -> [CatDef] {
                globs: ["iOS", "watchOS", "tvOS", "visionOS"].map { "~/Library/Developer/Xcode/\($0) DeviceSupport/*" }),
         CatDef(id: "sim-caches", name: "Simulator caches", detail: "Rebuilt automatically by the iOS Simulator",
                level: .safe, symbol: "ipad.and.iphone", group: .xcode, globs: ["~/Library/Developer/CoreSimulator/Caches/*"]),
-        CatDef(id: "sim-unavailable", name: "Simulators for runtimes no longer installed", detail: "Removes simulator devices whose runtime was deleted (xcrun simctl delete unavailable)",
-               level: .safe, symbol: "iphone.slash", group: .xcode, cmds: [["xcrun", "simctl", "delete", "unavailable"]], needs: "xcrun"),
+        // Caution: the devices (and the app data inside them) are deleted, not rebuilt.
+        CatDef(id: "sim-unavailable", name: "Simulators for runtimes no longer installed", detail: "Deletes simulator devices whose runtime is gone, with the app data in them (xcrun simctl delete unavailable)",
+               level: .caution, symbol: "iphone.slash", group: .xcode, cmds: [["xcrun", "simctl", "delete", "unavailable"]], needs: "xcrun"),
         CatDef(id: "xcode-previews", name: "SwiftUI previews & test devices", detail: "Preview and test simulators idle for a week; Xcode creates them again",
                level: .safe, symbol: "rectangle.on.rectangle", group: .xcode, minAgeDays: 7,
                globs: ["~/Library/Developer/Xcode/UserData/Previews/*", "~/Library/Developer/XCPGDevices/*", "~/Library/Developer/XCTestDevices/*"]),

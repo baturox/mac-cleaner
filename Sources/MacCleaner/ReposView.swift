@@ -239,7 +239,12 @@ struct ReposView: View {
             Chip(text: c.unpushedCount == 0 ? "clean & pushed" : "clean", tone: .good, symbol: "checkmark.circle.fill")
         } else {
             let detachedWorktree = c.isLinkedWorktree && c.branch == nil
-            if c.uncommittedCount > 0 { Chip(text: "\(c.uncommittedCount) uncommitted", tone: .bad, symbol: "pencil.circle.fill") }
+            let visibleChanges = c.uncommittedCount - c.hiddenFromStatusCount
+            if visibleChanges > 0 { Chip(text: "\(visibleChanges) uncommitted", tone: .bad, symbol: "pencil.circle.fill") }
+            if c.hiddenFromStatusCount > 0 {
+                Chip(text: "\(c.hiddenFromStatusCount) file\(c.hiddenFromStatusCount == 1 ? "" : "s") hidden from git status", tone: .bad, symbol: "eye.trianglebadge.exclamationmark")
+                    .help("Tracked files flagged skip-worktree or assume-unchanged in git's index. git status says nothing about them, so local edits in them cannot be verified.")
+            }
             if c.unpushedCount == nil {
                 if !c.isLinkedWorktree || detachedWorktree { Chip(text: "no remote", tone: .warn, symbol: "icloud.slash") }
             } else if let n = c.unpushedCount, n > 0, !c.isLinkedWorktree || detachedWorktree {
@@ -263,7 +268,8 @@ struct ReposView: View {
             parts.append("clean and pushed")
         } else {
             if c.ignoredFileCount > 0 { parts.append("\(c.ignoredFileCount) ignored files that exist only here") }
-            if c.uncommittedCount > 0 { parts.append("\(c.uncommittedCount) uncommitted files") }
+            if c.uncommittedCount - c.hiddenFromStatusCount > 0 { parts.append("\(c.uncommittedCount - c.hiddenFromStatusCount) uncommitted files") }
+            if c.hiddenFromStatusCount > 0 { parts.append("\(c.hiddenFromStatusCount) files hidden from git status") }
             if c.unpushedCount == nil { parts.append("no remote") }
             else if let n = c.unpushedCount, n > 0, !c.isLinkedWorktree { parts.append("\(n) unpushed commits") }
             if c.hasStash { parts.append("has stash") }

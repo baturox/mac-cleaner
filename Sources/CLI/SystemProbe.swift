@@ -95,7 +95,7 @@ func runProcess(_ argv: [String], timeout: TimeInterval) -> Data? {
     p.executableURL = URL(fileURLWithPath: exe)
     p.arguments = Array(argv.dropFirst())
     // A fixed, minimal environment: nothing from this process reaches the helper.
-    p.environment = ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": NSHomeDirectory(), "LANG": "C", "LC_ALL": "C"]
+    p.environment = ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": AccountEnvironment.home, "LANG": "C", "LC_ALL": "C"]
     let out = Pipe()
     p.standardOutput = out
     p.standardError = FileHandle.nullDevice

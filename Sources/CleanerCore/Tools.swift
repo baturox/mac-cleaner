@@ -113,7 +113,8 @@ enum ChildEnvironment {
     }
 
     /// For helpers that only measure (du) and take absolute paths.
-    static let system: [String: String] = base(home: NSHomeDirectory(), tmp: NSTemporaryDirectory())
+    static let system: [String: String] = base(home: EngineEnvironment.accountHome(uid: getuid()) ?? NSHomeDirectory(),
+                                               tmp: EngineEnvironment.userTempRoot())
 }
 
 extension EngineEnvironment {

@@ -1,11 +1,16 @@
 // Strict deletion (permanent or to the Trash) that cannot be redirected by symlinks, renames or letter case.
 //
-// The removal never re-resolves a path string while it works. It opens the target's parent folder by walking
+// Permanent removal never re-resolves a path string while it works. It opens the target's parent folder by walking
 // down from "/" one component at a time with O_NOFOLLOW (so no component can be a symlink), and from there
 // everything is done relative to open directory descriptors: `openat` to enter a folder, `fstat` to check
 // what was really opened, `unlinkat` to remove. If somebody swaps a folder for a symlink (or for another
 // folder) in the middle of the walk, the open fails or the identity check notices, and that entry is left
 // alone and counted as a failure. Symlinks are unlinked, never followed.
+//
+// Trash mode is different in one respect: the move itself is done by the system with the item's path. Before
+// it, the same checks run and the tree is walked read-only by descriptor (protected identities, other volumes
+// and foreign folders inside it make the move refuse), but the walk-and-remove guarantees above describe
+// permanent deletion only.
 import Foundation
 
 struct Deleter: Sendable {
@@ -73,7 +78,7 @@ struct Deleter: Sendable {
             current += "/" + comp
             if let root = sharedRoot, current.hasPrefix(root + "/") {
                 var st = stat()
-                guard fstat(fd, &st) == 0, st.st_uid == env.uid else { close(fd); return nil }
+                guard fstat(fd, &st) == 0, env.owner(st) == env.uid else { close(fd); return nil }
             }
         }
         return fd
@@ -114,17 +119,19 @@ struct Deleter: Sendable {
         return (results.reduce(0) { $0 + $1.failed }, results.flatMap { $0.messages })
     }
 
-    /// Like `remove`, with the outcome of every path (same order).
-    func removeEach(_ paths: [String], mode: DeleteMode = .permanent) -> [PathResult] {
-        paths.map { removeOne($0, mode: mode) }
+    /// Like `remove`, with the outcome of every path (same order). When `flag` is set the removal stops at
+    /// the next entry; what was not removed is reported as failed.
+    func removeEach(_ paths: [String], mode: DeleteMode = .permanent, flag: CancelFlag? = nil) -> [PathResult] {
+        paths.map { removeOne($0, mode: mode, flag: flag) }
     }
 
-    private func removeOne(_ path: String, mode: DeleteMode) -> PathResult {
+    private func removeOne(_ path: String, mode: DeleteMode, flag: CancelFlag?) -> PathResult {
         var res = PathResult(path: path)
         func fail(_ outcome: AuditOutcome, _ message: String) -> PathResult {
             res.failed += 1; res.messages.append(message); res.outcome = outcome; res.reason = message
             return res
         }
+        if flag?.isSet == true { return fail(.failed, "Not removed (the operation was cancelled): \(path)") }
         let trashDir = env.home + "/.Trash/"
         let name = (path as NSString).lastPathComponent
         guard isAllowed(path), let (parent, last) = split(path) else {
@@ -144,20 +151,27 @@ struct Deleter: Sendable {
             return res
         }
         let shared = env.sharedRoot(containing: path) != nil
-        if shared && st.st_uid != env.uid { return fail(.refused, "Refused (belongs to another user): \(path)") }
+        if shared && env.owner(st) != env.uid { return fail(.refused, "Refused (belongs to another user): \(path)") }
         if guardian.isProtectedID(FileID(st)) { return fail(.refused, "Refused (protected): \(path)") }
+        var walk = Walk(rootDev: st.st_dev, requiredOwner: shared ? env.uid : nil, guardian: guardian, env: env, flag: flag)
         if mode == .trash && !path.hasPrefix(trashDir) {
+            // The system moves the item by path, as one piece. Look inside first, read-only and by descriptor:
+            // whatever the permanent walk would refuse to touch must not be carried to the Trash either.
+            if let why = walk.obstacle(parentFD, last) {
+                return fail(.refused, "Refused to move \(name) to the Trash: \(why)")
+            }
             do { try env.trash(URL(fileURLWithPath: path)); res.trashed = true } catch {
                 return fail(.failed, "Could not move \(name) to the Trash")
             }
             return res
         }
-        var walk = Walk(rootDev: st.st_dev, requiredOwner: shared ? env.uid : nil, guardian: guardian)
         let e = walk.remove(parentFD, last)
         if e > 0 { walk.failed += 1 }
         if walk.failed > 0 {
             res.failed = walk.failed
             var note = "\(walk.failed) \(walk.failed == 1 ? "entry" : "entries") in \(name) could not be removed (in use or protected by macOS)"
+            if walk.skippedProtected > 0 { note += "; \(walk.skippedProtected) protected and left alone" }
+            if walk.cancelled { note += "; stopped because the operation was cancelled" }
             if walk.skippedForeign > 0 { note += "; \(walk.skippedForeign) changed or did not belong to you and were left alone" }
             res.messages.append(note)
             res.outcome = .failed
@@ -172,26 +186,55 @@ struct Deleter: Sendable {
         /// In shared temp areas: only folders owned by this user are entered.
         let requiredOwner: uid_t?
         let guardian: PathGuard
+        let env: EngineEnvironment
+        let flag: CancelFlag?
         var failed = 0
         var skippedForeign = 0
+        var skippedProtected = 0
+        var cancelled = false
+
+        /// Read-only twin of `remove`, for Trash mode: why the tree below entry `name` of `dir` must not be
+        /// moved as one piece, or nil. Same descriptor rules (O_NOFOLLOW, identity re-check after opening);
+        /// nothing is changed, not even a mode, so a folder that cannot be read counts as an obstacle.
+        func obstacle(_ dir: Int32, _ name: String) -> String? {
+            var st = stat()
+            if fstatat(dir, name, &st, AT_SYMLINK_NOFOLLOW) != 0 { return errno == ENOENT ? nil : "something in it cannot be examined" }
+            if guardian.isProtectedID(FileID(st)) { return "it contains a protected item" }
+            guard (st.st_mode & S_IFMT) == S_IFDIR else { return nil }
+            if st.st_dev != rootDev { return "it contains another volume" }
+            if let owner = requiredOwner, env.owner(st) != owner { return "it contains a folder that belongs to another user" }
+            let fd = openat(dir, name, Deleter.dirFlags)
+            guard fd >= 0 else { return "a folder in it cannot be read, so it cannot be checked for protected items" }
+            defer { close(fd) }
+            var now = stat()
+            guard fstat(fd, &now) == 0, now.st_dev == st.st_dev, now.st_ino == st.st_ino else { return "it changed while it was being checked" }
+            guard let children = Deleter.names(in: fd) else { return "a folder in it cannot be read, so it cannot be checked for protected items" }
+            for child in children {
+                if flag?.isSet == true { return "the operation was cancelled" }
+                if let why = obstacle(fd, child) { return why }
+            }
+            return nil
+        }
 
         /// Removes entry `name` of the open directory `dir`.
         /// Returns 0 when it is gone, an errno when the final removal failed and has NOT been counted yet
         /// (the caller may make its own folder writable and retry), or -1 when failures were already counted.
         mutating func remove(_ dir: Int32, _ name: String) -> Int32 {
             var st = stat()
+            if flag?.isSet == true { failed += 1; cancelled = true; return -1 }
             if fstatat(dir, name, &st, AT_SYMLINK_NOFOLLOW) != 0 { return errno == ENOENT ? 0 : errno }
-            if guardian.isProtectedID(FileID(st)) { failed += 1; return -1 }
+            if guardian.isProtectedID(FileID(st)) { failed += 1; skippedProtected += 1; return -1 }
             guard (st.st_mode & S_IFMT) == S_IFDIR else {
                 // Files, symlinks, sockets…: unlinked, never opened or followed.
                 if unlinkat(dir, name, 0) == 0 || errno == ENOENT { return 0 }
                 return errno
             }
             if st.st_dev != rootDev { failed += 1; return -1 }            // never descend into another volume
-            if let owner = requiredOwner, st.st_uid != owner { failed += 1; skippedForeign += 1; return -1 }
+            if let owner = requiredOwner, env.owner(st) != owner { failed += 1; skippedForeign += 1; return -1 }
 
             let original = st.st_mode & 0o7777
             var modeChanged = false
+            env.beforeDescend?(name)
             guard let fd = open(dir, name, expecting: st, original: original, modeChanged: &modeChanged) else {
                 failed += 1; skippedForeign += 1
                 return -1

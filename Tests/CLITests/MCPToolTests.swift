@@ -202,40 +202,103 @@ final class MCPToolTests: XCTestCase {
 
     // MARK: Hostile file names
 
-    func testHostileNamesAreSanitizedInEveryResult() async throws {
+    /// Every string anywhere in a decoded JSON value (keys included).
+    private func strings(in value: JSONValue?) -> [String] {
+        guard let value else { return [] }
+        if let s = value.string { return [s] }
+        if let a = value.array { return a.flatMap { strings(in: $0) } }
+        if let o = value.object { return o.flatMap { [$0.key] + strings(in: $0.value) } }
+        return []
+    }
+
+    /// Characters that must never reach the model: C0/C1 controls (a line feed is allowed only where
+    /// `allowLineFeed` says so), DEL, bidirectional overrides, zero-width and line/paragraph separators.
+    private func forbidden(in text: String, allowLineFeed: Bool = false) -> [UInt32] {
+        text.unicodeScalars.map(\.value).filter { v in
+            if v == 0x0A { return !allowLineFeed }
+            return v < 0x20 || (0x7F...0x9F).contains(v) || (0x200B...0x200F).contains(v) || (0x202A...0x202E).contains(v)
+                || v == 0x2028 || v == 0x2029 || (0x2060...0x206F).contains(v) || v == 0xFEFF
+        }
+    }
+
+    func testHostileNamesAreSanitizedInEveryResultOfEveryTool() async throws {
         let engine = FakeEngine()
         let s = try MCPScratch()
+        let evil = hostile + "\u{200B}\u{2028}\u{0085}\u{7F}"
         let longName = String(repeating: "x", count: 10_000)
-        let evilItem = CleanItem(url: URL(fileURLWithPath: s.home + "/Library/Caches/" + hostile), sizeBytes: 10, label: hostile)
+        let evilItem = CleanItem(url: URL(fileURLWithPath: s.home + "/Library/Caches/" + evil), sizeBytes: 10, label: evil)
         let longItem = CleanItem(url: URL(fileURLWithPath: s.home + "/Library/Caches/" + longName), sizeBytes: 9, label: longName)
-        var c = cacheCategory(s.home, name: hostile)
+        var c = cacheCategory(s.home, name: evil)
         c.items = [evilItem, longItem]
         engine.categories = [c]
-        engine.groups = [RepoGroup(id: "g", name: hostile, remote: nil, clones: [makeClone(s.home + "/code/" + hostile, branch: hostile)])]
+        try s.mkdir("code")
+        engine.groups = [RepoGroup(id: "g", name: evil, remote: "example.com/" + evil,
+                                   clones: [makeClone(s.home + "/code/" + evil, branch: evil, untrusted: [evil])])]
+        engine.artifacts = [ProjectArtifact(url: URL(fileURLWithPath: s.home + "/code/" + evil + "/node_modules"), kind: evil,
+                                            projectURL: URL(fileURLWithPath: s.home + "/code/" + evil), sizeBytes: 100_000_000, idleDays: 99)]
+        engine.folder = [FolderEntry(url: URL(fileURLWithPath: s.home + "/" + evil), name: evil, sizeBytes: 5, isDirectory: true)]
+        engine.growth = GrowthReport(previousDate: Date(), freeDeltaBytes: -1,
+                                     entries: [GrowthEntry(id: evil, name: evil, url: nil, previousBytes: 0, currentBytes: 100_000_000)])
+        engine.audit = [AuditRecord(id: "op-1", startedAt: Date(), endedAt: Date(), client: .mcp, appVersion: evil, kind: .cleanup,
+                                    mode: .permanent, planID: evil, freeBytesBefore: 0, freeBytesAfter: 1, freedBytes: 1, itemCount: 1,
+                                    failedItemCount: 1, items: [AuditItem(path: s.home + "/" + evil, name: evil, sizeBytes: 1,
+                                                                          action: .deleted, outcome: .failed, reason: evil)])]
+        engine.resultMessages = [evil]
         let o = cleanOptions()
         let h = MCPHarness(tools: s.tools(engine, o), options: o)
-        var outputs: [String] = []
-        outputs.append(await h.callTool("scan_cleanup").text)
-        outputs.append(await h.callTool("list_category_items", ["category": "user-caches"]).text)
-        outputs.append(await h.callTool("plan_cleanup", ["categories": ["user-caches"]]).text)
-        try s.mkdir("code")
-        outputs.append(await h.callTool("scan_repos").text)
-        for text in outputs {
-            XCTAssertFalse(text.isEmpty)
-            for u in text.unicodeScalars where u.value != 0x0A {
-                XCTAssertFalse(u.value < 0x20 || (0x7F...0x9F).contains(u.value) || u.value == 0x202E, "control character \(u.value) leaked")
+
+        // Positive control: the checker does see these characters when nothing removes them.
+        XCTAssertFalse(forbidden(in: evil).isEmpty)
+        XCTAssertEqual(Set(forbidden(in: strings(in: ["k": [.string(evil)]]).joined())), Set(forbidden(in: evil)))
+
+        var results: [(String, MCPHarness.ToolResult)] = []
+        results.append(("disk_status", await h.callTool("disk_status")))
+        results.append(("scan_cleanup", await h.callTool("scan_cleanup")))
+        results.append(("list_category_items", await h.callTool("list_category_items", ["category": "user-caches"])))
+        results.append(("scan_projects", await h.callTool("scan_projects", ["root": "~/code", "min_size_mb": 1])))
+        results.append(("scan_repos", await h.callTool("scan_repos")))
+        results.append(("explore_folder", await h.callTool("explore_folder")))
+        results.append(("growth_report", await h.callTool("growth_report")))
+        results.append(("audit_history", await h.callTool("audit_history", ["include_items": true])))
+        let plan = await h.callTool("plan_cleanup", ["categories": ["user-caches"], "include_project_artifacts": true, "project_root": "~/code", "min_size_mb": 1])
+        results.append(("plan_cleanup", plan))
+        results.append(("apply_cleanup", await h.callTool("apply_cleanup", ["plan_id": .string(plan.structured?["plan_id"]?.string ?? ""), "confirm": true])))
+        // Error results carry text too.
+        results.append(("error: unknown category", await h.callTool("list_category_items", ["category": .string(evil)])))
+        results.append(("error: unknown argument", await h.callTool("disk_status", [evil: 1])))
+        results.append(("error: bad plan group", await h.callTool("plan_cleanup", ["groups": [.string(evil)]])))
+        results.append(("error: bad plan category", await h.callTool("plan_cleanup", ["categories": [.string(evil)]])))
+        let listed = await h.request("tools/list")
+        XCTAssertEqual(Set(results.prefix(10).map(\.0)), Set(listed?["result"]?["tools"]?.array?.compactMap { $0["name"]?.string } ?? []),
+                       "every listed tool was exercised")
+
+        var sawTheHostileText = 0
+        for (name, r) in results {
+            XCTAssertNotNil(r.raw?["result"], "\(name) produced no result")
+            if !name.hasPrefix("error") { XCTAssertFalse(r.isError, "\(name): \(r.text.prefix(200))") }
+            // The decoded values, not the JSON text: escaping would hide a control character from a scan of the wire form.
+            let decoded = strings(in: r.structured) + strings(in: r.raw?["result"]?["content"])
+            XCTAssertFalse(decoded.isEmpty, name)
+            for value in decoded {
+                // The human-readable text block is "summary line, line feed, compact JSON": one line feed, added by the server.
+                let isTextBlock = value == r.text
+                XCTAssertEqual(forbidden(in: value, allowLineFeed: isTextBlock), [], "\(name) leaked a control character in \(value.prefix(60).debugDescription)")
+                if isTextBlock { XCTAssertLessThanOrEqual(value.filter { $0 == "\n" }.count, 1, name) }
+                else { XCTAssertLessThanOrEqual(value.count, 501, "\(name): a value is capped") }
+                if value.contains("IGNORE ALL PREVIOUS INSTRUCTIONS") { sawTheHostileText += 1 }
             }
-            XCTAssertLessThan(text.count, 20_000, "very long names are capped")
+            XCTAssertLessThan(r.text.count, 40_000, "\(name): very long names are capped")
         }
+        XCTAssertGreaterThan(sawTheHostileText, 15, "positive control: the hostile names did travel through the tools, as plain text")
         // The text that looks like an instruction is only ever a quoted JSON string value, never a message of its own.
         let list = await h.callTool("list_category_items", ["category": "user-caches"])
         let first = list.structured?["items"]?.array?.first
         XCTAssertTrue(first?["name"]?.string?.contains("IGNORE ALL PREVIOUS INSTRUCTIONS") ?? false)
-        XCTAssertFalse(first?["name"]?.string?.contains("\n") ?? true)
         XCTAssertEqual(first?["removed_by_command"]?.bool, false)
         XCTAssertLessThanOrEqual(list.structured?["items"]?.array?[1]["name"]?.string?.count ?? 0, 200)
-        XCTAssertTrue(engine.cleanedCalls.isEmpty, "nothing was applied")
         XCTAssertTrue(h.allRawLines.allSatisfy { JSON.parse(Data($0.utf8))?["jsonrpc"]?.string == "2.0" })
+        // On the wire every message is one line: the raw bytes hold no control character at all.
+        for line in h.allRawLines { XCTAssertEqual(forbidden(in: line), [], "raw line \(line.prefix(60))") }
     }
 
     func testSanitizerUnit() {

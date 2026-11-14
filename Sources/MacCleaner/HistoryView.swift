@@ -194,6 +194,10 @@ private struct HistoryRow: View {
                             ClientBadge(client: record.client)
                             if record.mode == .trash { KindBadge(kind: "Trash") }
                             if record.planID != nil { KindBadge(kind: "plan") }
+                            if record.isUnfinished {
+                                Text("interrupted — outcome unknown").foregroundStyle(.orange)
+                                    .help("This operation has no result record: its process ended before it finished (or it is still running). The items below are what it was about to remove; some, all or none may be gone.")
+                            }
                         }
                         .font(.caption).foregroundStyle(.secondary)
                     }
@@ -204,8 +208,12 @@ private struct HistoryRow: View {
                             .help("\(record.failedItemCount) item\(record.failedItemCount == 1 ? "" : "s") could not be removed or were refused")
                     }
                     VStack(alignment: .trailing, spacing: 2) {
-                        Text(record.mode == .trash ? "Moved to Trash" : Fmt.bytes(record.freedBytes)).monospacedDigit()
-                        if record.mode == .permanent { Text("freed").font(.caption).foregroundStyle(.secondary) }
+                        if record.isUnfinished {
+                            Text("unknown").foregroundStyle(.orange)
+                        } else {
+                            Text(record.mode == .trash ? "Moved to Trash" : Fmt.bytes(record.freedBytes)).monospacedDigit()
+                            if record.mode == .permanent { Text("freed").font(.caption).foregroundStyle(.secondary) }
+                        }
                     }
                     .frame(minWidth: 90, alignment: .trailing)
                 }
@@ -214,7 +222,9 @@ private struct HistoryRow: View {
             }
             .buttonStyle(.plain)
             .accessibilityElement(children: .combine)
-            .accessibilityLabel("\(title), \(record.client.rawValue), \(record.startedAt.formatted(date: .abbreviated, time: .shortened)), freed \(Fmt.bytes(record.freedBytes)), \(record.failedItemCount) failures")
+            .accessibilityLabel(record.isUnfinished
+                ? "\(title), \(record.client.rawValue), \(record.startedAt.formatted(date: .abbreviated, time: .shortened)), interrupted, outcome unknown"
+                : "\(title), \(record.client.rawValue), \(record.startedAt.formatted(date: .abbreviated, time: .shortened)), freed \(Fmt.bytes(record.freedBytes)), \(record.failedItemCount) failures")
             .accessibilityHint(expanded ? "Hides the items" : "Shows the items")
 
             if expanded { items }
@@ -223,6 +233,10 @@ private struct HistoryRow: View {
 
     private var items: some View {
         VStack(alignment: .leading, spacing: 0) {
+            if record.isUnfinished {
+                Text("Interrupted — outcome unknown. These are the items it was about to remove; some, all or none may be gone.")
+                    .font(.caption).foregroundStyle(.orange).padding(.horizontal, 62).padding(.vertical, 6)
+            }
             ForEach(Array(record.items.prefix(Self.itemCap).enumerated()), id: \.offset) { _, item in
                 ItemLine(item: item)
             }
@@ -279,6 +293,7 @@ private struct ItemLine: View {
         case .ok: Image(systemName: "checkmark.circle.fill").foregroundStyle(.green).help("Done").accessibilityLabel("Done")
         case .failed: Image(systemName: "xmark.circle.fill").foregroundStyle(.orange).help("Failed").accessibilityLabel("Failed")
         case .refused: Image(systemName: "hand.raised.circle.fill").foregroundStyle(.red).help("Refused").accessibilityLabel("Refused")
+        case .pending: Image(systemName: "questionmark.circle.fill").foregroundStyle(.orange).help("Outcome unknown").accessibilityLabel("Outcome unknown")
         }
     }
 }

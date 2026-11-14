@@ -58,20 +58,38 @@ enum RepoWalker {
         case submodule
     }
 
-    /// What the `.git` entry of `dir` says this folder is; nil when it is not a working copy.
+    /// What the `.git` entry of `dir` says this folder is; nil when it has none. Decided from the parsed
+    /// layout, never from what the path happens to look like: a linked worktree is a git directory that names
+    /// a separate common directory; a submodule is a git directory inside some repository's `modules` folder.
+    /// A `.git` entry that cannot be read the way git reads it is reported as a clone, so that it is listed
+    /// (as "not inspected") instead of disappearing.
     static func classify(_ dir: String) -> GitEntry? {
-        var st = stat()
-        guard lstat(dir + "/.git", &st) == 0 else { return nil }
-        if (st.st_mode & S_IFMT) == S_IFDIR { return .clone }
-        guard (st.st_mode & S_IFMT) == S_IFREG, let data = FileManager.default.contents(atPath: dir + "/.git"),
-              let text = String(data: data.prefix(4096), encoding: .utf8) else { return nil }
-        guard let line = text.split(whereSeparator: \.isNewline).first, line.hasPrefix("gitdir:") else { return nil }
-        var gitdir = line.dropFirst("gitdir:".count).trimmingCharacters(in: .whitespaces)
-        if !gitdir.hasPrefix("/") { gitdir = ((dir + "/" + gitdir) as NSString).standardizingPath }
-        if gitdir.contains("/modules/") { return .submodule }
-        if let r = gitdir.range(of: "/.git/worktrees/") { return .linked(main: String(gitdir[gitdir.startIndex..<r.lowerBound])) }
-        if gitdir.contains("/worktrees/") { return .linked(main: nil) }
-        return .clone
+        switch GitLayout.read(workTree: dir) {
+        case .none: return nil
+        case .suspicious: return .clone
+        case .layout(let layout):
+            if layout.isLinkedWorktree {
+                let common = layout.commonDir as NSString
+                return .linked(main: common.lastPathComponent == ".git" ? common.deletingLastPathComponent : nil)
+            }
+            if layout.gitDir != dir + "/.git", isSubmoduleGitDir(layout.gitDir) { return .submodule }
+            return .clone
+        }
+    }
+
+    /// `<superproject git dir>/modules/<name…>`: some ancestor called `modules` sits directly inside a git
+    /// directory (recognised by its `HEAD` and `objects`).
+    private static func isSubmoduleGitDir(_ gitDir: String) -> Bool {
+        var dir = (gitDir as NSString).deletingLastPathComponent
+        while dir.count > 1 {
+            if (dir as NSString).lastPathComponent == "modules" {
+                let parent = (dir as NSString).deletingLastPathComponent
+                var st = stat()
+                if lstat(parent + "/HEAD", &st) == 0, lstat(parent + "/objects", &st) == 0 { return true }
+            }
+            dir = (dir as NSString).deletingLastPathComponent
+        }
+        return false
     }
 
     /// Every working copy under `root` (submodules excluded). Artifact folders and hidden folders are not
@@ -103,7 +121,7 @@ enum RepoWalker {
                 if e.name == "vendor", ArtifactRules.bundlerVendor(parent: dir, siblings: names) { continue }
                 if dir == home && ProjectWalker.skipTop.contains(e.name) { continue }
                 let path = dir + "/" + e.name
-                if guardian.isProtected(path, checkAncestors: false) { continue }
+                if guardian.isHidden(path, checkAncestors: false) { continue }
                 stack.append(path)
             }
         }
@@ -122,12 +140,15 @@ struct RepoState: Sendable, Equatable {
     var remote: String?          // normalized
     /// Ignored entries that are not rebuildable output (see `RepoClone.ignoredFileCount`).
     var ignored = 0
+    /// Tracked files that exist on disk but are flagged skip-worktree or assume-unchanged in the index, so
+    /// `git status` says nothing about them whatever they contain. Included in `uncommitted`.
+    var hidden = 0
     /// Non-nil when git was not run because the repository's configuration is not trusted.
     var untrustedKeys: [String]?
 
     static func uninspected(_ keys: [String]) -> RepoState {
         RepoState(branch: nil, uncommitted: 0, unpushed: nil, hasStash: false, lastCommit: nil, remote: nil,
-                  ignored: 0, untrustedKeys: keys)
+                  ignored: 0, hidden: 0, untrustedKeys: keys)
     }
 }
 
@@ -178,9 +199,26 @@ enum RepoInspector {
         !name.isEmpty && name.range(of: "^[A-Za-z0-9][A-Za-z0-9._/-]*$", options: .regularExpression) != nil
     }
 
+    /// Submodules are inspected this many levels deep; anything deeper counts as "cannot verify".
+    static let maxSubmoduleDepth = 3
+
+    /// Tracked files `git status` is told not to look at: entries of `ls-files -v -z` tagged "S"
+    /// (skip-worktree) or with a lower-case letter (assume-unchanged), that exist in the work tree. A file
+    /// that is not on disk (a sparse checkout) holds nothing that could be lost and is not counted.
+    static func hiddenFromStatus(_ output: String, repo: String) -> Int {
+        var n = 0
+        for record in output.split(separator: "\0", omittingEmptySubsequences: true) {
+            guard record.count > 2, let tag = record.unicodeScalars.first else { continue }
+            guard tag == "S" || tag.properties.isLowercase else { continue }
+            var st = stat()
+            if lstat(repo + "/" + record.dropFirst(2), &st) == 0 { n += 1 }
+        }
+        return n
+    }
+
     /// Reads a working copy's state with git plumbing, after the configuration audit. If the configuration
     /// is not trusted git is not run at all. If git cannot answer, the state errs on the side of "not
-    /// backed up" (uncommitted = 1, unpushed = nil).
+    /// backed up" (uncommitted >= 1, unpushed = nil, a stash assumed).
     static func inspect(path: String, isLinkedWorktree: Bool, env: EngineEnvironment, depth: Int = 0) async -> RepoState {
         let repo: GitRepo
         switch await Git.open(path, env: env) {
@@ -194,11 +232,21 @@ enum RepoInspector {
         async let statusR = Git.run(repo, ["status", "--porcelain=v1", "-z", "-uall", "--ignore-submodules=all"], env: env, timeout: 90)
         async let ignoredR = Git.run(repo, ["status", "--porcelain=v1", "-z", "--untracked-files=normal", "--ignored=matching",
                                             "--ignore-submodules=all"], env: env, timeout: 90)
-        async let stashR = Git.run(repo, ["rev-parse", "-q", "--verify", "refs/stash"], env: env, timeout: 15)
+        // Prints the ref when there is a stash and nothing (still exit 0) when there is none, so "no stash"
+        // is told apart from every kind of failure.
+        async let stashR = Git.run(repo, ["for-each-ref", "--format=%(refname)", "refs/stash"], env: env, timeout: 15)
         async let logR = Git.run(repo, ["log", "-1", "--format=%ct", "--no-show-signature"], env: env, timeout: 15)
-        let (branch, status, ignoredOut, stash, log) = await (branchR, statusR, ignoredR, stashR, logR)
+        async let flagsR = Git.run(repo, ["ls-files", "-v", "-z"], env: env, timeout: 90)
+        let (branch, status, ignoredOut, stash, log, flags) = await (branchR, statusR, ignoredR, stashR, logR, flagsR)
 
         var uncommitted = status.ok ? parseStatus(status.stdout).count : 1
+        var hidden = 0
+        if flags.ok {
+            hidden = hiddenFromStatus(flags.stdout, repo: path)
+            uncommitted += hidden
+        } else {
+            uncommitted = max(uncommitted, 1)
+        }
         var ignored = 0
         if ignoredOut.ok {
             ignored = parseStatus(ignoredOut.stdout).filter { $0.code == "!!" && !isRebuildable(ignored: $0.path, repo: path) }.count
@@ -221,10 +269,17 @@ enum RepoInspector {
 
         // Submodules: each is a repository of its own inside this folder. One that holds work, or that
         // cannot be inspected, makes the parent "not backed up".
-        if depth < 3, env.exists(path + "/.gitmodules") || env.isDirectory(repo.layout.commonDir + "/modules") {
+        if env.exists(path + "/.gitmodules") || env.isDirectory(repo.layout.commonDir + "/modules") {
             let index = await Git.run(repo, ["ls-files", "-s", "-z"], env: env, timeout: 60)
             if !index.ok {
                 uncommitted += 1
+            } else if depth >= maxSubmoduleDepth {
+                // Too deep to follow: a checked-out submodule down here cannot be verified, so it counts as work.
+                let deeper = index.stdout.split(separator: "\0").contains { record in
+                    guard record.hasPrefix("160000 "), let tab = record.firstIndex(of: "\t") else { return false }
+                    return env.exists(path + "/" + record[record.index(after: tab)...] + "/.git")
+                }
+                if deeper { uncommitted += 1 }
             } else {
                 for record in index.stdout.split(separator: "\0") where record.hasPrefix("160000 ") {
                     guard let tab = record.firstIndex(of: "\t") else { continue }
@@ -239,8 +294,9 @@ enum RepoInspector {
         let commitDate = Double(log.stdout.trimmingCharacters(in: .whitespacesAndNewlines)).map { Date(timeIntervalSince1970: $0) }
         return RepoState(branch: branch.ok ? branch.stdout.trimmingCharacters(in: .whitespacesAndNewlines) : nil,
                          uncommitted: uncommitted, unpushed: unpushed,
-                         hasStash: !isLinkedWorktree && stash.ok,
-                         lastCommit: commitDate, remote: remote, ignored: ignored, untrustedKeys: nil)
+                         // Anything but a clean run that printed nothing counts as "has a stash / cannot tell".
+                         hasStash: !isLinkedWorktree && !(stash.ok && stash.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty),
+                         lastCommit: commitDate, remote: remote, ignored: ignored, hidden: hidden, untrustedKeys: nil)
     }
 
     /// Why a state is not fully backed up, for messages. Mirrors `RepoClone.isFullyBackedUp`.
@@ -249,7 +305,11 @@ enum RepoInspector {
             return "untrusted git configuration (\(keys.joined(separator: ", "))), not inspected"
         }
         var parts: [String] = []
-        if s.uncommitted > 0 { parts.append("\(s.uncommitted) uncommitted \(s.uncommitted == 1 ? "file" : "files")") }
+        let visible = s.uncommitted - s.hidden
+        if visible > 0 { parts.append("\(visible) uncommitted \(visible == 1 ? "file" : "files")") }
+        if s.hidden > 0 {
+            parts.append("\(s.hidden) \(s.hidden == 1 ? "file" : "files") hidden from git status (skip-worktree or assume-unchanged), which cannot be verified")
+        }
         if s.ignored > 0 { parts.append("\(s.ignored) ignored \(s.ignored == 1 ? "file" : "files") that exist only here") }
         if isLinkedWorktree {
             if s.branch == nil {
@@ -259,7 +319,7 @@ enum RepoInspector {
         } else {
             if let u = s.unpushed { if u > 0 { parts.append("\(u) unpushed \(u == 1 ? "commit" : "commits")") } }
             else { parts.append("no network remote (or unreadable)") }
-            if s.hasStash { parts.append("a stash") }
+            if s.hasStash { parts.append("a stash (or the stash could not be checked)") }
         }
         return parts.isEmpty ? nil : parts.joined(separator: ", ")
     }
@@ -272,7 +332,8 @@ extension LiveEngine {
         RepoClone(url: URL(fileURLWithPath: f.path, isDirectory: true), branch: state.branch,
                   isLinkedWorktree: f.isLinkedWorktree, uncommittedCount: state.uncommitted, unpushedCount: state.unpushed,
                   hasStash: state.hasStash, lastCommit: state.lastCommit, idleDays: idle, sizeBytes: size, artifactBytes: artifactBytes,
-                  ignoredFileCount: state.ignored, untrustedConfigKeys: state.untrustedKeys)
+                  ignoredFileCount: state.ignored, untrustedConfigKeys: state.untrustedKeys,
+                  hiddenFromStatusCount: state.hidden)
     }
 
     public func scanRepos(root: URL, progress: @escaping ProgressHandler) async -> [RepoGroup] {
@@ -296,10 +357,8 @@ extension LiveEngine {
                                                       guardian: guardian, progress: { _ in })
             let artifactSizes = await Self.measure(cands.map(\.path))
             let artifactBytes = artifactSizes.values.reduce(0, +)
-            var matched = Set<String>()
-            for c in cands where c.project == f.path { matched.insert((c.path as NSString).lastPathComponent) }
-            let matchedNames = matched
-            let touched = await onBackground { ProjectWalker.lastTouched(project: f.path, artifacts: matchedNames) }
+            let artifactPaths = Set(cands.map(\.path))
+            let touched = await onBackground { ProjectWalker.lastTouched(project: f.path, skipping: artifactPaths) }
             let st = await state
             let newest = max(touched, st.lastCommit?.timeIntervalSince1970 ?? 0)
             let idle = max(0, Int((Date().timeIntervalSince1970 - newest) / 86400))
@@ -332,10 +391,25 @@ extension LiveEngine {
 
     public func removeClones(_ clones: [RepoClone], force: Bool, mode: DeleteMode,
                              progress: @escaping ProgressHandler) async -> CleanResult {
-        let before = diskInfo().freeBytes
+        let flag = CancelFlag()
+        return await withTaskCancellationHandler {
+            await removeClonesBody(clones, force: force, mode: mode, flag: flag, progress: progress)
+        } onCancel: { flag.set() }
+    }
+
+    private func removeClonesBody(_ clones: [RepoClone], force: Bool, mode: DeleteMode, flag: CancelFlag,
+                                  progress: @escaping ProgressHandler) async -> CleanResult {
         let ctx = context()
         let deleter = Deleter(env: env, guardian: ctx.guardian)
-        var audit = AuditDraft(kind: .removeClones, mode: mode)
+        let intended = clones.map { c in
+            AuditItem(path: c.url.path, name: c.url.lastPathComponent, sizeBytes: c.sizeBytes,
+                      action: mode == .trash ? .movedToTrash : .deleted, outcome: .pending, branch: c.branch, forced: force)
+        }
+        var op: Operation
+        switch await begin(kind: .removeClones, mode: mode, intended: intended) {
+        case .refused(let result): return result
+        case .started(let started): op = started
+        }
         var failed = 0
         var messages: [String] = []
         for clone in clones {
@@ -344,9 +418,9 @@ extension LiveEngine {
             let name = (path as NSString).lastPathComponent
             progress("Checking \(name)…")
             func record(_ outcome: AuditOutcome, _ reason: String?, state: RepoState? = nil, backedUp: Bool? = nil, action: AuditAction = .deleted) {
-                audit.add(AuditItem(path: path, name: name, sizeBytes: clone.sizeBytes, action: action, outcome: outcome, reason: reason,
-                                    remote: state?.remote, branch: state?.branch ?? clone.branch,
-                                    fullyBackedUp: backedUp ?? clone.isFullyBackedUp, forced: force))
+                op.audit.add(AuditItem(path: path, name: name, sizeBytes: clone.sizeBytes, action: action, outcome: outcome, reason: reason,
+                                       remote: state?.remote, branch: state?.branch ?? clone.branch,
+                                       fullyBackedUp: backedUp ?? clone.isFullyBackedUp, forced: force))
             }
             guard deleter.isAllowed(path) else {
                 let m = "Refused (outside the allowed area, reached through a symlink, or protected): \(path)"
@@ -378,43 +452,61 @@ extension LiveEngine {
                     failed += 1; messages.append("Kept \(name): \(why). Back it up or remove it with force.")
                     record(.refused, "Kept: \(why)", state: state, backedUp: false); continue
                 }
-                if !isLinked, let why = await Self.nestedRisk(path: path, env: env, guardian: ctx.guardian) {
+                if let why = await Self.nestedRisk(path: path, env: env, guardian: ctx.guardian) {
                     failed += 1; messages.append("Kept \(name): \(why). Back it up or remove it with force.")
                     record(.refused, "Kept: \(why)", state: state, backedUp: false); continue
                 }
             }
-            // For a linked worktree, git in the main clone does the bookkeeping. The main clone's shared
-            // configuration was part of this worktree's audit; `Git.open` audits it again as the main clone.
-            var mainRepo: GitRepo?
-            if isLinked, let layout = GitLayout.of(workTree: path), layout.commonDir.hasSuffix("/.git") {
-                let main = (layout.commonDir as NSString).deletingLastPathComponent
-                if case .trusted(let r) = await Git.open(main, env: env) { mainRepo = r }
-            }
+            // A linked worktree is removed exactly like any other folder: by the descriptor walk, with every
+            // guarantee that comes with it. git is not given a path to delete. Afterwards only the stale
+            // registration in the main repository is pruned, and only when that repository may be written to.
             progress("Removing \(name)…")
-            if let mainRepo, mode == .permanent {
-                var r = await Git.run(mainRepo, ["worktree", "remove", "--force", path], env: env, timeout: 300, mutating: true)
-                if !r.ok { r = await Git.run(mainRepo, ["worktree", "remove", "--force", "--force", path], env: env, timeout: 300, mutating: true) }
-                if !r.ok {
-                    let m = "Could not remove worktree \(name): \(String(r.lastLine.prefix(160)))"
-                    failed += 1; messages.append(m)
-                    record(.failed, m, state: state, backedUp: backedUp)
-                } else {
-                    record(.ok, nil, state: state, backedUp: backedUp)
-                }
-                _ = await Git.run(mainRepo, ["worktree", "prune"], env: env, timeout: 60, mutating: true)
-            } else {
-                let r = (await onBackground { deleter.removeEach([path], mode: mode) })[0]
-                failed += r.failed; messages += r.messages
-                record(r.outcome, r.reason, state: state, backedUp: backedUp, action: r.trashed ? .movedToTrash : .deleted)
-                if let mainRepo {
-                    _ = await Git.run(mainRepo, ["worktree", "prune"], env: env, timeout: 60, mutating: true)
-                }
+            let r = (await onBackground { deleter.removeEach([path], mode: mode, flag: flag) })[0]
+            failed += r.failed; messages += r.messages
+            record(r.outcome, r.reason, state: state, backedUp: backedUp, action: r.trashed ? .movedToTrash : .deleted)
+            guard case .linked(let main) = kind, r.failed == 0 else { continue }
+            if let note = await pruneWorktrees(main: main, guardian: ctx.guardian) {
+                messages.append("Removed the worktree \(name). \(note)")
             }
         }
-        return await finish(before: before, failed: failed, messages: messages, audit: audit)
+        return await finish(op, failed: failed, messages: messages)
     }
 
-    /// Reasons deleting a normal clone would lose more than the clone itself: linked worktrees hanging off it
+    public func inspectClones(_ urls: [URL]) async -> [CloneInspection] {
+        let guardian = context().guardian
+        let env = self.env
+        return await boundedMap(urls, limit: 4) { url -> CloneInspection? in
+            let path = url.path
+            guard let kind = RepoWalker.classify(path), kind != .submodule else { return nil }
+            var isLinked = false
+            if case .linked = kind { isLinked = true }
+            let state = await RepoInspector.inspect(path: path, isLinkedWorktree: isLinked, env: env)
+            let clone = RepoClone(url: url, branch: state.branch, isLinkedWorktree: isLinked, uncommittedCount: state.uncommitted,
+                                  unpushedCount: state.unpushed, hasStash: state.hasStash, lastCommit: state.lastCommit, idleDays: 0,
+                                  sizeBytes: 0, artifactBytes: 0, ignoredFileCount: state.ignored,
+                                  untrustedConfigKeys: state.untrustedKeys, hiddenFromStatusCount: state.hidden)
+            let nested = state.untrustedKeys == nil ? await Self.nestedRisk(path: path, env: env, guardian: guardian) : nil
+            return CloneInspection(clone: clone, nestedRisk: nested)
+        }.compactMap { $0 }
+    }
+
+    /// Drops the registration of worktrees whose folder is gone, with hardened `git worktree prune` in the main
+    /// repository. Returns a note for the user when that was not done: the main repository is unknown,
+    /// protected (nothing is ever written inside a protected folder) or untrusted (git is never run in it).
+    func pruneWorktrees(main: String?, guardian: PathGuard) async -> String? {
+        let manual = "Run `git worktree prune` in the main repository yourself to drop its registration."
+        guard let main else { return "The main repository could not be determined. " + manual }
+        if guardian.isProtected(main) || guardian.isProtected(main + "/.git") {
+            return "The main repository is in a protected folder, so nothing was changed there. " + manual
+        }
+        guard case .trusted(let repo) = await Git.open(main, env: env) else {
+            return "The main repository's git configuration is not trusted, so git was not run there. " + manual
+        }
+        let r = await Git.run(repo, ["worktree", "prune"], env: env, timeout: 60, mutating: true)
+        return r.ok ? nil : "`git worktree prune` failed in the main repository (\(String(r.lastLine.prefix(120)))). " + manual
+    }
+
+    /// Reasons deleting a working copy would lose more than the copy itself: linked worktrees hanging off it
     /// and nested repositories with unsaved work (or that could not be inspected).
     static func nestedRisk(path: String, env: EngineEnvironment, guardian: PathGuard) async -> String? {
         if let wt = readDir(path + "/.git/worktrees"), !wt.isEmpty {

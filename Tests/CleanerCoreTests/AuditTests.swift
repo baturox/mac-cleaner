@@ -211,6 +211,83 @@ final class AuditTests: XCTestCase {
         XCTAssertEqual(skipped, 0)
     }
 
+    // MARK: Several processes (the app, the CLI and an MCP server can run at the same time)
+
+    private static let workerDirKey = "MACCLEANER_TEST_AUDIT_WORKER_DIR"
+    private static let workerTagKey = "MACCLEANER_TEST_AUDIT_WORKER_TAG"
+    private static let workerRecords = 40
+
+    /// Not a test of its own: the body the multi-process test below runs in separate `xctest` processes.
+    /// Without the two environment variables it does nothing.
+    func testAppendWorkerForTheMultiProcessTest() throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let dir = env[Self.workerDirKey], let tag = env[Self.workerTagKey] else { return }
+        guard dir.contains("/MacCleanerTests-") else { return XCTFail("refusing to write outside a test fixture") }
+        var store = AuditStore(directory: URL(fileURLWithPath: dir, isDirectory: true))
+        store.maxFileBytes = 200_000        // small, so that several processes also rotate the log at the same time
+        for i in 0..<Self.workerRecords {
+            var r = sample(name: "\(tag)-\(i)", items: 15)
+            r.appVersion = "pid-\(getpid())"
+            try store.append(r)
+        }
+    }
+
+    func testConcurrentAppendsFromSeveralProcessesStayIntact() throws {
+        let f = try Fixture()
+        let find = Process()
+        find.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
+        find.arguments = ["--find", "xctest"]
+        let pipe = Pipe()
+        find.standardOutput = pipe; find.standardError = FileHandle.nullDevice
+        guard (try? find.run()) != nil else { throw XCTSkip("xcrun is not available") }
+        let xctest = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+        find.waitUntilExit()
+        guard find.terminationStatus == 0, FileManager.default.isExecutableFile(atPath: xctest) else { throw XCTSkip("the xctest runner was not found") }
+        let bundle = Bundle(for: AuditTests.self).bundlePath
+        let dir = f.root + "/history"
+
+        var workers: [Process] = []
+        for w in 0..<4 {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: xctest)
+            p.arguments = ["-XCTest", "CleanerCoreTests.AuditTests/testAppendWorkerForTheMultiProcessTest", bundle]
+            var env = ProcessInfo.processInfo.environment
+            env[Self.workerDirKey] = dir
+            env[Self.workerTagKey] = "w\(w)"
+            p.environment = env
+            p.standardOutput = FileHandle.nullDevice; p.standardError = FileHandle.nullDevice
+            try p.run()
+            workers.append(p)
+        }
+        // This process appends at the same time, through the same code.
+        var store = AuditStore(directory: f.env.historyDir)
+        store.maxFileBytes = 200_000
+        for i in 0..<Self.workerRecords {
+            var r = sample(name: "main-\(i)", items: 15)
+            r.appVersion = "pid-\(getpid())"
+            try store.append(r)
+        }
+        for p in workers { p.waitUntilExit() }
+        guard workers.allSatisfy({ $0.terminationStatus == 0 }) else {
+            throw XCTSkip("the worker processes could not run the test bundle here (exit \(workers.map(\.terminationStatus)))")
+        }
+        // Every line that is on disk is a whole record; nothing was interleaved or torn by a concurrent rotation.
+        let (records, skipped) = store.readLines()
+        XCTAssertEqual(skipped, 0, "a line was damaged by concurrent appends")
+        XCTAssertGreaterThanOrEqual(Set(records.map(\.appVersion)).count, 3, "positive control: several processes really wrote")
+        XCTAssertEqual(Set(records.map(\.id)).count, records.count, "no record appears twice")
+        // Rotation keeps two files, so the oldest records may be gone; the newest of every writer must be there.
+        for tag in ["w0", "w1", "w2", "w3", "main"] {
+            XCTAssertTrue(records.contains { $0.items.first?.name == "\(tag)-\(Self.workerRecords - 1)" }, "the last record of \(tag) is missing")
+        }
+        for name in ["audit.jsonl", "audit.1.jsonl"] {
+            guard let data = FileManager.default.contents(atPath: dir + "/" + name) else { continue }
+            XCTAssertEqual(data.last, 0x0A, "\(name) must end with a complete line")
+            XCTAssertLessThan(data.count, 200_000 + 20_000)
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: dir + "/audit.1.jsonl"), "positive control: the log was rotated while several processes wrote")
+    }
+
     func testItemListIsCappedWithSummarizedRemainder() {
         var draft = AuditDraft(kind: .cleanup, mode: .permanent)
         for i in 0..<(AuditLimits.maxItems + 120) {

@@ -128,6 +128,12 @@ struct DoctorReport: Codable {
     /// How to start the MCP server (see the README).
     var mcpCommand: String = "mac-cleaner mcp"
     var recordAuditLog: Bool = true
+    /// The account's home folder, from the user database (never from HOME or CFFIXED_USER_HOME).
+    var homeFolder: String = ""
+    /// The per-user temp folder as the system defines it (never from TMPDIR).
+    var tempRoot: String = ""
+    /// Non-null when the process was started with a relocated home folder: every deleting command refuses.
+    var homeProblem: String?
 }
 
 /// What protects the user's own folders in this run.

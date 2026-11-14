@@ -152,6 +152,10 @@ final class FileSafetyTests: EngineTestCase {
         let stage = f.root + "/stage"
         try FileManager.default.createDirectory(atPath: stage, withIntermediateDirectories: true)
         var damaged = 0
+        /// Rounds in which the attacker's rename really replaced the folder (the exchange succeeded while the
+        /// folder still existed, i.e. before or during the walk). Without any, this test proves nothing.
+        let swaps = Counter()
+        var refusedRounds = 0
         let iterations = 30
         for round in 0..<iterations {
             for i in 0..<25 { try f.file("Documents/file\(i).txt", "precious") }
@@ -179,13 +183,18 @@ final class FileSafetyTests: EngineTestCase {
                     if lstat(old + "/sub/slow0/f0", &st) != 0 || lstat(old + "/sub/slow3/f199", &st) != 0 { break }
                 }
                 usleep(delay)
-                _ = renamex_np(old + "/sub", link, UInt32(RENAME_SWAP))
+                if renamex_np(old + "/sub", link, UInt32(RENAME_SWAP)) == 0 { swaps.increment() }
                 finished.signal()
             }
             attacker.start()
             started.wait()
-            _ = deleter.remove([old])
+            let before = swaps.value
+            let result = deleter.remove([old])
             finished.wait()
+            // When the exchange landed inside the walk, the deleter met a symlink where it had seen a folder
+            // and must have reported that instead of following it.
+            var st = stat()
+            if swaps.value > before, lstat(old + "/sub", &st) == 0, (st.st_mode & S_IFMT) == S_IFLNK, result.failed > 0 { refusedRounds += 1 }
 
             let left = (try? FileManager.default.contentsOfDirectory(atPath: f.path("Documents")))?.count ?? 0
             if left != 25 { damaged += 1 }
@@ -198,10 +207,55 @@ final class FileSafetyTests: EngineTestCase {
             }
         }
         XCTAssertEqual(damaged, 0, "the victim's folder lost files in \(damaged) of \(iterations) rounds")
+        XCTAssertGreaterThan(swaps.value, 0, "the attacker never managed to swap the folder: the race did not happen and nothing was proven")
+        // Not asserted (timing dependent), but reported: how often the swap hit the walk itself.
+        print("race test: \(swaps.value) successful swaps in \(iterations) rounds, \(refusedRounds) caught mid-walk")
     }
 
-    func testDeleterDoesNotCrossIntoAFolderThatReplacedTheOneItChecked() throws {
-        // Deterministic version of the race: the walk is given a parent that is a symlink.
+    /// The race above made deterministic: the folder is exchanged at the exact moment between the deleter's
+    /// look at it (`fstatat`) and its `openat`.
+    func testFolderSwappedForASymlinkOrForAnotherFolderDuringTheWalkIsLeftAlone() throws {
+        for kind in ["symlink", "folder"] {
+            let f = try Fixture()
+            for i in 0..<5 { try f.file("Documents/file\(i).txt", "precious") }
+            let tree = f.root + "/private-tmp/tree"
+            try f.file(tree + "/sub/a.txt", "x")
+            try f.file(tree + "/other/b.txt", "x")
+            // What the attacker puts in place of `sub`: a link to the victim's home, or another real folder.
+            let replacement = f.root + "/replacement"
+            if kind == "symlink" {
+                try FileManager.default.createSymbolicLink(atPath: replacement, withDestinationPath: f.path("Documents"))
+            } else {
+                try f.file(replacement + "/precious.txt", "precious")
+            }
+            let swaps = Counter()
+            f.env.beforeDescend = { name in
+                guard name == "sub", swaps.value == 0 else { return }
+                if renamex_np(tree + "/sub", replacement, UInt32(RENAME_SWAP)) == 0 { swaps.increment() }
+            }
+            let r = f.deleter().removeEach([tree], mode: .permanent)[0]
+            XCTAssertEqual(swaps.value, 1, "\(kind): positive control, the swap happened inside the walk")
+            XCTAssertGreaterThan(r.failed, 0, kind)
+            XCTAssertTrue(r.reason?.contains("changed or did not belong to you") ?? false, r.reason ?? "")
+            XCTAssertEqual((try? FileManager.default.contentsOfDirectory(atPath: f.path("Documents")))?.count, 5, "\(kind): the victim's folder is untouched")
+            XCTAssertFalse(f.exists(tree + "/other"), "\(kind): the rest of the tree was removed")
+            var st = stat()
+            XCTAssertEqual(lstat(tree + "/sub", &st), 0, "\(kind): the entry that changed is left in place")
+            if kind == "folder" {
+                XCTAssertTrue(f.exists(tree + "/sub/precious.txt"), "the folder that took its place keeps its content")
+            } else {
+                XCTAssertEqual(st.st_mode & S_IFMT, S_IFLNK)
+            }
+            // Positive control: with no swap the same tree is removed completely.
+            let g = try Fixture()
+            try g.file(g.root + "/private-tmp/tree/sub/a.txt", "x")
+            XCTAssertEqual(g.deleter().remove([g.root + "/private-tmp/tree"]).failed, 0)
+            XCTAssertFalse(g.exists(g.root + "/private-tmp/tree"))
+        }
+    }
+
+    func testPathWhoseParentBecameASymlinkBeforeTheRemovalIsRefused() throws {
+        // The swap happens before `remove` is called: the walk is given a parent that is a symlink.
         let f = try Fixture()
         try f.file("Documents/keep.txt")
         try f.file(f.root + "/private-tmp/work/victim/x")
@@ -215,7 +269,46 @@ final class FileSafetyTests: EngineTestCase {
         XCTAssertTrue(f.exists("Documents/keep.txt"))
     }
 
-    func testDeleterStaysOnOneVolumeAndRemovesNestedSymlinksAsLinks() throws {
+    /// A second volume mounted inside the tree (a small disk image made for this test): the walk must not
+    /// descend into it, and Trash mode must refuse to move a tree that contains it.
+    func testDeleterDoesNotDescendIntoAnotherVolume() throws {
+        let f = try Fixture()
+        try f.file("proj/build/a/b/c.txt")
+        let mount = try f.dir("proj/build/mnt")
+        let image = f.root + "/volume.dmg"
+        func hdiutil(_ args: [String]) -> Int32 {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/hdiutil")
+            p.arguments = args
+            p.standardOutput = FileHandle.nullDevice; p.standardError = FileHandle.nullDevice
+            do { try p.run() } catch { return -1 }
+            p.waitUntilExit()
+            return p.terminationStatus
+        }
+        guard hdiutil(["create", "-size", "4m", "-fs", "HFS+", "-volname", "MacCleanerTestVolume", "-quiet", image]) == 0,
+              hdiutil(["attach", image, "-nobrowse", "-quiet", "-mountpoint", mount]) == 0 else {
+            throw XCTSkip("a test disk image could not be created or attached here (hdiutil unavailable or not permitted)")
+        }
+        defer { _ = hdiutil(["detach", mount, "-force", "-quiet"]) }
+        try f.file(mount + "/on-the-other-volume.txt", "precious")
+        // Positive control: the mount point really is another device.
+        var inner = stat(), outer = stat()
+        XCTAssertEqual(lstat(mount, &inner), 0)
+        XCTAssertEqual(lstat(f.path("proj/build"), &outer), 0)
+        XCTAssertNotEqual(inner.st_dev, outer.st_dev, "the fixture volume is not a separate device; the test would prove nothing")
+
+        let trash = f.deleter().removeEach([f.path("proj/build")], mode: .trash)[0]
+        XCTAssertFalse(trash.trashed)
+        XCTAssertTrue(trash.reason?.contains("another volume") ?? false, trash.reason ?? "")
+        XCTAssertTrue(f.exists("proj/build/a/b/c.txt"), "a refused move changes nothing")
+
+        let r = f.deleter().removeEach([f.path("proj/build")], mode: .permanent)[0]
+        XCTAssertGreaterThan(r.failed, 0)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: mount + "/on-the-other-volume.txt"), "nothing on the other volume is touched")
+        XCTAssertFalse(f.exists("proj/build/a"), "everything on the tree's own volume is removed")
+    }
+
+    func testDeleterRemovesNestedSymlinksAsLinksAndNeverFollowsThem() throws {
         let f = try Fixture()
         let outside = try f.dir(f.root + "/outside")
         try f.file(f.root + "/outside/secret.txt")
@@ -354,4 +447,12 @@ final class FileSafetyTests: EngineTestCase {
         XCTAssertTrue(d.isAllowed(f.path("Documents/Thesis")), "the canonical spelling is fine")
         XCTAssertTrue(d.isAllowed(f.root + "/private-tmp/direct-link"), "the link itself, as an entry of /private/tmp")
     }
+}
+
+/// A thread-safe counter for tests in which another thread or a hook reports events.
+final class Counter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var n = 0
+    func increment() { lock.lock(); n += 1; lock.unlock() }
+    var value: Int { lock.lock(); defer { lock.unlock() }; return n }
 }

@@ -82,6 +82,9 @@ struct DeletionPlan: Identifiable {
     var cautionNames: [String] = []
     var warnings: [String] = []
     var losses: [LossLine] = []
+    /// Clones only: per forced copy, the losses the confirmation showed. A forced removal goes ahead only
+    /// if a fresh inspection right before it finds exactly the same.
+    var confirmedLosses: [String: [String]] = [:]
     /// When set, the confirm button stays disabled until the user types exactly this.
     var confirmPhrase: String?
     var hasCommands = false
@@ -214,7 +217,7 @@ final class AppModel {
     init(engine: any CleanerEngine, isMock: Bool) {
         self.engine = engine
         self.isMock = isMock
-        let home = FileManager.default.homeDirectoryForCurrentUser.standardizedFileURL
+        let home = URL(fileURLWithPath: AccountEnvironment.home, isDirectory: true)
         self.home = home
         self.disk = engine.diskInfo()
         self.explore = ExploreModel(engine: engine, home: home)
@@ -663,10 +666,67 @@ final class AppModel {
                                       expectedBytes: items.reduce(0) { $0 + $1.sizeBytes }, totalItemCount: items.count))
     }
 
+    /// What removing this copy would lose, in words, from its CURRENT state. `nested` is what lies inside the
+    /// folder beyond the copy itself (linked worktrees that depend on it, nested repositories with unsaved work).
+    nonisolated static func lossDetails(_ c: RepoClone, nested: String?) -> [String] {
+        var d: [String] = []
+        let visible = c.uncommittedCount - c.hiddenFromStatusCount
+        if visible > 0 { d.append("\(visible) uncommitted file\(visible == 1 ? "" : "s")") }
+        if c.hiddenFromStatusCount > 0 {
+            d.append("\(c.hiddenFromStatusCount) file\(c.hiddenFromStatusCount == 1 ? "" : "s") hidden from git status (skip-worktree or assume-unchanged), which cannot be verified")
+        }
+        let detachedWorktree = c.isLinkedWorktree && c.branch == nil
+        if let u = c.unpushedCount {
+            if u > 0 && (!c.isLinkedWorktree || detachedWorktree) { d.append("\(u) unpushed commit\(u == 1 ? "" : "s")") }
+        } else if !c.isLinkedWorktree {
+            d.append("no network remote: its commits exist only here")
+        } else if detachedWorktree {
+            d.append("a detached HEAD whose commits no remote has")
+        }
+        if c.ignoredFileCount > 0 {
+            d.append("\(c.ignoredFileCount) ignored file\(c.ignoredFileCount == 1 ? "" : "s") that exist only here (such as .env)")
+        }
+        if c.hasStash { d.append("stashed changes") }
+        if let nested { d.append("inside it: \(nested)") }
+        if d.isEmpty && !c.isFullyBackedUp { d.append("work that is not backed up") }
+        return d
+    }
+
+    /// The numbers shown in the confirmation are read from disk at this moment, not taken from the scan:
+    /// the user may have kept working since. Copies that stopped being working copies are left out.
+    private func currentState(of scanned: [RepoClone]) async -> (clones: [RepoClone], nested: [String: String]) {
+        if isMock { return (scanned, [:]) }
+        let inspections = await engine.inspectClones(scanned.map(\.url))
+        let byID = Dictionary(inspections.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        var clones: [RepoClone] = []
+        var nested: [String: String] = [:]
+        for c in scanned {
+            guard let fresh = byID[c.id] else { continue }
+            var now = fresh.clone
+            now.sizeBytes = c.sizeBytes; now.artifactBytes = c.artifactBytes; now.idleDays = c.idleDays
+            clones.append(now)
+            nested[c.id] = fresh.nestedRisk
+        }
+        return (clones, nested)
+    }
+
     func requestRemoveClones(_ requested: [RepoClone]) {
         // Copies that were not inspected are never part of a removal.
-        let clones = requested.filter(\.wasInspected)
-        guard !clones.isEmpty, !isBusy else { return }
+        let scanned = requested.filter(\.wasInspected)
+        guard !scanned.isEmpty, !isBusy else { return }
+        Task { await presentCloneRemoval(scanned) }
+    }
+
+    private func presentCloneRemoval(_ scanned: [RepoClone]) async {
+        let (inspected, nested) = await currentState(of: scanned)
+        let clones = inspected.filter(\.wasInspected)
+        guard !isBusy else { return }
+        guard !clones.isEmpty else {
+            sheet = .result(CleanSummary(result: CleanResult(freedBytes: 0, failedCount: scanned.count, messages: [
+                "Nothing was removed: the selected copies changed since the scan (they are gone, or can no longer be inspected). Scan again."]),
+                                         expectedBytes: 0, mode: Prefs.deleteMode))
+            return
+        }
         let ids = Set(clones.map(\.id))
         // Force is passed ONLY for copies whose "Allow removal" switch the user turned on. A copy that looked
         // backed up at scan time goes through the engine's own re-check and is refused if that changed.
@@ -681,23 +741,18 @@ final class AppModel {
                 warnings.append("Every local copy of \(g.name) is selected and it has no remote. No copy of it will remain anywhere.")
             }
         }
+        for c in removal.unforced {
+            if !c.isFullyBackedUp {
+                warnings.append("\(c.url.lastPathComponent) is no longer fully backed up (\(Self.lossDetails(c, nested: nil).joined(separator: ", "))). It will be kept unless you allow its removal.")
+            } else if let n = nested[c.id] {
+                warnings.append("\(c.url.lastPathComponent) will be kept: \(n).")
+            }
+        }
 
+        var confirmed: [String: [String]] = [:]
         let losses = risky.map { c -> LossLine in
-            var d: [String] = []
-            if c.uncommittedCount > 0 { d.append("\(c.uncommittedCount) uncommitted file\(c.uncommittedCount == 1 ? "" : "s")") }
-            let detachedWorktree = c.isLinkedWorktree && c.branch == nil
-            if let u = c.unpushedCount {
-                if u > 0 && (!c.isLinkedWorktree || detachedWorktree) { d.append("\(u) unpushed commit\(u == 1 ? "" : "s")") }
-            } else if !c.isLinkedWorktree {
-                d.append("no network remote: its commits exist only here")
-            } else if detachedWorktree {
-                d.append("a detached HEAD whose commits no remote has")
-            }
-            if c.ignoredFileCount > 0 {
-                d.append("\(c.ignoredFileCount) ignored file\(c.ignoredFileCount == 1 ? "" : "s") that exist only here (such as .env)")
-            }
-            if c.hasStash { d.append("stashed changes") }
-            if d.isEmpty { d.append("work that is not backed up") }
+            let d = Self.lossDetails(c, nested: nested[c.id])
+            confirmed[c.id] = d
             return LossLine(name: c.url.lastPathComponent, details: d)
         }
 
@@ -714,9 +769,11 @@ final class AppModel {
             return DeletionEntry(name: c.url.lastPathComponent, subtitle: sub,
                                  symbol: c.isLinkedWorktree ? "square.stack.3d.up" : "folder", size: c.sizeBytes)
         }
-        sheet = .confirm(DeletionPlan(source: .clones(unforced: removal.unforced, forced: removal.forced), mode: Prefs.deleteMode,
-                                      entries: entries, expectedBytes: clones.reduce(0) { $0 + $1.sizeBytes },
-                                      warnings: warnings, losses: losses, confirmPhrase: phrase, totalItemCount: clones.count))
+        var removalPlan = DeletionPlan(source: .clones(unforced: removal.unforced, forced: removal.forced), mode: Prefs.deleteMode,
+                                       entries: entries, expectedBytes: clones.reduce(0) { $0 + $1.sizeBytes },
+                                       warnings: warnings, losses: losses, confirmPhrase: phrase, totalItemCount: clones.count)
+        removalPlan.confirmedLosses = confirmed
+        sheet = .confirm(removalPlan)
     }
 
     // MARK: Executing
@@ -749,8 +806,22 @@ final class AppModel {
                                                    progress: relay.handler)
                 result.failedCount += checked.1.count
                 result.messages = checked.1 + result.messages
-                if !forced.isEmpty {
-                    let r = await engine.removeClones(forced, force: true, mode: mode, progress: relay.handler)
+                // A forced removal skips the engine's refusals, so it is only made for copies that are, right
+                // now, exactly what the user confirmed losing. Anything that changed meanwhile (more unsaved
+                // work, a nested repository, new linked worktrees) is kept and reported.
+                var acknowledged = forced
+                if !mock, !acknowledged.isEmpty {
+                    let now = await engine.inspectClones(acknowledged.map(\.url))
+                    let current = Dictionary(now.map { ($0.id, Self.lossDetails($0.clone, nested: $0.nestedRisk)) }, uniquingKeysWith: { first, _ in first })
+                    let unchanged = acknowledged.filter { current[$0.id] != nil && current[$0.id] == plan.confirmedLosses[$0.id] }
+                    for c in acknowledged where !unchanged.contains(where: { $0.id == c.id }) {
+                        result.failedCount += 1
+                        result.messages.append("Kept \(c.url.lastPathComponent): it changed after you confirmed (now: \((current[c.id] ?? ["no longer a working copy that can be inspected"]).joined(separator: ", "))). Nothing of it was removed; review it again.")
+                    }
+                    acknowledged = unchanged
+                }
+                if !acknowledged.isEmpty {
+                    let r = await engine.removeClones(acknowledged, force: true, mode: mode, progress: relay.handler)
                     result.freedBytes += r.freedBytes
                     result.failedCount += r.failedCount
                     result.messages += r.messages

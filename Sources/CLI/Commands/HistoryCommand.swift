@@ -12,6 +12,9 @@ struct HistoryReport: Codable {
     var totalFreedBytes: Int64
     /// Lines of the log file that could not be read.
     var skippedLines: Int
+    /// Among `records`: operations with `"phase": "started"`, which have no outcome record. They were
+    /// interrupted (or are still running); their items are what they intended to remove, with outcome "pending".
+    var unfinishedOperations = 0
 }
 
 enum HistoryCommand {
@@ -49,7 +52,8 @@ enum HistoryCommand {
         let total = matching.reduce(Int64(0)) { $0 + $1.freedBytes }
 
         if ctx.json {
-            ctx.emit(HistoryReport(records: shown, matching: matching.count, totalFreedBytes: total, skippedLines: stats.skippedLines))
+            ctx.emit(HistoryReport(records: shown, matching: matching.count, totalFreedBytes: total, skippedLines: stats.skippedLines,
+                                   unfinishedOperations: shown.filter(\.isUnfinished).count))
             return ExitCode.ok
         }
         let s = ctx.style
@@ -59,9 +63,13 @@ enum HistoryCommand {
             return ExitCode.ok
         }
         let rows = shown.map { r -> [String] in
-            [formatDateTime(r.startedAt), r.client.rawValue, kindText(r), String(r.itemCount),
-             r.mode == .trash ? "trash" : formatBytes(r.freedBytes),
-             r.failedItemCount > 0 ? s.yellow(String(r.failedItemCount)) : s.dim("0")]
+            if r.isUnfinished {
+                return [formatDateTime(r.startedAt), r.client.rawValue, kindText(r) + s.yellow(" (interrupted)"), String(r.itemCount),
+                        s.yellow("unknown"), s.yellow("?")]
+            }
+            return [formatDateTime(r.startedAt), r.client.rawValue, kindText(r), String(r.itemCount),
+                    r.mode == .trash ? "trash" : formatBytes(r.freedBytes),
+                    r.failedItemCount > 0 ? s.yellow(String(r.failedItemCount)) : s.dim("0")]
         }
         for line in renderTable([TableColumn(title: "When"), TableColumn(title: "By"), TableColumn(title: "What"),
                                  TableColumn(title: "Items", align: .right), TableColumn(title: "Freed", align: .right),
@@ -73,6 +81,9 @@ enum HistoryCommand {
                 ctx.out()
                 ctx.out(s.bold("\(formatDateTime(r.startedAt))  \(kindText(r))") + s.dim("  by \(r.client.rawValue) \(r.appVersion)"
                         + (r.planID.map { "  plan \($0)" } ?? "")))
+                if r.isUnfinished {
+                    ctx.out(s.yellow("    Interrupted - outcome unknown. These are the items it was about to remove; some, all or none may be gone."))
+                }
                 for item in r.items.prefix(itemsShownPerRecord) { ctx.out(itemLine(item, ctx)) }
                 let hidden = r.itemCount - min(r.items.count, itemsShownPerRecord)
                 if hidden > 0 { ctx.out(s.dim("    … and \(hidden) more (use --json for the full record)")) }
@@ -81,6 +92,11 @@ enum HistoryCommand {
         ctx.out()
         ctx.out(s.dim("\(matching.count) operation\(matching.count == 1 ? "" : "s") match, \(formatBytes(total)) freed"
             + (matching.count > shown.count ? "; showing the newest \(shown.count) (--limit)" : "")))
+        let unfinished = shown.filter(\.isUnfinished).count
+        if unfinished > 0 {
+            ctx.out(s.yellow("\(unfinished) operation\(unfinished == 1 ? " was" : "s were") interrupted (the process ended, or is still running): "
+                + "the outcome is unknown. `mac-cleaner history --items` lists what \(unfinished == 1 ? "it" : "they") intended to remove."))
+        }
         if stats.skippedLines > 0 {
             ctx.out(s.yellow("\(stats.skippedLines) unreadable line\(stats.skippedLines == 1 ? "" : "s") in the log file were skipped."))
         }
@@ -119,6 +135,7 @@ enum HistoryCommand {
         case .ok: mark = s.green("ok")
         case .failed: mark = s.red("failed")
         case .refused: mark = s.yellow("refused")
+        case .pending: mark = s.yellow("unknown")
         }
         let what = item.command.map { "ran: " + $0.joined(separator: " ") } ?? item.path.map { abbreviateHome($0, home: ctx.home) } ?? item.name
         var line = "    \(formatBytes(item.sizeBytes).leftPadded(9))  \(mark.padding(toLength: max(mark.count, 7), withPad: " ", startingAt: 0))  \(what)"

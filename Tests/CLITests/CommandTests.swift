@@ -297,6 +297,53 @@ final class CommandTests: XCTestCase {
         XCTAssertEqual(bad.code, 2)
     }
 
+    func testRelocatedHomeFolderStopsEveryDeletingCommand() async throws {
+        let e = engineWithCategories()
+        e.artifacts = [ProjectArtifact(url: URL(fileURLWithPath: "/tmp/p/node_modules"), kind: "node_modules",
+                                       projectURL: URL(fileURLWithPath: "/tmp/p"), sizeBytes: 900_000_000, idleDays: 90)]
+        e.groups = [RepoGroup(id: "g", name: "x", remote: "r", clones: [makeClone("/r/a", idle: 1), makeClone("/r/b", idle: 90)])]
+        let problem = "this process was started with a relocated home folder (it reports /tmp/fake, the account's home is /Users/tester; is CFFIXED_USER_HOME set?)"
+        let deleting = [["clean", "--safe", "-y"], ["clean", "npm", "--trash", "-y"], ["projects", "/tmp", "-y"], ["repos", "/tmp", "--remove-clean", "-y"]]
+        for args in deleting {
+            let r = await invoke(args, engine: e, homeProblem: problem)
+            XCTAssertEqual(r.code, 1, "\(args)")
+            XCTAssertTrue(r.err.contains("nothing is deleted") && r.err.contains("relocated home folder"), r.err)
+        }
+        XCTAssertTrue(e.cleanedCalls.isEmpty && e.deletedCalls.isEmpty && e.removeCalls.isEmpty, "nothing may be deleted")
+        for args in [["scan"], ["clean", "--safe", "-n"], ["projects", "/tmp", "-n"], ["repos", "/tmp", "--remove-clean", "-n"]] {
+            let r = await invoke(args, engine: e, homeProblem: problem)
+            XCTAssertEqual(r.code, 0, "\(args): \(r.err)")
+            XCTAssertTrue(r.err.contains("warning:") && r.err.contains("relocated home folder"), "\(args)")
+        }
+        let doctor = await invoke(["doctor", "--no-color"], engine: e, homeProblem: problem)
+        XCTAssertTrue(doctor.out.contains("Deleting is disabled"), doctor.out)
+        // Positive control: without the problem the same commands reach the engine.
+        var ran = 0
+        for args in deleting { ran += (await invoke(args, engine: e)).code == 0 ? 1 : 0 }
+        XCTAssertEqual(ran, deleting.count)
+        XCTAssertFalse(e.cleanedCalls.isEmpty || e.deletedCalls.isEmpty || e.removeCalls.isEmpty)
+    }
+
+    func testProtectedPathsThatAreNotAbsoluteAreNeverSilentlyIgnored() async throws {
+        // In the settings file: the whole file is refused, and with it every deleting command.
+        let (s, dir) = try store(#"{"version":1,"protectedPaths":["Work/Secret"],"sessionRetentionDays":30}"#)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let e = engineWithCategories()
+        var r = await invoke(["clean", "--safe", "-y"], engine: e, settingsStore: s)
+        XCTAssertEqual(r.code, 1)
+        XCTAssertTrue(r.err.contains("Work/Secret") && r.err.contains("not absolute"), r.err)
+        XCTAssertTrue(e.cleanedCalls.isEmpty)
+        // On the command line a relative path means "relative to the current folder": it reaches the engine as
+        // an absolute path, so it is honored rather than dropped.
+        let e2 = FakeEngine()
+        r = await invoke(["scan", "--protect", "Work/Secret", "--protect", "./x"], engine: e2)
+        XCTAssertEqual(r.code, 0, r.err)
+        let passed = e2.configured.last?.protectedPaths ?? []
+        XCTAssertEqual(passed.count, 2)
+        XCTAssertTrue(passed.allSatisfy { $0.hasPrefix("/") && EngineSettings.isValidProtectedPath($0) }, "\(passed)")
+        XCTAssertTrue(passed[0].hasSuffix("/Work/Secret"))
+    }
+
     func testCorruptSettingsFileStopsEveryDeletingCommand() async throws {
         let (s, dir) = try store("{ this is not json")
         defer { try? FileManager.default.removeItem(at: dir) }

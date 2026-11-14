@@ -95,10 +95,16 @@ struct SettingsView: View {
     private var protection: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text("Protected folders").font(.headline)
-            Text("These folders, and everything below them, are never listed, measured or deleted. The `mac-cleaner` command line tool obeys the same list.")
+            Text("These folders, and everything below them, are never listed, offered for cleanup or deleted. The `mac-cleaner` command line tool obeys the same list. (The size shown for a folder that contains a protected one still includes it.)")
                 .font(.callout).foregroundStyle(.secondary)
             pathList(paths: protectedPaths, selection: $selectedProtected,
                      empty: "No protected folders. Add the ones you never want touched.")
+            let invalid = EngineSettings(protectedPaths: protectedPaths).invalidProtectedPaths
+            if !invalid.isEmpty {
+                Label("\(invalid.count == 1 ? "This entry is" : "These entries are") not an absolute path and cannot protect anything: \(invalid.map { "“\($0)”" }.joined(separator: ", ")). Nothing can be deleted until you remove \(invalid.count == 1 ? "it" : "them") and add the folder again.",
+                      systemImage: "exclamationmark.triangle.fill")
+                    .font(.callout).foregroundStyle(.red)
+            }
             HStack {
                 Button { pickFolders { add($0, to: $protectedRaw) } } label: { Label("Add folder…", systemImage: "plus") }
                 Button { if let s = selectedProtected { remove(s, from: $protectedRaw); selectedProtected = nil } } label: {

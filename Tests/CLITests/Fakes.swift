@@ -52,6 +52,21 @@ final class FakeEngine: CleanerEngine, @unchecked Sendable {
     /// Makes scans slow (cancellable) and chatty, for the MCP concurrency tests.
     var scanDelay: UInt64 = 0
     var scanProgressMessages: [String] = []
+    /// What the engine reports about its audit log.
+    var auditRecorded = true
+    var auditProblem: String?
+    /// Notes returned with every deleting call (the engine passes on tool output and file names).
+    var resultMessages: [String] = []
+    /// When set, cleaning and deleting really remove the given paths, but only below this folder
+    /// (a scratch tree under the system temp directory).
+    var removeBelow: String?
+    /// Makes deleting calls slow, for the concurrency tests.
+    var cleanDelay: UInt64 = 0
+
+    private func reallyRemove(_ paths: [String]) {
+        guard let root = removeBelow, root.contains("/MacCleanerMCP-") else { return }
+        for p in paths where p.hasPrefix(root + "/") { try? FileManager.default.removeItem(atPath: p) }
+    }
 
     private let lock = NSLock()
     private(set) var cleanedCalls: [(ids: [String], mode: DeleteMode)] = []
@@ -88,11 +103,15 @@ final class FakeEngine: CleanerEngine, @unchecked Sendable {
             cleanedItemPaths.append(categories.flatMap { $0.items.map { $0.url.path } })
             cleanedCommands.append(categories.flatMap { $0.commands })
         }
-        return CleanResult(freedBytes: categories.reduce(0) { $0 + $1.sizeBytes }, failedCount: 0, messages: [])
+        if cleanDelay > 0 { try? await Task.sleep(nanoseconds: cleanDelay) }
+        reallyRemove(categories.flatMap { $0.items.map { $0.url.path } })
+        return CleanResult(freedBytes: categories.reduce(0) { $0 + $1.sizeBytes }, failedCount: 0, messages: resultMessages,
+                           auditRecorded: auditRecorded)
     }
     func delete(urls: [URL], mode: DeleteMode, progress: @escaping ProgressHandler) async -> CleanResult {
         lock.withLock { deletedCalls.append((urls, mode)) }
-        return CleanResult(freedBytes: 1, failedCount: 0, messages: [])
+        reallyRemove(urls.map(\.path))
+        return CleanResult(freedBytes: 1, failedCount: 0, messages: resultMessages, auditRecorded: auditRecorded)
     }
     func scanRepos(root: URL, progress: @escaping ProgressHandler) async -> [RepoGroup] { groups }
     func removeClones(_ clones: [RepoClone], force: Bool, mode: DeleteMode, progress: @escaping ProgressHandler) async -> CleanResult {
@@ -109,6 +128,7 @@ final class FakeEngine: CleanerEngine, @unchecked Sendable {
                           itemsRemoved: rs.reduce(0) { $0 + $1.items.count }, skippedLines: auditSkippedLines)
     }
     func clearAuditLog() async { lock.withLock { auditCleared += 1; audit = [] } }
+    func auditLogProblem() async -> String? { auditProblem }
 }
 
 // MARK: - Builders
@@ -128,8 +148,10 @@ func makeClone(_ path: String, branch: String? = "main", linked: Bool = false, u
 }
 
 func invoke(_ args: [String], engine: FakeEngine = FakeEngine(), console: FakeConsole = FakeConsole(),
-            environment: [String: String] = [:], settingsStore: SettingsStore? = nil) async -> (code: Int32, out: String, err: String) {
+            environment: [String: String] = [:], settingsStore: SettingsStore? = nil,
+            homeProblem: String? = nil) async -> (code: Int32, out: String, err: String) {
     let code = await runCLI(arguments: args, engine: engine, console: console, environment: environment,
-                            home: URL(fileURLWithPath: "/Users/tester"), probe: FakeProbe(), settingsStore: settingsStore)
+                            home: URL(fileURLWithPath: "/Users/tester"), homeProblem: homeProblem, probe: FakeProbe(),
+                            settingsStore: settingsStore)
     return (code, console.stdout, console.stderr)
 }

@@ -87,8 +87,8 @@ struct PathGuard: Sendable {
         ]
     }
 
-    /// The user's own top-level folders: never deletable themselves. (The deleter's depth rule refuses them
-    /// too; listing them here also hides them from every scanner and makes the identity check cover them.)
+    /// The user's own top-level folders: never deletable themselves, under any name (the identity check
+    /// covers them; the deleter's depth rule refuses them too). They are not hidden: scans walk into them.
     static func builtInExact(home: String) -> [String] {
         ["Documents", "Desktop", "Downloads", "Pictures", "Movies", "Music", "Library", "Applications", "Public"]
             .map { home + "/" + $0 }
@@ -107,6 +107,8 @@ struct PathGuard: Sendable {
             let trimmed = p.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty else { continue }
             let expanded = env.expand(trimmed)
+            // Not absolute: nothing to match. This is never silent: the settings file is rejected when it is
+            // loaded, and `LiveEngine.begin` refuses every deleting operation while such an entry exists.
             guard expanded.hasPrefix("/") else { continue }
             let std = (expanded as NSString).standardizingPath
             roots.append(realPath(std) ?? canonicalPath(std))
@@ -133,16 +135,29 @@ struct PathGuard: Sendable {
     /// The object with this identity is a protected root (used while walking a tree by descriptor).
     func isProtectedID(_ id: FileID) -> Bool { subtreeIDs.contains(id) || exactIDs.contains(id) }
 
-    /// The path is protected, or lies below a protected path. With `checkAncestors` false only the entry's
-    /// own identity is looked up: for walkers that come down from a folder they have already checked.
+    /// The path may not be DELETED: it is protected, lies below a protected path, or is one of the user's own
+    /// top-level folders (`exact`). With `checkAncestors` false only the entry's own identity is looked up:
+    /// for walkers that come down from a folder they have already checked.
     func isProtected(_ path: String, checkAncestors: Bool = true) -> Bool {
+        isProtected(path, checkAncestors: checkAncestors, includeExact: true)
+    }
+
+    /// The path may not even be LISTED, measured or walked into: it is a protected subtree (a built-in
+    /// credential or configuration location, or one of the user's protected folders) or lies inside one.
+    /// The user's top-level folders (`~/Documents`, `~/Library`, …) are not hidden: they are where the data
+    /// is. They can be looked into and used as scan roots; they just cannot be deleted themselves.
+    func isHidden(_ path: String, checkAncestors: Bool = true) -> Bool {
+        isProtected(path, checkAncestors: checkAncestors, includeExact: false)
+    }
+
+    private func isProtected(_ path: String, checkAncestors: Bool, includeExact: Bool) -> Bool {
         let p = canonicalPath(path)
         let folded = foldedPath(p)
-        if foldedExact.contains(folded) { return true }
+        if includeExact, foldedExact.contains(folded) { return true }
         for root in foldedSubtrees where folded == root || folded.hasPrefix(root + "/") { return true }
         // Same object under another name?
         if let id = FileID.of(p) {
-            if exactIDs.contains(id) || subtreeIDs.contains(id) { return true }
+            if (includeExact && exactIDs.contains(id)) || subtreeIDs.contains(id) { return true }
         }
         if checkAncestors, !subtreeIDs.isEmpty {
             var dir = (p as NSString).deletingLastPathComponent
@@ -190,8 +205,17 @@ public struct PathAccess: Sendable {
         guardian = PathGuard(env: e, settings: settings)
     }
 
-    /// The path is a protected location (built-in or user-configured) or lies inside one.
+    /// The path may never be deleted: a protected location (built-in or user-configured), something inside
+    /// one, or one of the user's own top-level folders (`~/Documents`, `~/Library`, …).
     public func isProtected(_ path: String) -> Bool { guardian.isProtected(path) }
+
+    /// The path must not be listed, measured or used as a scan root: a credential/configuration location or
+    /// one of the user's protected folders, or something inside one. The user's top-level folders are NOT
+    /// hidden; they can be looked into.
+    public func isHidden(_ path: String) -> Bool { guardian.isHidden(path) }
+
+    /// The path has a hidden location somewhere inside it, so its measured size includes protected data.
+    public func containsHidden(_ path: String) -> Bool { guardian.containsProtected(path) }
 
     /// The (symlink-resolved) path is the home folder, below it, or in a per-user temp area.
     public func isInExplorableArea(_ resolved: String) -> Bool {

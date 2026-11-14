@@ -26,7 +26,7 @@ enum Commands {
         positionalHelp: ["ids…   Category ids as shown by `mac-cleaner scan` (e.g. user-caches npm)."],
         maxPositionals: nil,
         options: [
-            OptionSpec("safe", "Select every \"safe\" category (rebuilt automatically)."),
+            OptionSpec("safe", "Select every \"safe\" category (caches and build output that tools create again)."),
             OptionSpec("all", "Select every category, including \"caution\" ones."),
             OptionSpec("group", value: "GROUP", "Only this group (its safe categories, unless --all): \(groupNames)."),
             OptionSpec("trash", "Move items to the Trash instead of deleting them permanently."),
@@ -68,7 +68,9 @@ enum Commands {
             "mac-cleaner projects --json | jq '.totalBytes'",
         ],
         notes: [
-            "Folders that contain git-tracked files are never listed.",
+            "A folder inside a git repository is listed only when git reports no tracked file in it (also when PATH is a",
+            "sub-folder of the repository). Build folders of a repository that cannot be inspected are not listed.",
+            "Idle time is the newest change in the project outside its build folders; a huge project counts as touched today.",
             "--json implies --dry-run.",
         ]
     )
@@ -92,8 +94,9 @@ enum Commands {
             "mac-cleaner repos --json",
         ],
         notes: [
-            "--remove-clean only removes copies with no uncommitted work, nothing unpushed to a network remote, no stash and",
-            "no ignored files that exist only there (.env, local data). It never forces, and it always keeps at least one",
+            "--remove-clean only removes copies with no uncommitted work, no files hidden from git status (skip-worktree,",
+            "assume-unchanged), nothing unpushed to a network remote, no stash, no ignored files that exist only there (.env,",
+            "local data) and no nested repository or linked worktree with work. It never forces, and it always keeps at least one",
             "working copy of each repository. A remote that is a folder on this disk does not count as a backup.",
             "A repository whose own git configuration could run programs (hooks path, filters, fsmonitor, aliases…) is",
             "listed as \"untrusted git config - not inspected\": git is never run in it and it is never removed.",
@@ -155,9 +158,11 @@ enum Commands {
             "mac-cleaner history clear",
         ],
         notes: [
-            "Read-only (except `clear`). Every clean, delete and clone removal is recorded with the paths, sizes and outcomes,",
-            "in ~/Library/Application Support/MacCleaner/audit.jsonl. Paths can be sensitive; the file stays on this Mac and is",
-            "readable by you only. File contents are never recorded. Turn recording off in the app's Settings.",
+            "Read-only (except `clear`). Unless recording is turned off, every clean, delete and clone removal is recorded with",
+            "the paths, sizes and outcomes in ~/Library/Application Support/MacCleaner/audit.jsonl: what it is about to do",
+            "before anything is deleted, then the result. An operation shown as (interrupted) has no result on record; --items",
+            "lists what it intended to remove. Paths can be sensitive; the file stays on this Mac and is readable by you only.",
+            "File contents are never recorded. Turn recording off in the app's Settings.",
         ]
     )
 
@@ -181,8 +186,9 @@ enum Commands {
         notes: [
             "Speaks newline-delimited JSON-RPC on stdin/stdout (MCP 2026-07-28, and 2025-11-25 down to 2024-11-05); logs go to stderr.",
             "Without --allow-clean every tool is read-only and no deletion tool is even listed.",
-            "With --allow-clean, deleting is two steps (plan_cleanup, then apply_cleanup with the plan id), only safe categories and",
-            "build folders of idle projects can be in a plan, and every apply is written to the audit log (`mac-cleaner history`).",
+            "With --allow-clean, deleting is two steps (plan_cleanup, then apply_cleanup with the plan id). Only safe categories",
+            "(a few run one fixed cache-prune command) and build folders of idle projects can be in a plan. An apply is refused",
+            "when the audit log cannot be written, so nothing is deleted without a record (`mac-cleaner history`).",
             "--json and the global options do not apply. Start it from your agent's MCP configuration, not by hand.",
         ]
     )

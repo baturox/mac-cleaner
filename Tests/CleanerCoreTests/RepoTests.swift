@@ -28,6 +28,12 @@ final class RepoTests: EngineTestCase {
         try FileManager.default.removeItem(atPath: f.path(seed))
     }
 
+    /// Scans `code` and returns the clone at `rel`.
+    private func scanned(_ f: Fixture, _ rel: String) async throws -> RepoClone {
+        let groups = await scan(f, root: f.path("code"))
+        return try XCTUnwrap(clone(groups, rel, f))
+    }
+
     // MARK: URL normalization
 
     func testRemoteURLNormalization() {
@@ -443,6 +449,101 @@ final class RepoTests: EngineTestCase {
         XCTAssertEqual(r.failedCount, 1)
         XCTAssertTrue(r.messages.joined().contains("nested repository inner"), r.messages.joined())
         XCTAssertTrue(f.exists("code/parent/build/inner/unsaved.txt"))
+    }
+
+    // MARK: Index flags that hide local edits (M1)
+
+    func testEditsHiddenBySkipWorktreeOrAssumeUnchangedAreNotBackedUp() async throws {
+        let f = try Fixture()
+        try cloneWithRemote(f, remote: "remotes/app.git", to: "code/app")
+        try f.file("code/app/README.md", "local-only edit")
+        try f.file("code/app/.gitignore", ".env\n# local-only edit\n")
+        // Positive control 1: without the flags git reports both edits.
+        var c = try await scanned(f, "code/app")
+        XCTAssertEqual(c.uncommittedCount, 2)
+        try f.git("code/app", "update-index", "--skip-worktree", "README.md")
+        try f.git("code/app", "update-index", "--assume-unchanged", ".gitignore")
+        // Positive control 2: with the flags git status is silent although both files differ from the commit.
+        XCTAssertEqual(try f.git("code/app", "status", "--porcelain=v1", "-uall"), "")
+        XCTAssertEqual(try String(contentsOfFile: f.path("code/app/README.md"), encoding: .utf8), "local-only edit")
+
+        c = try await scanned(f, "code/app")
+        XCTAssertFalse(c.isFullyBackedUp, "edits hidden by index flags exist only in this folder")
+        XCTAssertGreaterThanOrEqual(c.uncommittedCount, 2)
+        let r = await f.engine().removeClones([c], force: false, mode: .permanent, progress: { _ in })
+        XCTAssertEqual(r.failedCount, 1)
+        XCTAssertTrue(r.messages.joined().contains("hidden from git status"), r.messages.joined())
+        XCTAssertTrue(f.exists("code/app/README.md"))
+    }
+
+    func testSparseCheckoutFilesThatAreNotOnDiskDoNotCount() async throws {
+        let f = try Fixture()
+        try cloneWithRemote(f, remote: "remotes/app.git", to: "code/app")
+        // skip-worktree on a file that is absent (what a sparse checkout does): nothing local can be lost.
+        try f.git("code/app", "update-index", "--skip-worktree", "README.md")
+        try FileManager.default.removeItem(atPath: f.path("code/app/README.md"))
+        let c = try await scanned(f, "code/app")
+        XCTAssertEqual(c.uncommittedCount, 0)
+        XCTAssertTrue(c.isFullyBackedUp)
+    }
+
+    func testCoreIgnoreStatIsNotAcceptedAsHarmless() async throws {
+        let f = try Fixture()
+        try cloneWithRemote(f, remote: "remotes/app.git", to: "code/app")
+        try f.git("code/app", "config", "core.ignorestat", "true")
+        let c = try await scanned(f, "code/app")
+        XCTAssertFalse(c.isFullyBackedUp, "core.ignoreStat makes git mark files assume-unchanged on its own")
+    }
+
+    // MARK: Linked worktrees are removed like any other folder (M5)
+
+    func testLinkedWorktreeWithANestedUnsavedRepositoryIsRefused() async throws {
+        let f = try Fixture()
+        try f.repo("code/main")
+        try f.git("code/main", "worktree", "add", "-q", f.path("code/wt"), "-b", "x")
+        try f.file("code/main/.git/info/exclude", "build/\n")
+        try f.repo("code/wt/build/inner")
+        try f.file("code/wt/build/inner/unsaved.txt", "x")
+        let wt = try await scanned(f, "code/wt")
+        XCTAssertTrue(wt.isFullyBackedUp, "positive control: the worktree itself looks clean")
+        let r = await f.engine().removeClones([wt], force: false, mode: .permanent, progress: { _ in })
+        XCTAssertEqual(r.failedCount, 1, r.messages.joined())
+        XCTAssertTrue(r.messages.joined().contains("nested repository inner"), r.messages.joined())
+        XCTAssertTrue(f.exists("code/wt/build/inner/unsaved.txt"))
+    }
+
+    func testRemovingAWorktreeOfAProtectedMainRepositoryDoesNotWriteIntoIt() async throws {
+        let f = try Fixture()
+        try f.repo("keep/main")
+        try f.git("keep/main", "worktree", "add", "-q", f.path("code/wt"), "-b", "x")
+        let settings = EngineSettings(protectedPaths: ["~/keep"])
+        let engine = f.engine(settings: settings)
+        let found = await engine.scanRepos(root: URL(fileURLWithPath: f.path("code")), progress: { _ in })
+        let wt = try XCTUnwrap(allClones(found).first)
+        XCTAssertTrue(f.exists("keep/main/.git/worktrees/wt"), "positive control: the registration lives in the protected repository")
+        let r = await engine.removeClones([wt], force: false, mode: .permanent, progress: { _ in })
+        XCTAssertEqual(r.failedCount, 0, r.messages.joined())
+        XCTAssertFalse(f.exists("code/wt"), "the worktree folder itself is not protected and goes")
+        XCTAssertTrue(f.exists("keep/main/.git/worktrees/wt"), "nothing may be changed inside a protected folder")
+        XCTAssertTrue(r.messages.joined().contains("git worktree prune"), r.messages.joined())
+    }
+
+    func testWorktreeRemovalHonorsTheProtectedIdentityCheckInsideTheTree() async throws {
+        let f = try Fixture()
+        try f.file("vault/key.pem", "secret")
+        try f.repo("code/main")
+        try f.git("code/main", "worktree", "add", "-q", f.path("code/wt"), "-b", "x")
+        // The protected file under a second name inside the worktree (a hard link: same device and inode).
+        try f.dir("code/wt/node_modules")
+        XCTAssertEqual(link(f.path("vault/key.pem"), f.path("code/wt/node_modules/alias.pem")), 0)
+        try f.file("code/main/.git/info/exclude", "node_modules/\n")
+        let engine = f.engine(settings: EngineSettings(protectedPaths: ["~/vault/key.pem"]))
+        let found = await engine.scanRepos(root: URL(fileURLWithPath: f.path("code")), progress: { _ in })
+        let wt = try XCTUnwrap(allClones(found).first { $0.url.path == f.path("code/wt") })
+        let r = await engine.removeClones([wt], force: true, mode: .permanent, progress: { _ in })
+        XCTAssertGreaterThan(r.failedCount, 0, "the alias of a protected file must be left alone")
+        XCTAssertTrue(f.exists("code/wt/node_modules/alias.pem"))
+        XCTAssertTrue(f.exists("vault/key.pem"))
     }
 
     func testRemoveRefusesNonReposProtectedAndOutOfAreaPaths() async throws {

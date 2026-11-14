@@ -566,7 +566,7 @@ final class MockEngine: CleanerEngine, @unchecked Sendable {
             }
             lock.withLock { _ = removedPaths.insert(c.id) }
             freed += c.sizeBytes
-            messages.append(c.isLinkedWorktree ? "$ git worktree remove --force \(c.url.abbreviatedPath)\n(mock) done" : "(mock) removed \(c.url.abbreviatedPath)")
+            messages.append(c.isLinkedWorktree ? "(mock) removed the worktree \(c.url.abbreviatedPath)\n$ git worktree prune" : "(mock) removed \(c.url.abbreviatedPath)")
         }
         if mode == .trash {
             messages.insert("(mock) Moved the copies to the Trash. Empty the Trash to free the space.", at: 0)

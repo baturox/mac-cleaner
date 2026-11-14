@@ -55,16 +55,23 @@ public struct SettingsStore: Sendable {
         guard let file = try? JSONDecoder().decode(File.self, from: data) else { return .corrupt(reason: "it is not valid settings JSON") }
         guard file.version == 1 else { return .corrupt(reason: "it was written by a newer version (format \(file.version))") }
         guard (0...100_000).contains(file.sessionRetentionDays) else { return .corrupt(reason: "sessionRetentionDays is out of range") }
+        // A protected path that is not absolute cannot be matched against anything. Ignoring it would leave
+        // the folder the user meant unprotected without a word, so the whole file is refused instead.
+        if let bad = EngineSettings(protectedPaths: file.protectedPaths).invalidProtectedPaths.first {
+            let shown = String(bad.unicodeScalars.filter { !$0.properties.isWhitespace || $0 == " " }.prefix(80))
+            return .corrupt(reason: "the protected path \"\(shown)\" is not absolute (it must start with / or ~/)")
+        }
         return .loaded(EngineSettings(protectedPaths: file.protectedPaths, sessionRetentionDays: file.sessionRetentionDays,
                                       recordAuditLog: file.recordAuditLog ?? true))
     }
 
-    /// Writes atomically (temporary file + rename), readable by the user only.
+    /// Writes atomically (temporary file + rename), readable by the user only, in a folder only the user
+    /// can enter (created 0700, or tightened to 0700 when it already exists).
     @discardableResult
     public func save(_ settings: EngineSettings) -> Bool {
         let dir = fileURL.deletingLastPathComponent()
         do {
-            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            try DataFolder.prepare(dir)
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
             let data = try encoder.encode(File(version: 1, protectedPaths: settings.protectedPaths,

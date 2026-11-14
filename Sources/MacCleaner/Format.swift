@@ -1,9 +1,10 @@
 import Foundation
 import AppKit
+import CleanerCore
 
 /// Shared formatting helpers.
 enum Fmt {
-    static let homePath = FileManager.default.homeDirectoryForCurrentUser.path
+    static let homePath = AccountEnvironment.home
 
     /// Sizes formatted like Finder (powers of 1000, "file" count style).
     static func bytes(_ b: Int64) -> String {

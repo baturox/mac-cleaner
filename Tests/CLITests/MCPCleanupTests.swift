@@ -383,15 +383,79 @@ final class MCPCleanupTests: XCTestCase {
         XCTAssertEqual(rec.items.count, 1)
     }
 
+    /// The real engine with protected folders of its own that the MCP layer above does not know about: it
+    /// ignores `configure`, and its scan reports whatever the test says. This is "a plan that somehow holds a
+    /// protected folder": the planner's own filter cannot see the protection, so only the engine can refuse.
+    private struct EngineThatKnowsMore: CleanerEngine {
+        let real: LiveEngine
+        let reported: [CleanCategory]
+        func diskInfo() -> DiskInfo { real.diskInfo() }
+        func scanCategories(progress: @escaping ProgressHandler) async -> [CleanCategory] { reported }
+        func scanProjects(root: URL, minBytes: Int64, progress: @escaping ProgressHandler) async -> [ProjectArtifact] { [] }
+        func listFolder(_ url: URL) async -> [FolderEntry] { [] }
+        func clean(categories: [CleanCategory], progress: @escaping ProgressHandler) async -> CleanResult {
+            await real.clean(categories: categories, mode: .permanent, progress: progress)
+        }
+        func delete(urls: [URL], progress: @escaping ProgressHandler) async -> CleanResult { await real.delete(urls: urls, progress: progress) }
+        func configure(_ settings: EngineSettings) async {}
+        func clean(categories: [CleanCategory], mode: DeleteMode, progress: @escaping ProgressHandler) async -> CleanResult {
+            await real.clean(categories: categories, mode: mode, progress: progress)
+        }
+        func auditLog(limit: Int, before: Date?) async -> [AuditRecord] { await real.auditLog(limit: limit, before: before) }
+        func auditLogProblem() async -> String? { await real.auditLogProblem() }
+    }
+
     func testRealEngineRefusesProtectedFolderEvenIfAPlanSomehowHeldIt() async throws {
+        let s = try MCPScratch()
+        for d in ["tmp/T", "private-tmp", "history", "trashbin"] {
+            try FileManager.default.createDirectory(atPath: s.root + "/" + d, withIntermediateDirectories: true)
+        }
+        let ok = s.home + "/Library/Caches/ok", secret = s.home + "/Library/Caches/secret-project"
+        let alias = s.home + "/Library/Caches/alias-of-secret"
+        try write(ok + "/blob", bytes: 1 << 20)
+        try write(secret + "/thesis.docx", bytes: 1 << 20)
+        try FileManager.default.createSymbolicLink(atPath: alias, withDestinationPath: secret)
+        let box = SettingsBox()
+        box.settings = EngineSettings(protectedPaths: [secret])
+        let real = LiveEngine(env: EngineEnvironment.fixture(root: s.root) { _ in }, settings: box, client: .mcp, appVersion: "test")
+        let cat = CleanCategory(id: "user-caches", name: "User caches", detail: "d", level: .safe, symbol: "folder",
+                                items: [ok, secret, secret + "/thesis.docx", alias + "/thesis.docx"].map { CleanItem(url: URL(fileURLWithPath: $0), sizeBytes: 1 << 20) },
+                                sizeBytes: 4 << 20)
+        let o = cleanOptions()
+        let h = MCPHarness(tools: s.tools(EngineThatKnowsMore(real: real, reported: [cat]), o), options: o)
+        let plan = await h.callTool("plan_cleanup", ["categories": ["user-caches"]])
+        XCTAssertFalse(plan.isError, plan.text)
+        // Positive control: the plan really holds the protected folder (the MCP layer did not filter it out).
+        let planned = (plan.structured?["categories"]?.array?.first?["items_shown"]?.array ?? []).compactMap { $0["path"]?.string }
+        XCTAssertEqual(Set(planned), [ok, secret, secret + "/thesis.docx", alias + "/thesis.docx"])
+        let id = try XCTUnwrap(plan.structured?["plan_id"]?.string)
+        let apply = await h.callTool("apply_cleanup", ["plan_id": .string(id), "confirm": true], timeout: 30)
+        XCTAssertFalse(apply.isError, apply.text)
+        XCTAssertEqual(apply.structured?["failed_count"]?.int, 3, "the engine refused the three protected paths")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: secret + "/thesis.docx"), "the protected folder is untouched")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: ok), "positive control: the unprotected item of the same plan was removed")
+        let log = await real.auditLog(limit: 5, before: nil)
+        let rec = try XCTUnwrap(log.first)
+        XCTAssertEqual(rec.planID, id)
+        let outcomes = Dictionary(uniqueKeysWithValues: rec.items.compactMap { i in i.path.map { ($0, i.outcome) } })
+        XCTAssertEqual(outcomes[ok], .ok)
+        XCTAssertEqual(outcomes[secret], .refused)
+        XCTAssertEqual(outcomes[secret + "/thesis.docx"], .refused)
+        XCTAssertEqual(outcomes[alias + "/thesis.docx"], .refused, "reached through a symlink: refused as well")
+        XCTAssertEqual(apply.structured?["removed_bytes_estimate"]?.int, 1 << 20, "only what is really gone counts")
+    }
+
+    func testBuiltInProtectedLocationsNeverEnterAPlan() async throws {
         let s = try MCPScratch()
         let (h, engine) = try liveRig(s)
         try write(s.home + "/Library/Caches/ok/blob", bytes: 3 << 20)
         try write(s.home + "/.ssh/known_hosts", bytes: 100)
         let plan = await h.callTool("plan_cleanup", ["groups": ["system"]])
         let id = try XCTUnwrap(plan.structured?["plan_id"]?.string)
+        XCTAssertFalse(plan.text.contains(".ssh"))
         _ = await h.callTool("apply_cleanup", ["plan_id": .string(id), "confirm": true], timeout: 30)
         XCTAssertTrue(FileManager.default.fileExists(atPath: s.home + "/.ssh/known_hosts"))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: s.home + "/Library/Caches/ok"), "positive control: the plan did run")
         let paths = (await engine.auditLog(limit: 5, before: nil)).flatMap(\.items).compactMap(\.path)
         XCTAssertFalse(paths.contains { $0.contains(".ssh") })
     }

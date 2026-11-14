@@ -20,6 +20,9 @@ enum DoctorCommand {
                                      builtInProtectedPaths: ProtectedLocations.builtIn(),
                                      sessionRetentionDays: ctx.settings.sessionRetentionDays))
         report.recordAuditLog = ctx.settings.recordAuditLog
+        report.homeFolder = ctx.home.path
+        report.tempRoot = AccountEnvironment.tempRoot
+        report.homeProblem = ctx.homeProblem
         try Task.checkCancellation()
 
         if ctx.json {
@@ -46,8 +49,14 @@ enum DoctorCommand {
             ctx.out(s.dim("  Grant it to your terminal app: System Settings > Privacy & Security > Full Disk Access."))
         }
 
+        if let problem = ctx.homeProblem {
+            ctx.out()
+            ctx.out(s.bold("Home folder"))
+            ctx.out("  " + s.red("Deleting is disabled: \(problem)."))
+        }
+
         ctx.out()
-        ctx.out(s.bold("Protected folders") + s.dim("  (never listed, measured or deleted; shared with the app)"))
+        ctx.out(s.bold("Protected folders") + s.dim("  (never deleted; credential locations and your own list are also never listed or measured; shared with the app)"))
         let st = report.settings
         switch st.status {
         case "ok": ctx.out(s.dim("  Settings file: \(st.file ?? "-")"))

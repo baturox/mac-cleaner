@@ -23,7 +23,8 @@ enum MCPCommand {
 
     static func run(_ args: ParsedArguments, _ ctx: Context) async throws -> Int32 {
         let o = try options(from: args)
-        let tools = MCPTools(engine: ctx.engine, options: o, home: ctx.home, settingsStore: ctx.settingsStore, extraProtected: ctx.extraProtected)
+        let tools = MCPTools(engine: ctx.engine, options: o, home: ctx.home, settingsStore: ctx.settingsStore, extraProtected: ctx.extraProtected,
+                             homeProblem: ctx.homeProblem)
         let console = ctx.console
         let server = MCPServer(tools: tools, options: o, log: { console.err("mcp: " + $0) })
         var state = o.allowClean ? "cleanup tools ENABLED (min idle \(o.minIdleDays) d, plan limit \(o.maxPlanBytes / 1_000_000_000) GB, "

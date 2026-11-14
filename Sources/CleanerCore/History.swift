@@ -43,9 +43,10 @@ struct HistoryStore: Sendable {
     @discardableResult
     func save(_ snapshots: [Snapshot]) -> Bool {
         do {
-            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try DataFolder.prepare(directory)
             let data = try Self.encoder().encode(Array(snapshots.suffix(Self.maxSnapshots)))
             try data.write(to: fileURL, options: .atomic)
+            chmod(fileURL.path, 0o600)
             return true
         } catch { return false }
     }

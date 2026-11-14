@@ -1,5 +1,7 @@
-// Plans for the MCP cleanup tools. A plan is built by this server from the engine's own scan results (the caller
-// never supplies a path), is immutable once stored, expires, and can be applied exactly once.
+// Plans for the MCP cleanup tools. A plan is built by this server from the engine's own scan results: the caller
+// never names a path to delete. (It may name a folder to LOOK IN for build folders, `project_root`, which must be
+// inside the home folder and not protected; it only narrows the project scan.) A plan is immutable once
+// stored, expires, and can be applied exactly once.
 import CleanerCore
 import Foundation
 
@@ -66,12 +68,32 @@ final class CleanupPlanner: @unchecked Sendable {
 
     // MARK: Policy
 
-    /// Why a category may not be part of an agent-made plan (nil = it may). Only categories that are rebuilt
-    /// automatically, whose items are plain files (or fixed cache-prune commands), and that are not system snapshots.
+    /// The only category-wide commands a plan may contain: cache-prune commands of package managers, each a
+    /// fixed argv. Everything else the engine can run (`xcrun simctl delete …`, `tmutil deletelocalsnapshots`,
+    /// `ollama rm`, the other `docker … prune` commands) is never part of a plan.
+    static let plannableCommands: Set<[String]> = [
+        ["brew", "cleanup", "-s", "--prune=all"],
+        ["pnpm", "store", "prune"],
+        ["go", "clean", "-modcache"],
+        ["uv", "cache", "prune"],
+    ]
+
+    /// `docker --host unix:///… builder prune -af` (the build cache of the local daemon) is the one Docker command.
+    static func isPlannableCommand(_ argv: [String]) -> Bool {
+        if plannableCommands.contains(argv) { return true }
+        return argv.count == 6 && argv[0] == "docker" && argv[1] == "--host" && argv[2].hasPrefix("unix:///")
+            && Array(argv[3...]) == ["builder", "prune", "-af"]
+    }
+
+    /// Why a category may not be part of an agent-made plan (nil = it may). Only "safe" categories whose items
+    /// are plain files and whose category-wide commands, if any, are on the fixed list above.
     static func eligibility(_ c: CleanCategory) -> String? {
-        if c.level != .safe { return "it is a \"caution\" category (real data the user may want)" }
-        if c.id == "snapshots" { return "system snapshots are never removed through this server" }
+        if c.level != .safe { return "it is a \"caution\" category (real data, or something nothing rebuilds)" }
+        if c.id == "snapshots" || c.id == "sim-unavailable" { return "system snapshots and simulator devices are never removed through this server" }
         if c.items.contains(where: { $0.deleteCommand != nil }) { return "its items are removed by running a tool command" }
+        if let cmd = c.commands.first(where: { !isPlannableCommand($0) }) {
+            return "it runs a command this server never runs (\(MCPSanitizer.text(cmd.prefix(3).joined(separator: " "), max: 60)))"
+        }
         if c.items.isEmpty && c.commands.isEmpty { return "there is nothing to remove" }
         return nil
     }
@@ -173,6 +195,16 @@ final class CleanupPlanner: @unchecked Sendable {
         reservedBytes += entry.plan.totalBytes
         return entry.plan
     }
+
+    /// After a plan ran: the session ceiling counts what was actually removed, not what was planned. (While
+    /// the plan runs its full size stays reserved, so two plans applied at once cannot exceed the ceiling.)
+    func settle(_ plan: Plan, removedBytes: Int64) {
+        lock.lock(); defer { lock.unlock() }
+        reservedBytes = max(0, reservedBytes - plan.totalBytes + max(0, min(removedBytes, plan.totalBytes)))
+    }
+
+    /// Bytes counted against the session ceiling so far.
+    var sessionBytes: Int64 { lock.lock(); defer { lock.unlock() }; return reservedBytes }
 
     // MARK: Describing
 

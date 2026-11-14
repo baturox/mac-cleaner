@@ -78,6 +78,33 @@ final class DeleterTests: EngineTestCase {
         XCTAssertTrue(d.isAllowed(f.path(".cache/tool")))
     }
 
+    /// The user's own top-level folders are refused by two independent rules: the depth rule (one level below
+    /// home) and the protected list. This isolates the second: the list belongs to an account whose home is
+    /// `~/nested`, so its Documents folder sits at a depth the deleter's own depth rule allows.
+    func testUsersTopLevelFoldersAreRefusedByTheProtectedListAtAnAllowedDepth() throws {
+        let f = try Fixture()
+        var inner = f.env
+        inner.home = try f.dir("nested")
+        for name in ["Documents", "Desktop", "Downloads", "Pictures", "Movies", "Music", "Library", "Applications", "Public"] {
+            let path = try f.dir("nested/" + name)
+            try f.file("nested/" + name + "/sub/x")
+            // Positive control: for the fixture's own account this is an ordinary folder two levels down.
+            XCTAssertTrue(f.deleter().isAllowed(path), "\(name): the depth rule alone allows it")
+            let guarded = Deleter(env: f.env, guardian: PathGuard(env: inner, settings: EngineSettings()))
+            XCTAssertFalse(guarded.isAllowed(path), "\(name): refused by the protected list, not by depth")
+            XCTAssertFalse(guarded.isAllowed(f.path("nested/" + name.uppercased())), "\(name): also under another letter case")
+            XCTAssertEqual(guarded.remove([path]).failed, 1)
+            XCTAssertTrue(f.exists("nested/" + name + "/sub/x"))
+            XCTAssertTrue(guarded.isAllowed(path + "/sub"), "\(name)/sub stays an explicit selection")
+            // The identity check that runs inside a walk knows the folder too.
+            let guardian = PathGuard(env: inner, settings: EngineSettings())
+            XCTAssertTrue(guardian.isProtectedID(try XCTUnwrap(FileID.of(path))))
+            XCTAssertFalse(guardian.isHidden(path), "\(name) is not hidden from scans, only undeletable")
+        }
+        try f.dir("nested/Other")
+        XCTAssertTrue(Deleter(env: f.env, guardian: PathGuard(env: inner, settings: EngineSettings())).isAllowed(f.path("nested/Other")))
+    }
+
     func testProtectedClaudeMemoryAndAncestors() throws {
         let f = try Fixture()
         try f.file(".claude/projects/-proj/memory/notes.md")

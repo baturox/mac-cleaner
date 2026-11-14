@@ -73,15 +73,21 @@ final class MCPTools: @unchecked Sendable {
     private let lock = NSLock()
     private var cache: (date: Date, categories: [CleanCategory])?
 
+    /// Non-nil when the process was started with a relocated home folder: nothing may be deleted.
+    let homeProblem: String?
+
     init(engine: any CleanerEngine, options: MCPOptions, home: URL, settingsStore: SettingsStore?, extraProtected: [String] = [],
-         now: @escaping @Sendable () -> Date = { Date() }) {
+         homeProblem: String? = nil, now: @escaping @Sendable () -> Date = { Date() }) {
         self.engine = engine; self.options = options; self.home = home
         self.settingsStore = settingsStore; self.extraProtected = extraProtected; self.now = now
+        self.homeProblem = homeProblem
         planner = CleanupPlanner(options: options, now: now)
         var reason: String?
         if options.allowClean {
             let loaded = settingsStore?.load() ?? .missing
-            if let problem = loaded.problem {
+            if let homeProblem {
+                reason = homeProblem
+            } else if let problem = loaded.problem {
                 reason = "the settings file cannot be used (\(problem)), so the user's protected folders are unknown"
             } else if !loaded.settings.recordAuditLog {
                 reason = "the audit log is turned off in Mac Cleaner's settings, and the cleanup tools never run without one"
@@ -102,7 +108,7 @@ final class MCPTools: @unchecked Sendable {
         if cleanupListed {
             s += """
 
-            Cleanup is ENABLED by the user. It is two steps: plan_cleanup builds a plan (only "safe" cache categories and build folders of idle projects can be in one) and returns a plan_id; apply_cleanup then executes exactly that plan. Deletion is irreversible\(options.trash ? " in effect only after the Trash is emptied (this server moves items to the Trash)" : " (items are removed permanently)"). ALWAYS show the plan to the user and get their explicit approval before calling apply_cleanup. Never apply a plan the user has not seen.
+            Cleanup is ENABLED by the user. It is two steps: plan_cleanup builds a plan (only "safe" cache categories, a few fixed package-manager cache-prune commands, and build folders of idle projects can be in one) and returns a plan_id; apply_cleanup then executes that plan, skipping whatever changed since. Deletion is irreversible\(options.trash ? " in effect only after the Trash is emptied (this server moves items to the Trash)" : " (items are removed permanently)"). ALWAYS show the plan to the user and get their explicit approval before calling apply_cleanup. Never apply a plan the user has not seen.
             """
         } else if let why = cleanupDisabledReason {
             s += "\nCleanup is disabled: \(why). No tool here can delete anything."
@@ -152,7 +158,7 @@ final class MCPTools: @unchecked Sendable {
                  output: Self.out(["total_bytes": ["type": "integer"], "used_bytes": ["type": "integer"], "free_bytes": ["type": "integer"],
                                    "purgeable_bytes": ["type": "integer"], "full_disk_access": ["type": "boolean"], "cleanup_enabled": ["type": "boolean"]]),
                  readOnly: true, destructive: false, idempotent: true),
-            tool("scan_cleanup", "Scan cleanup categories", "Measure everything that could be reclaimed: categories with id, group, safety level (safe = rebuilt automatically, caution = real data), size and item count. Can take 10-60 seconds. Read-only." + n,
+            tool("scan_cleanup", "Scan cleanup categories", "Measure everything that could be reclaimed: categories with id, group, safety level (safe = caches and build output that tools create again; caution = real data or things nothing rebuilds), size and item count. Can take 10-60 seconds. Read-only." + n,
                  input: Self.schema(["group": Self.p("string", "Only this group: \(CategoryGroup.allCases.map(\.rawValue).joined(separator: ", ")).")]),
                  output: Self.out(["categories": ["type": "array"], "total_categories": ["type": "integer"], "safe_bytes": ["type": "integer"], "caution_bytes": ["type": "integer"]]),
                  readOnly: true, destructive: false, idempotent: true),
@@ -160,9 +166,9 @@ final class MCPTools: @unchecked Sendable {
                  input: Self.schema(Self.paging.merging(["category": Self.p("string", "Category id from scan_cleanup.")]) { a, _ in a }, required: ["category"]),
                  output: Self.out(["category": ["type": "string"], "items": ["type": "array"], "total_items": ["type": "integer"], "has_more": ["type": "boolean"]]),
                  readOnly: true, destructive: false, idempotent: true),
-            tool("scan_projects", "Scan project build folders", "Find rebuildable build folders (node_modules, target, .next, .venv, Pods, ...) under a folder, with their project's idle time. Folders with git-tracked files are never reported. Can take a while. Read-only." + n,
+            tool("scan_projects", "Scan project build folders", "Find rebuildable build folders (node_modules, target, .next, .venv, Pods, ...) under a folder, with their project's idle time. A folder inside a git repository is listed only when git reports no tracked file in it; folders of repositories that cannot be inspected are left out. Can take a while. Read-only." + n,
                  input: Self.schema(Self.paging.merging([
-                    "root": Self.p("string", "Folder to search; must be inside the home folder or a temp folder (default: home)."),
+                    "root": Self.p("string", "Folder to search; must be inside the home folder or a temp folder and not a protected location (default: home)."),
                     "min_size_mb": Self.p("integer", "Only folders of at least this many MB (default 50).", extra: ["minimum": 1]),
                     "min_idle_days": Self.p("integer", "Only projects untouched for at least this many days (default 0).", extra: ["minimum": 0]),
                     "kinds": ["type": "array", "items": ["type": "string"], "description": "Only these folder names, e.g. node_modules."],
@@ -171,12 +177,12 @@ final class MCPTools: @unchecked Sendable {
                  readOnly: true, destructive: false, idempotent: true),
             tool("scan_repos", "Scan git clones and worktrees", "List git working copies grouped by repository, with backup status (uncommitted, unpushed, stash, ignored files that exist only locally, untrusted git configuration). Read-only; nothing here can remove a clone." + n,
                  input: Self.schema(Self.paging.merging([
-                    "root": Self.p("string", "Folder to search; inside the home folder or a temp folder (default: home)."),
+                    "root": Self.p("string", "Folder to search; inside the home folder or a temp folder and not a protected location (default: home)."),
                     "multiple_only": Self.p("boolean", "Only repositories that exist more than once."),
                  ]) { a, _ in a }),
                  output: Self.out(["groups": ["type": "array"], "total_groups": ["type": "integer"], "has_more": ["type": "boolean"]]),
                  readOnly: true, destructive: false, idempotent: true),
-            tool("explore_folder", "Explore a folder", "Show the biggest children of a folder with on-disk sizes. Restricted to the home folder and temp folders; protected locations (SSH keys, keychains, credentials, user-protected folders) are refused and never listed. Read-only." + n,
+            tool("explore_folder", "Explore a folder", "Show the biggest children of a folder with on-disk sizes. Restricted to the home folder and temp folders. Credential and configuration locations (SSH keys, keychains, tool credentials) and the user's protected folders are refused as the path and left out of the listing; the size of a folder that contains one still includes it. Read-only." + n,
                  input: Self.schema(["path": Self.p("string", "Absolute path or ~/…; default: home."),
                                      "top": Self.p("integer", "Number of entries (default 15, maximum 50).", extra: ["minimum": 1, "maximum": 50])]),
                  output: Self.out(["path": ["type": "string"], "total_bytes": ["type": "integer"], "entries": ["type": "array"], "omitted_count": ["type": "integer"]]),
@@ -185,7 +191,7 @@ final class MCPTools: @unchecked Sendable {
                  input: Self.schema([:]),
                  output: Self.out(["previous_snapshot": ["anyOf": [["type": "string"], ["type": "null"]]], "free_bytes_change": ["type": "integer"], "entries": ["type": "array"]]),
                  readOnly: false, destructive: false, idempotent: false),
-            tool("audit_history", "Audit history", "What Mac Cleaner deleted (by the app, the CLI or this server): newest operations first, paged. Read-only." + n,
+            tool("audit_history", "Audit history", "What Mac Cleaner deleted (by the app, the CLI or this server): newest operations first, paged. An operation with unfinished: true was interrupted (or is still running): its outcome is unknown and its items are what it intended to remove. Read-only." + n,
                  input: Self.schema([
                     "limit": Self.p("integer", "Operations per page (default 10, maximum 25).", extra: ["minimum": 1, "maximum": 25]),
                     "before": Self.p("string", "ISO 8601 time; only operations that started before it (paging)."),
@@ -197,22 +203,22 @@ final class MCPTools: @unchecked Sendable {
                  readOnly: true, destructive: false, idempotent: true),
         ]
         if cleanupListed {
-            list.append(tool("plan_cleanup", "Plan a cleanup", "Step 1 of 2. Build a cleanup plan from fresh scan results and return a plan_id with the exact categories, items and total size. Nothing is deleted. Only 'safe' cache categories (by id or group) and build folders of projects idle at least \(options.minIdleDays) days can be planned; caution categories, clones, Trash and arbitrary paths never can. The plan expires in \(Int(options.planTTL / 60)) minutes. You MUST show the plan to the user and get explicit approval before calling apply_cleanup." + n,
+            list.append(tool("plan_cleanup", "Plan a cleanup", "Step 1 of 2. Build a cleanup plan from fresh scan results and return a plan_id with the exact categories, items and total size. Nothing is deleted. Only 'safe' cache categories (by id or group; a few of them run one fixed cache-prune command: brew cleanup, pnpm store prune, go clean -modcache, uv cache prune, docker builder prune) and build folders of projects idle at least \(options.minIdleDays) days can be planned; caution categories, simulator devices, snapshots, clones, Trash and paths of your choosing never can. The plan expires in \(Int(options.planTTL / 60)) minutes. You MUST show the plan to the user and get explicit approval before calling apply_cleanup." + n,
                  input: Self.schema([
                     "categories": ["type": "array", "items": ["type": "string"], "description": "Category ids from scan_cleanup (must be safe)."],
                     "groups": ["type": "array", "items": ["type": "string"], "description": "Groups whose safe categories to include: \(CategoryGroup.allCases.map(\.rawValue).joined(separator: ", "))."],
                     "include_project_artifacts": Self.p("boolean", "Also plan build folders of idle projects."),
-                    "project_root": Self.p("string", "Folder to look in for build folders (default: home)."),
+                    "project_root": Self.p("string", "Folder to look in for build folders (default: home). Must be inside the home folder and not a protected location; it only narrows where build folders are searched, it is never deleted itself."),
                     "project_kinds": ["type": "array", "items": ["type": "string"], "description": "Only these build folder names."],
                     "min_idle_days": Self.p("integer", "Idle days required (cannot be lower than \(options.minIdleDays), the user's setting).", extra: ["minimum": 1]),
                     "min_size_mb": Self.p("integer", "Smallest build folder to include in MB (default 50).", extra: ["minimum": 1]),
                  ]),
                  output: Self.out(["plan_id": ["type": "string"], "expires_at": ["type": "string"], "total_bytes": ["type": "integer"], "categories": ["type": "array"], "project_artifacts": ["type": "array"], "skipped": ["type": "array"]]),
                  readOnly: true, destructive: false, idempotent: false))
-            list.append(tool("apply_cleanup", "Apply a cleanup plan", "Step 2 of 2. IRREVERSIBLE\(options.trash ? " (moves items to the Trash)" : ": permanently deletes files"). Executes exactly the stored plan identified by plan_id, once. Call only after the user has seen the plan and explicitly approved it, and pass confirm: true. Items that changed since planning are skipped and reported. Everything is recorded in the audit log." + n,
+            list.append(tool("apply_cleanup", "Apply a cleanup plan", "Step 2 of 2. IRREVERSIBLE\(options.trash ? " (moves items to the Trash)" : ": permanently deletes files"). Executes exactly the stored plan identified by plan_id, once. Call only after the user has seen the plan and explicitly approved it, and pass confirm: true. Items that changed since planning are skipped and reported. The run is refused if the audit log cannot be written; audit_logged in the result says whether the outcome was recorded." + n,
                  input: Self.schema(["plan_id": Self.p("string", "The plan_id returned by plan_cleanup."),
                                      "confirm": Self.p("boolean", "Must be true: the user approved this exact plan.")], required: ["plan_id", "confirm"]),
-                 output: Self.out(["plan_id": ["type": "string"], "freed_bytes": ["type": "integer"], "failed_count": ["type": "integer"], "skipped": ["type": "array"]]),
+                 output: Self.out(["plan_id": ["type": "string"], "freed_bytes": ["type": "integer"], "failed_count": ["type": "integer"], "skipped": ["type": "array"], "audit_logged": ["type": "boolean"]]),
                  readOnly: false, destructive: true, idempotent: false))
         }
         return list
@@ -265,14 +271,23 @@ final class MCPTools: @unchecked Sendable {
         return (slice, offset, offset + slice.count < all.count)
     }
 
-    private func resolveFolder(_ raw: String?, _ s: EngineSettings) throws -> String {
+    /// A caller-chosen folder to look into. Symlinks are resolved first. It must lie in the home folder or a
+    /// temp area (`homeOnly`: in the home folder) and must not be a hidden location: a credential or
+    /// configuration subtree, or one of the user's protected folders. The user's own top-level folders
+    /// (~/Documents, ~/Library, …) are allowed: they cannot be deleted, but they can be looked into.
+    private func resolveFolder(_ raw: String?, _ s: EngineSettings, homeOnly: Bool = false) throws -> String {
         let value = (raw?.isEmpty ?? true) ? "~" : raw!
         let expanded = value == "~" ? home.path : (value.hasPrefix("~/") ? home.path + value.dropFirst(1) : value)
         guard expanded.hasPrefix("/") else { throw ToolError("The path must be absolute or start with ~/.") }
         guard let resolved = Self.realPath(expanded) else { throw ToolError("That folder does not exist.") }
         let acc = access(s)
+        if homeOnly {
+            guard resolved == acc.home || resolved.hasPrefix(acc.home + "/") else {
+                throw ToolError("project_root must be inside the home folder.")
+            }
+        }
         guard acc.isInExplorableArea(resolved) else { throw ToolError("Only the home folder and temp folders can be inspected.") }
-        guard !acc.isProtected(resolved) else { throw ToolError("That location is protected and is never listed.") }
+        guard !acc.isHidden(resolved) else { throw ToolError("That location is protected and is never listed.") }
         var isDir: ObjCBool = false
         guard FileManager.default.fileExists(atPath: resolved, isDirectory: &isDir), isDir.boolValue else { throw ToolError("That path is not a folder.") }
         return resolved
@@ -340,7 +355,7 @@ final class MCPTools: @unchecked Sendable {
         let all = try await categories(maxAge: 300, progress)
         guard let cat = all.first(where: { $0.id == id }) else { throw ToolError("No category with that id (run scan_cleanup).") }
         let acc = access(s.settings)
-        let visible = cat.items.filter { !acc.isProtected($0.url.path) }
+        let visible = cat.items.filter { !acc.isHidden($0.url.path) }
         let p = try page(visible, a)
         let items: [JSONValue] = p.items.map { i in
             var o: [String: JSONValue] = ["name": .string(MCPSanitizer.text(i.displayName)), "path": .string(MCPSanitizer.path(i.url.path)),
@@ -362,7 +377,7 @@ final class MCPTools: @unchecked Sendable {
         let found = await engine.scanProjects(root: URL(fileURLWithPath: root, isDirectory: true), minBytes: Int64(minMB) * 1_000_000, progress: progress)
         try Task.checkCancellation()
         let acc = access(s.settings)
-        let matching = found.filter { $0.idleDays >= idle && (kinds.isEmpty || kinds.contains($0.kind.lowercased())) && !acc.isProtected($0.url.path) }
+        let matching = found.filter { $0.idleDays >= idle && (kinds.isEmpty || kinds.contains($0.kind.lowercased())) && !acc.isHidden($0.url.path) }
             .sorted { $0.sizeBytes > $1.sizeBytes }
         let total = matching.reduce(Int64(0)) { $0 + $1.sizeBytes }
         let p = try page(matching, a)
@@ -388,7 +403,9 @@ final class MCPTools: @unchecked Sendable {
         func status(_ c: RepoClone) -> String {
             if !c.wasInspected { return "untrusted git config - not inspected" }
             var parts: [String] = []
-            if c.uncommittedCount > 0 { parts.append("\(c.uncommittedCount) uncommitted") }
+            let visible = c.uncommittedCount - c.hiddenFromStatusCount
+            if visible > 0 { parts.append("\(visible) uncommitted") }
+            if c.hiddenFromStatusCount > 0 { parts.append("\(c.hiddenFromStatusCount) file(s) hidden from git status") }
             if let u = c.unpushedCount { if u > 0 { parts.append("\(u) unpushed") } } else { parts.append("no network remote") }
             if c.hasStash { parts.append("stash") }
             if c.ignoredFileCount > 0 { parts.append("\(c.ignoredFileCount) ignored file(s) only here") }
@@ -399,6 +416,7 @@ final class MCPTools: @unchecked Sendable {
                 var o: [String: JSONValue] = [
                     "path": .string(MCPSanitizer.path(c.url.path)), "is_linked_worktree": .bool(c.isLinkedWorktree),
                     "uncommitted_count": .int(Int64(c.uncommittedCount)), "has_stash": .bool(c.hasStash),
+                    "hidden_from_status_count": .int(Int64(c.hiddenFromStatusCount)),
                     "ignored_file_count": .int(Int64(c.ignoredFileCount)), "idle_days": .int(Int64(c.idleDays)),
                     "size_bytes": .int(c.sizeBytes), "artifact_bytes": .int(c.artifactBytes),
                     "fully_backed_up": .bool(c.isFullyBackedUp), "inspected": .bool(c.wasInspected), "status": .string(status(c)),
@@ -426,12 +444,17 @@ final class MCPTools: @unchecked Sendable {
         let acc = access(s.settings)
         let all = await engine.listFolder(URL(fileURLWithPath: path, isDirectory: true))
         try Task.checkCancellation()
-        let visible = all.filter { !acc.isProtected($0.url.path) }.sorted { $0.sizeBytes > $1.sizeBytes }
+        // Hidden: credential/configuration locations and the user's protected folders. The user's own
+        // top-level folders (Documents, Library, …) are listed; they are usually the biggest entries.
+        let visible = all.filter { !acc.isHidden($0.url.path) }.sorted { $0.sizeBytes > $1.sizeBytes }
         let total = visible.reduce(Int64(0)) { $0 + $1.sizeBytes }
         let shown = visible.prefix(top)
         let entries: [JSONValue] = shown.map { e in
-            ["name": .string(MCPSanitizer.text(e.name)), "path": .string(MCPSanitizer.path(e.url.path)),
-             "size_bytes": .int(e.sizeBytes), "is_directory": .bool(e.isDirectory)]
+            var o: [String: JSONValue] = ["name": .string(MCPSanitizer.text(e.name)), "path": .string(MCPSanitizer.path(e.url.path)),
+                                          "size_bytes": .int(e.sizeBytes), "is_directory": .bool(e.isDirectory)]
+            // The size of a folder is measured as a whole, so it includes protected folders inside it.
+            if e.isDirectory, acc.containsHidden(e.url.path) { o["size_includes_protected_data"] = true }
+            return .object(o)
         }
         return .ok("\(MCPSanitizer.path(path)): \(fmt(total)) in \(visible.count) entries; showing \(entries.count).",
                    ["path": .string(MCPSanitizer.path(path)), "total_bytes": .int(total), "entry_count": .int(Int64(visible.count)),
@@ -478,7 +501,11 @@ final class MCPTools: @unchecked Sendable {
                 "id": .string(r.id), "started_at": JSON.iso(r.startedAt), "client": .string(r.client.rawValue),
                 "app_version": .string(MCPSanitizer.text(r.appVersion, max: 30)), "kind": .string(r.kind.rawValue), "mode": .string(r.mode.rawValue),
                 "freed_bytes": .int(r.freedBytes), "item_count": .int(Int64(r.itemCount)), "failed_item_count": .int(Int64(r.failedItemCount)),
+                "unfinished": .bool(r.isUnfinished),
             ]
+            if r.isUnfinished {
+                o["outcome"] = "interrupted - outcome unknown; items are what the operation intended to remove"
+            }
             if let p = r.planID { o["plan_id"] = .string(MCPSanitizer.text(p, max: 64)) }
             if withItems {
                 o["items"] = .array(r.items.prefix(itemsLimit).map { i in
@@ -506,6 +533,7 @@ final class MCPTools: @unchecked Sendable {
     /// Cleanup needs a usable settings file, a running audit log and the user's opt-in; checked on every call.
     private func requireCleanup(_ s: (settings: EngineSettings, problem: String?)) throws {
         guard options.allowClean else { throw ToolError("Cleanup is disabled.") }
+        if let homeProblem { throw ToolError("Cleanup is disabled: \(homeProblem).") }
         if let problem = s.problem { throw ToolError("Cleanup is disabled: the settings file cannot be used (\(problem)), so the protected folders are unknown.") }
         guard s.settings.recordAuditLog else { throw ToolError("Cleanup is disabled: the audit log is turned off in Mac Cleaner's settings.") }
     }
@@ -531,7 +559,8 @@ final class MCPTools: @unchecked Sendable {
         let minMB = try a.int("min_size_mb", default: 50, range: 1...1_000_000)
         let kinds = try a.strings("project_kinds", maxCount: 30, maxLength: 60).map { $0.lowercased() }
         var root: String?
-        if wantsProjects { root = try resolveFolder(try a.string("project_root"), s.settings) }
+        // The one place a caller names a folder for a deleting tool. It is only where the project scan looks.
+        if wantsProjects { root = try resolveFolder(try a.string("project_root"), s.settings, homeOnly: true) }
 
         let acc = access(s.settings)
         var cats: [CleanCategory] = []
@@ -555,14 +584,23 @@ final class MCPTools: @unchecked Sendable {
         let a = try ToolArgs(raw, allowed: ["plan_id", "confirm"])
         guard let id = try a.string("plan_id", max: 100) else { throw ToolError("'plan_id' is required.") }
         guard raw["confirm"]?.bool == true else { throw ToolError("Refused: 'confirm' must be true, and only after the user approved this exact plan. Nothing was deleted.") }
+        // Nothing is deleted without a log entry: prove the log can be appended to BEFORE the plan is used up.
+        if let why = await engine.auditLogProblem() {
+            throw ToolError("Refused: the audit log cannot be written (\(MCPSanitizer.text(why, max: 200))), and this server never deletes without recording it. Nothing was deleted; the plan is still valid.")
+        }
         let plan = try planner.claim(id)      // unknown / expired / used / rate-limited / over the session ceiling
         let acc = access(s.settings)
         let mode = plan.mode
         var skipped: [JSONValue] = []
         func skip(_ what: String, _ why: String) { skipped.append(["what": .string(MCPSanitizer.path(what)), "reason": .string(why)]) }
+        func gone(_ path: String) -> Bool { var st = stat(); return lstat(path, &st) != 0 }
         var freed: Int64 = 0, failed = 0
         var messages: [String] = []
+        var submittedBytes: Int64 = 0
+        /// What is really gone afterwards; this is what counts against the session ceiling.
         var removedBytes: Int64 = 0
+        var engineCalls = 0
+        var audited = true
 
         await AuditContext.$planID.withValue(plan.id) {
             // Safe categories: re-scan and keep only what is still there, still safe and not protected.
@@ -578,42 +616,63 @@ final class MCPTools: @unchecked Sendable {
                     let keep = live.items.filter { wanted.contains($0.url.path) && !acc.isProtected($0.url.path) }
                     for p in planned.itemPaths where !keep.contains(where: { $0.url.path == p }) { skip(p, "changed or gone since the plan was made") }
                     live.items = keep
-                    // A category-wide command only runs if it was planned and nothing else changed.
+                    // A category-wide command only runs if it was planned, is on the fixed list, and nothing else changed.
                     let unchanged = keep.count == planned.itemPaths.count
-                    live.commands = unchanged ? live.commands.filter { planned.commands.contains($0) } : []
+                    live.commands = unchanged ? live.commands.filter { planned.commands.contains($0) && CleanupPlanner.isPlannableCommand($0) } : []
                     if keep.isEmpty && live.commands.isEmpty { continue }
-                    removedBytes += keep.reduce(0) { $0 + $1.sizeBytes }
+                    submittedBytes += keep.reduce(0) { $0 + $1.sizeBytes }
                     selected.append(live)
                 }
                 if !selected.isEmpty {
                     let r = await engine.clean(categories: selected, mode: mode, progress: progress)
+                    engineCalls += 1
+                    audited = audited && r.auditRecorded
                     freed += r.freedBytes; failed += r.failedCount; messages += r.messages
+                    for c in selected {
+                        removedBytes += c.items.filter { gone($0.url.path) }.reduce(0) { $0 + $1.sizeBytes }
+                        // A command-only category has no path to look at: its measured size counts when its command ran.
+                        if c.items.isEmpty, r.failedCount == 0, r.auditRecorded { removedBytes += c.sizeBytes }
+                    }
                 }
             }
             // Build folders: re-scan the root; each folder must still be reported, as the same kind, in a project idle long enough.
             if !plan.artifacts.isEmpty, let root = plan.artifactRoot {
                 let current = await engine.scanProjects(root: URL(fileURLWithPath: root, isDirectory: true), minBytes: 1, progress: progress)
-                var urls: [URL] = []
+                var chosen: [ProjectArtifact] = []
                 for planned in plan.artifacts {
                     guard let live = current.first(where: { $0.url.path == planned.path }) else { skip(planned.path, "no longer reported by the project scan"); continue }
                     guard live.kind == planned.kind else { skip(planned.path, "kind changed"); continue }
                     guard live.idleDays >= plan.minIdleDays else { skip(planned.path, "the project was touched since the plan (idle \(live.idleDays) days)"); continue }
                     guard !acc.isProtected(planned.path) else { skip(planned.path, "protected"); continue }
-                    urls.append(live.url)
-                    removedBytes += live.sizeBytes
+                    chosen.append(live)
+                    submittedBytes += live.sizeBytes
                 }
-                if !urls.isEmpty {
-                    let r = await engine.delete(urls: urls, mode: mode, purpose: .projectArtifacts, progress: progress)
+                if !chosen.isEmpty {
+                    let r = await engine.delete(urls: chosen.map(\.url), mode: mode, purpose: .projectArtifacts, progress: progress)
+                    engineCalls += 1
+                    audited = audited && r.auditRecorded
                     freed += r.freedBytes; failed += r.failedCount; messages += r.messages
+                    removedBytes += chosen.filter { gone($0.url.path) }.reduce(0) { $0 + $1.sizeBytes }
                 }
             }
+            // Everything was skipped: the run is still recorded (an operation with the plan id and no items).
+            if engineCalls == 0 {
+                let r = await engine.clean(categories: [], mode: mode, progress: progress)
+                audited = r.auditRecorded
+                messages += r.messages
+            }
         }
+        planner.settle(plan, removedBytes: removedBytes)
         let shownMessages: [JSONValue] = messages.prefix(20).map { .string(MCPSanitizer.text($0, max: 300)) }
+        var note = mode == .trash ? "Items were moved to the Trash; space is freed when the user empties it." : "Items were permanently deleted."
+        if engineCalls == 0 { note = "Nothing was removed: every item of the plan was skipped." }
+        if !audited { note += " WARNING: the outcome of this run could not be written to the audit log; tell the user." }
         return .ok("Applied plan \(plan.id): about \(fmt(freed)) freed, \(failed) failures, \(skipped.count) skipped.",
-                   ["plan_id": .string(plan.id), "mode": .string(mode.rawValue), "freed_bytes": .int(freed), "removed_bytes_estimate": .int(removedBytes),
+                   ["plan_id": .string(plan.id), "mode": .string(mode.rawValue), "freed_bytes": .int(freed),
+                    "removed_bytes_estimate": .int(removedBytes), "submitted_bytes": .int(submittedBytes),
                     "failed_count": .int(Int64(failed)), "skipped": .array(Array(skipped.prefix(50))), "skipped_count": .int(Int64(skipped.count)),
-                    "messages": .array(shownMessages), "audit_logged": true,
-                    "note": mode == .trash ? "Items were moved to the Trash; space is freed when the user empties it." : "Items were permanently deleted."])
+                    "messages": .array(shownMessages), "audit_logged": .bool(audited),
+                    "session_bytes_used": .int(planner.sessionBytes), "note": .string(note)])
     }
 
     private func fmt(_ bytes: Int64) -> String {

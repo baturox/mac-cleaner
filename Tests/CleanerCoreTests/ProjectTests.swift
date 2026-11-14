@@ -64,6 +64,14 @@ final class ProjectTests: EngineTestCase {
         XCTAssertEqual(found, ["p/node_modules"])
     }
 
+    func testProjectsInsideTheUsersOwnTopLevelFoldersAreFound() async throws {
+        // ~/Documents, ~/Desktop and ~/Downloads cannot be deleted themselves, but they are where projects live.
+        let f = try Fixture()
+        for top in ["Documents", "Desktop", "Downloads"] { try f.file("\(top)/proj/node_modules/x", bytes: 5000) }
+        let found = try await scan(f)
+        XCTAssertEqual(found, ["Documents/proj/node_modules", "Desktop/proj/node_modules", "Downloads/proj/node_modules"])
+    }
+
     func testSkipsLibraryAtHomeTopLevelOnly() async throws {
         let f = try Fixture()
         try f.file("Library/thing/node_modules/x", bytes: 5000)
@@ -160,14 +168,140 @@ final class ProjectTests: EngineTestCase {
         XCTAssertEqual(found, ["outer/inner/dist"])
     }
 
-    func testGitFilterFailsClosedWhenGitCannotAnswer() async throws {
+    func testFolderWithAGitDirThatIsNotARepositoryIsNeverOffered() async throws {
         let f = try Fixture()
-        // A ".git" folder that is not a repository: git fails, so nothing in it may be offered.
+        // A ".git" folder that is not a repository: the audit already refuses it, so nothing in it may be offered.
         try f.file("broken/.git/HEAD", "garbage")
         try f.file("broken/package.json", "{}")
         try f.file("broken/.next/x", bytes: 5000)
         let found = try await scan(f)
         XCTAssertFalse(found.contains("broken/.next"))
+    }
+
+    func testGitFilterFailsClosedWhenGitCannotAnswer() async throws {
+        let f = try Fixture()
+        // A real repository whose index is corrupt: the configuration audit passes, `git ls-files` then fails.
+        try f.repo("corrupt", files: ["package.json": "{}", ".gitignore": ".next/\nnode_modules/\n"])
+        try f.file("corrupt/.next/x", bytes: 5000)
+        try f.file("corrupt/node_modules/x", bytes: 5000)
+        // Positive control 1: while git can answer, both folders are offered.
+        var found = try await scan(f)
+        XCTAssertEqual(found, ["corrupt/.next", "corrupt/node_modules"])
+        try Data("this is not an index".utf8).write(to: URL(fileURLWithPath: f.path("corrupt/.git/index")))
+        // Positive control 2: the repository still passes the audit, and git itself is what fails.
+        guard case .trusted(let repo) = await Git.open(f.path("corrupt"), env: f.env) else { return XCTFail("the audit must pass, or git is never reached") }
+        let r = await Git.run(repo, ["ls-files", "-z"], env: f.env)
+        XCTAssertTrue(r.launched)
+        XCTAssertFalse(r.ok, "git must fail on the corrupt index")
+        let tracked = await GitArtifactFilter.trackedPaths(repo: repo, rels: [".next"], env: f.env)
+        XCTAssertNil(tracked)
+        found = try await scan(f)
+        XCTAssertEqual(found, [], "nothing may be offered when git cannot say what is tracked")
+    }
+
+    // MARK: Scan root below the repository root (H2)
+
+    private func scan(_ f: Fixture, root rel: String) async -> Set<String> {
+        let found = await f.engine().scanProjects(root: URL(fileURLWithPath: f.path(rel)), minBytes: 1, progress: { _ in })
+        return Set(found.map { String($0.url.path.dropFirst(f.home.count + 1)) })
+    }
+
+    func testTrackedBuildFolderIsNotReportedWhenScanningBelowTheRepositoryRoot() async throws {
+        let f = try Fixture()
+        try f.repo("app", files: ["ios/Podfile": "pod 'X'", "ios/Pods/Lib/blob": String(repeating: "x", count: 5000),
+                                  "web/package.json": "{}", "web/node_modules/pkg/index.js": "committed on purpose"])
+        // Positive control: the walker does find both folders from the sub-roots; only git knows they are tracked.
+        let guardian = PathGuard(env: f.env, settings: EngineSettings())
+        let raw = ProjectWalker.find(root: f.path("app/ios"), home: f.home, guardian: guardian, flag: CancelFlag())
+        XCTAssertEqual(raw.map(\.path), [f.path("app/ios/Pods")])
+        XCTAssertEqual(raw.first?.repoRoot, f.path("app"), "the walker must know the repository above its root")
+        for root in ["app", "app/ios", "app/web", "app/ios/Pods/..", "app/web/node_modules/pkg/../.."] {
+            let found = await scan(f, root: root)
+            XCTAssertEqual(found, [], "scan root \(root)")
+        }
+    }
+
+    func testIgnoredBuildFolderIsStillReportedWhenScanningBelowTheRepositoryRoot() async throws {
+        let f = try Fixture()
+        try f.repo("app", files: ["web/package.json": "{}", ".gitignore": "node_modules/\ndist/\n", "ios/Podfile": "pod 'X'"])
+        try f.file("app/web/node_modules/pkg/index.js", bytes: 5000)
+        try f.file("app/web/dist/bundle.js", bytes: 5000)       // risky name: needs the repository AND the ignore rule
+        try f.file("app/ios/Pods/Lib/blob", bytes: 5000)        // untracked, not ignored, not a risky name
+        var found = await scan(f, root: "app/web")
+        XCTAssertEqual(found, ["app/web/node_modules", "app/web/dist"])
+        found = await scan(f, root: "app/ios")
+        XCTAssertEqual(found, ["app/ios/Pods"])
+        // Outside any repository nothing changes: plain folders are still found, risky names still are not.
+        try f.file("plain/sub/package.json", "{}")
+        try f.file("plain/sub/node_modules/x", bytes: 5000)
+        try f.file("plain/sub/dist/x", bytes: 5000)
+        found = await scan(f, root: "plain/sub")
+        XCTAssertEqual(found, ["plain/sub/node_modules"])
+    }
+
+    func testNothingIsReportedBelowTheRootOfAnUntrustedOrUnreadableRepository() async throws {
+        let f = try Fixture()
+        try f.repo("evil", files: ["web/package.json": "{}", ".gitignore": "node_modules/\n"])
+        try f.file("evil/web/node_modules/pkg/index.js", bytes: 5000)
+        // Positive control: reported while the repository is trusted.
+        var found = await scan(f, root: "evil/web")
+        XCTAssertEqual(found, ["evil/web/node_modules"])
+        try f.git("evil", "config", "core.fsmonitor", "/nonexistent/program")
+        found = await scan(f, root: "evil/web")
+        XCTAssertEqual(found, [], "untrusted repository above the scan root")
+        // A `.git` entry above the root that is not a repository at all.
+        try f.file("fake/.git/HEAD", "garbage")
+        try f.file("fake/web/node_modules/pkg/index.js", bytes: 5000)
+        found = await scan(f, root: "fake/web")
+        XCTAssertEqual(found, [], "an enclosing repository that cannot be inspected")
+    }
+
+    // MARK: Idle time (L2)
+
+    func testIdleDaysSeeAChangeDeepInsideTheProject() async throws {
+        let f = try Fixture()
+        try f.file("web/package.json", "{}")
+        try f.file("web/node_modules/pkg/blob", bytes: 5000)
+        try f.file("web/src/deep/er/x.js", "1")
+        try f.file("web/.hidden/y", "1")
+        for rel in ["web/src/deep/er/x.js", "web/src/deep/er", "web/src/deep", "web/src", "web/.hidden/y", "web/.hidden",
+                    "web/package.json", "web/node_modules/pkg/blob", "web/node_modules/pkg", "web/node_modules", "web"] {
+            try f.age(rel, days: 300)
+        }
+        func idle() async -> Int? {
+            await f.engine().scanProjects(root: URL(fileURLWithPath: f.home), minBytes: 1, progress: { _ in }).first?.idleDays
+        }
+        // Positive control: everything is old, so the project is idle.
+        let first = await idle()
+        let before = try XCTUnwrap(first)
+        XCTAssertGreaterThanOrEqual(before, 299)
+        // A change inside the artifact folder itself does not count as project activity…
+        try f.age("web/node_modules/pkg/blob", days: 0)
+        let second = await idle()
+        let stillIdle = try XCTUnwrap(second)
+        XCTAssertGreaterThanOrEqual(stillIdle, 299)
+        // …an edit three levels down does (a file's change does not touch its grand-parents' timestamps).
+        try f.age("web/src/deep/er/x.js", days: 0)
+        let third = await idle()
+        let after = try XCTUnwrap(third)
+        XCTAssertEqual(after, 0, "a project edited today is not idle")
+    }
+
+    func testIdleDaysFailClosedWhenTheProjectIsTooBigOrUnreadable() throws {
+        let f = try Fixture()
+        try f.file("p/package.json", "{}")
+        for i in 0..<30 { try f.file("p/src/f\(i).js", "1") }
+        try f.dir("p/locked")
+        for rel in (0..<30).map({ "p/src/f\($0).js" }) + ["p/src", "p/package.json", "p/locked", "p"] { try f.age(rel, days: 100) }
+        let old = Date().timeIntervalSince1970 - 99 * 86400
+        // Positive control: within the bound the real (old) time is found.
+        XCTAssertLessThan(ProjectWalker.lastTouched(project: f.path("p"), skipping: []), old)
+        // Bound hit: counts as touched just now.
+        XCTAssertGreaterThan(ProjectWalker.lastTouched(project: f.path("p"), skipping: [], maxEntries: 10), Date().timeIntervalSince1970 - 60)
+        // A folder that cannot be read: same.
+        chmod(f.path("p/locked"), 0)
+        defer { chmod(f.path("p/locked"), 0o700) }
+        XCTAssertGreaterThan(ProjectWalker.lastTouched(project: f.path("p"), skipping: []), Date().timeIntervalSince1970 - 60)
     }
 
     func testArtifactRuleMatching() {
