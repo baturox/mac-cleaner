@@ -9,7 +9,7 @@ enum DoctorCommand {
         let fda = ctx.engine.hasFullDiskAccess()
         let apfs = probe.apfsLayout()
         let snapshots = probe.localSnapshots()
-        let report = DoctorReport(
+        var report = DoctorReport(
             cliVersion: cliVersion, macOSVersion: probe.osVersion(), architecture: probe.architecture(),
             disk: DiskReport(disk), fullDiskAccess: fda, tools: probe.detectedTools(home: ctx.home),
             apfsVolumes: apfs?.volumes ?? [], apfsContainerFreeBytes: apfs?.containerFreeBytes,
@@ -19,6 +19,7 @@ enum DoctorCommand {
                                      extraProtectedPaths: ctx.extraProtected,
                                      builtInProtectedPaths: ProtectedLocations.builtIn(),
                                      sessionRetentionDays: ctx.settings.sessionRetentionDays))
+        report.recordAuditLog = ctx.settings.recordAuditLog
         try Task.checkCancellation()
 
         if ctx.json {
@@ -107,6 +108,12 @@ enum DoctorCommand {
             ctx.out()
             ctx.out(s.bold("Swap / sleep image") + "  \(formatBytes(swap))" + s.dim("  (shrinks after a reboot; grows when RAM is exhausted)"))
         }
+
+        ctx.out()
+        ctx.out(s.bold("AI agents (MCP)") + s.dim("  (let Claude Code, Cursor, Codex… inspect disk usage)"))
+        ctx.out("  Server command: " + report.mcpCommand + s.dim("   (read-only; cleanup tools only with --allow-clean)"))
+        ctx.out(s.dim("  Setup: README, \"Use it from your AI agent (MCP)\". `mac-cleaner help mcp` lists the options."))
+        ctx.out(s.dim("  Audit log of every deletion: `mac-cleaner history`" + (ctx.settings.recordAuditLog ? "" : " (recording is OFF in Settings)")))
         return ExitCode.ok
     }
 }

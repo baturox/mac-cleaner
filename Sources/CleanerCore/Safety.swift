@@ -174,6 +174,35 @@ public enum ProtectedLocations {
     }
 }
 
+/// Read-only questions about the protected list and the areas a front end may look into, for front ends
+/// that expose folder contents to someone else (the MCP server). It uses exactly the rules the engine deletes by.
+public struct PathAccess: Sendable {
+    public let home: String
+    private let guardian: PathGuard
+    private let env: EngineEnvironment
+
+    /// `home` defaults to the real home folder (tests pass a fixture's).
+    public init(home: String? = nil, settings: EngineSettings) {
+        var e = EngineEnvironment.live
+        if let home { e.home = realPath(home) ?? home }
+        env = e
+        self.home = e.home
+        guardian = PathGuard(env: e, settings: settings)
+    }
+
+    /// The path is a protected location (built-in or user-configured) or lies inside one.
+    public func isProtected(_ path: String) -> Bool { guardian.isProtected(path) }
+
+    /// The (symlink-resolved) path is the home folder, below it, or in a per-user temp area.
+    public func isInExplorableArea(_ resolved: String) -> Bool {
+        func inside(_ root: String) -> Bool { resolved == root || resolved.hasPrefix(root + "/") }
+        if inside(env.home) { return true }
+        var temps = [env.tmp, env.privateTmp]
+        if let v = env.varFolders { temps.append(v) }
+        return temps.contains(where: inside)
+    }
+}
+
 // MARK: - Command allowlist
 
 /// Commands the engine itself generates. A `CleanCategory` arriving from outside must not be able to make

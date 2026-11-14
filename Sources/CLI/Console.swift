@@ -129,6 +129,8 @@ struct Context {
     /// Paths added with `--protect` for this run (absolute).
     var extraProtected: [String] = []
     var settingsFile: String?
+    /// The shared settings file, so long-running commands (mcp) can re-read it.
+    var settingsStore: SettingsStore?
     /// "ok", "missing" or "corrupt".
     var settingsStatus = "missing"
     /// Set when the settings file exists but cannot be used.

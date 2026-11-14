@@ -65,7 +65,7 @@ enum ProjectsCommand {
                 return ExitCode.ok
             }
         }
-        let result = await ctx.engine.delete(urls: chosen.map { $0.url }, mode: mode, progress: progress.handler)
+        let result = await ctx.engine.delete(urls: chosen.map { $0.url }, mode: mode, purpose: .projectArtifacts, progress: progress.handler)
         progress.finish()
         CleanCommand.printResult(result, mode: mode, ctx)
         try Task.checkCancellation()

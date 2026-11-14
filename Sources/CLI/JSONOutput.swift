@@ -125,6 +125,9 @@ struct DoctorReport: Codable {
     var localSnapshots: [LocalSnapshot]
     var swapBytes: Int64?
     var settings: SettingsReport
+    /// How to start the MCP server (see the README).
+    var mcpCommand: String = "mac-cleaner mcp"
+    var recordAuditLog: Bool = true
 }
 
 /// What protects the user's own folders in this run.

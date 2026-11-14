@@ -46,9 +46,18 @@ final class FakeEngine: CleanerEngine, @unchecked Sendable {
     var groups: [RepoGroup] = []
     var folder: [FolderEntry] = []
     var growth = GrowthReport.empty
+    var audit: [AuditRecord] = []
+    var auditSkippedLines = 0
+    private(set) var auditCleared = 0
+    /// Makes scans slow (cancellable) and chatty, for the MCP concurrency tests.
+    var scanDelay: UInt64 = 0
+    var scanProgressMessages: [String] = []
 
     private let lock = NSLock()
     private(set) var cleanedCalls: [(ids: [String], mode: DeleteMode)] = []
+    private(set) var cleanedItemPaths: [[String]] = []
+    private(set) var cleanedCommands: [[[String]]] = []
+    private(set) var scanCount = 0
     private(set) var deletedCalls: [(urls: [URL], mode: DeleteMode)] = []
     private(set) var removeCalls: [(clones: [RepoClone], force: Bool, mode: DeleteMode)] = []
     private(set) var configured: [EngineSettings] = []
@@ -56,7 +65,13 @@ final class FakeEngine: CleanerEngine, @unchecked Sendable {
     func configure(_ settings: EngineSettings) async { lock.withLock { configured.append(settings) } }
 
     func diskInfo() -> DiskInfo { DiskInfo(totalBytes: 1_000_000_000_000, freeBytes: 200_000_000_000, availableWithPurgeableBytes: 230_000_000_000) }
-    func scanCategories(progress: @escaping ProgressHandler) async -> [CleanCategory] { categories }
+    func scanCategories(progress: @escaping ProgressHandler) async -> [CleanCategory] {
+        lock.withLock { scanCount += 1 }
+        for m in scanProgressMessages { progress(m); try? await Task.sleep(nanoseconds: 300_000_000) }
+        if scanDelay > 0 { try? await Task.sleep(nanoseconds: scanDelay) }
+        if Task.isCancelled { return [] }
+        return categories
+    }
     func scanProjects(root: URL, minBytes: Int64, progress: @escaping ProgressHandler) async -> [ProjectArtifact] {
         artifacts.filter { $0.sizeBytes >= minBytes }
     }
@@ -68,7 +83,11 @@ final class FakeEngine: CleanerEngine, @unchecked Sendable {
         await delete(urls: urls, mode: .permanent, progress: progress)
     }
     func clean(categories: [CleanCategory], mode: DeleteMode, progress: @escaping ProgressHandler) async -> CleanResult {
-        lock.withLock { cleanedCalls.append((categories.map { $0.id }, mode)) }
+        lock.withLock {
+            cleanedCalls.append((categories.map { $0.id }, mode))
+            cleanedItemPaths.append(categories.flatMap { $0.items.map { $0.url.path } })
+            cleanedCommands.append(categories.flatMap { $0.commands })
+        }
         return CleanResult(freedBytes: categories.reduce(0) { $0 + $1.sizeBytes }, failedCount: 0, messages: [])
     }
     func delete(urls: [URL], mode: DeleteMode, progress: @escaping ProgressHandler) async -> CleanResult {
@@ -81,6 +100,15 @@ final class FakeEngine: CleanerEngine, @unchecked Sendable {
         return CleanResult(freedBytes: clones.reduce(0) { $0 + $1.sizeBytes }, failedCount: 0, messages: [])
     }
     func recordSnapshot(categories: [CleanCategory], artifacts: [ProjectArtifact]) async -> GrowthReport { growth }
+    func auditLog(limit: Int, before: Date?) async -> [AuditRecord] {
+        Array(audit.filter { before == nil || $0.startedAt < before! }.sorted { $0.startedAt > $1.startedAt }.prefix(limit))
+    }
+    func auditStats(since: Date?) async -> AuditStats {
+        let rs = audit.filter { since == nil || $0.startedAt >= since! }
+        return AuditStats(operations: rs.count, freedBytes: rs.reduce(0) { $0 + $1.freedBytes },
+                          itemsRemoved: rs.reduce(0) { $0 + $1.items.count }, skippedLines: auditSkippedLines)
+    }
+    func clearAuditLog() async { lock.withLock { auditCleared += 1; audit = [] } }
 }
 
 // MARK: - Builders
