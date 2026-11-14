@@ -243,15 +243,15 @@ All documents carry `"schemaVersion": 1`; fields are only ever added within a sc
 | Group | Examples | Typical level |
 | --- | --- | --- |
 | System & apps | user caches, logs and crash reports, old temp files, app caches (VS Code, Slack, Chrome and other Electron apps), Time Machine local snapshots | safe |
-| Package managers | npm, pnpm, Yarn, Bun, Cargo registry, Go modules, Gradle, Homebrew old versions, `~/.cache` | safe (Go modules: caution) |
-| Xcode & mobile | DerivedData, device support files, simulator caches, unavailable simulators and runtimes, archives, iPhone/iPad local backups | safe; archives and backups are caution |
+| Package managers | npm, pnpm, Yarn, Bun, uv, pip, Cargo registry, Go build and module caches, Gradle, CocoaPods, SwiftPM, Composer, Homebrew old versions | safe |
+| Xcode & mobile | DerivedData (per project), device support files, simulator caches, simulator runtimes and devices (one at a time) | safe; runtimes and devices are caution |
 | AI coding tools | session data and transcripts of Claude Code, Cursor, Windsurf, VS Code, Codex and Gemini CLI older than the retention period, orphaned workspace storage, old extension versions, Playwright browsers | session data is caution; the rest safe |
 | AI models | Hugging Face, Ollama, LM Studio, one model at a time | caution |
 | Language toolchains | old Node, Rust and Python versions, Android SDK pieces | caution |
 | Containers & VMs | Docker unused images, containers and build cache (with a breakdown) | per item |
-| Personal data | the Trash and other things only you can judge, always opt-in | caution |
+| Personal data | the Trash, Xcode archives, iPhone/iPad local backups; always opt-in | caution |
 
-The exact list lives in `Sources/CleanerCore/Categories.swift`; `mac-cleaner scan` shows what exists on your machine. Missing tools simply produce no category.
+The exact list lives in `Sources/CleanerCore/` (`Categories.swift` and the files next to it); `mac-cleaner scan` shows what exists on your machine. Missing tools simply produce no category.
 
 ## Safety model
 
