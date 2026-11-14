@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 import CleanerCore
 
 struct ConfirmDeleteSheet: View {
@@ -6,27 +7,64 @@ struct ConfirmDeleteSheet: View {
     var onCancel: () -> Void
     var onConfirm: () -> Void
 
+    @State private var typed = ""
+    @FocusState private var phraseFocused: Bool
+
+    private var n: Int { plan.itemCount }
+    private var trash: Bool { plan.mode == .trash }
+
+    private var title: String {
+        if plan.isClones {
+            let noun = "working cop\(n == 1 ? "y" : "ies")"
+            return trash ? "Move \(n) \(noun) to the Trash?" : "Remove \(n) \(noun) permanently?"
+        }
+        let noun = "item\(n == 1 ? "" : "s")"
+        return trash ? "Move \(n) \(noun) to the Trash?" : "Delete \(n) \(noun) permanently?"
+    }
+
+    private var subtitle: String {
+        trash
+            ? "You can restore them from the Trash. No space is freed until you empty it."
+            : "This cannot be undone. Nothing is moved to the Trash."
+    }
+
+    private var buttonTitle: String {
+        if trash { return "Move to Trash" }
+        return plan.isClones ? "Remove permanently" : "Delete permanently"
+    }
+
+    private var phraseOK: Bool {
+        guard let phrase = plan.confirmPhrase else { return true }
+        return typed.trimmingCharacters(in: .whitespaces) == phrase
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .firstTextBaseline) {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Delete \(plan.itemCount) item\(plan.itemCount == 1 ? "" : "s") permanently?")
-                        .font(.title3.weight(.semibold))
-                    Text("This cannot be undone. Nothing is moved to the Trash.")
-                        .font(.callout).foregroundStyle(.secondary)
+                    Text(title).font(.title3.weight(.semibold))
+                    Text(subtitle).font(.callout).foregroundStyle(.secondary)
                 }
                 Spacer()
                 VStack(alignment: .trailing, spacing: 0) {
                     Text(Fmt.bytes(plan.expectedBytes)).font(.title2.weight(.semibold)).monospacedDigit()
-                    Text("to be removed").font(.caption).foregroundStyle(.secondary)
+                    Text(trash ? "to be moved" : "to be removed").font(.caption).foregroundStyle(.secondary)
                 }
             }
 
+            if !plan.losses.isEmpty { lossBox }
+
+            ForEach(plan.warnings, id: \.self) { warning($0) }
             if !plan.cautionNames.isEmpty {
                 warning("Review first: this includes real data you may want — \(plan.cautionNames.joined(separator: ", ")).")
             }
             if plan.isExplorer {
                 warning("These are arbitrary files and folders. Unlike caches, they are not rebuilt automatically.")
+            }
+            if plan.hasCommands && trash {
+                Label("Items shown with a command are removed by running it, whichever delete mode is set.",
+                      systemImage: "terminal")
+                    .font(.caption).foregroundStyle(.secondary)
             }
 
             ScrollView {
@@ -41,16 +79,51 @@ struct ConfirmDeleteSheet: View {
             .background(.background.secondary, in: RoundedRectangle(cornerRadius: 8))
             .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(.quaternary))
 
+            if let phrase = plan.confirmPhrase {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Type **\(phrase)** to enable the button.").font(.callout)
+                    TextField(phrase, text: $typed)
+                        .textFieldStyle(.roundedBorder)
+                        .focused($phraseFocused)
+                        .autocorrectionDisabled()
+                        .accessibilityLabel("Type \(phrase) to confirm")
+                }
+            }
+
             HStack {
                 Spacer()
-                Button("Delete permanently", role: .destructive, action: onConfirm)
+                Button(buttonTitle, role: .destructive, action: onConfirm)
                     .foregroundStyle(.red)
+                    .disabled(!phraseOK)
                 Button("Cancel", action: onCancel)
                     .keyboardShortcut(.defaultAction)
             }
         }
         .padding(20)
-        .frame(width: 560)
+        .frame(width: 580)
+        .onAppear { if plan.confirmPhrase != nil { phraseFocused = true } }
+    }
+
+    private var lossBox: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Label("Some of these copies hold work that exists nowhere else", systemImage: "exclamationmark.octagon.fill")
+                .font(.callout.weight(.semibold)).foregroundStyle(.red)
+            Text(trash ? "Moving them to the Trash keeps the files for now, but nothing is backed up elsewhere. This would lose:"
+                       : "Removing them permanently cannot be undone. This would lose:")
+                .font(.callout)
+            ForEach(plan.losses) { l in
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Text("•")
+                    (Text(l.name).fontWeight(.medium) + Text(": " + l.details.joined(separator: ", ")))
+                        .font(.callout)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(10)
+        .background(.red.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+        .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(.red.opacity(0.5)))
+        .accessibilityElement(children: .combine)
     }
 
     private func warning(_ text: String) -> some View {
@@ -75,7 +148,9 @@ private struct EntryRow: View {
                 } else {
                     Button { expanded.toggle() } label: {
                         Image(systemName: expanded ? "chevron.down" : "chevron.right").font(.caption2).frame(width: 14)
-                    }.buttonStyle(.plain)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(expanded ? "Hide details of \(entry.name)" : "Show details of \(entry.name)")
                 }
                 Image(systemName: entry.symbol).foregroundStyle(.secondary).frame(width: 18)
                 VStack(alignment: .leading, spacing: 0) {
@@ -97,8 +172,13 @@ private struct EntryRow: View {
                         VStack(alignment: .leading, spacing: 0) {
                             Text(c.name).font(.callout).lineLimit(1).truncationMode(.middle)
                             if !c.path.isEmpty {
-                                Text(c.path).font(.caption2).foregroundStyle(.secondary)
-                                    .lineLimit(1).truncationMode(.middle)
+                                if c.isCommand {
+                                    Text("$ " + c.path).font(.caption2.monospaced()).foregroundStyle(.secondary)
+                                        .lineLimit(1).truncationMode(.middle)
+                                } else {
+                                    Text(c.path).font(.caption2).foregroundStyle(.secondary)
+                                        .lineLimit(1).truncationMode(.middle)
+                                }
                             }
                         }
                         Spacer(minLength: 8)
@@ -128,25 +208,47 @@ struct CleaningSheet: View {
         .padding(28)
         .frame(width: 420)
         .interactiveDismissDisabled()
+        .accessibilityElement(children: .combine)
     }
 }
 
 struct ResultSheet: View {
     let summary: CleanSummary
     var onDone: () -> Void
+    @State private var copied = false
+
+    private var trash: Bool { summary.mode == .trash }
+
+    /// Lines that read like a failure get a warning icon; the engine only gives us free text.
+    private func isFailure(_ line: String) -> Bool {
+        let l = line.lowercased()
+        return ["fail", "refus", "could not", "couldn't", "cannot", "can't", "denied", "not permitted", "skipp", "error", "in use", "protected"]
+            .contains { l.contains($0) }
+    }
+
+    /// Failures first, then the remaining notes in their original order.
+    private func orderedMessages(_ lines: [String]) -> [String] {
+        lines.filter(isFailure) + lines.filter { !isFailure($0) }
+    }
 
     var body: some View {
         let r = summary.result
         VStack(alignment: .leading, spacing: 14) {
             HStack(spacing: 12) {
-                Image(systemName: "checkmark.circle.fill").font(.largeTitle).foregroundStyle(.green)
+                Image(systemName: r.failedCount > 0 ? "exclamationmark.circle.fill" : "checkmark.circle.fill")
+                    .font(.largeTitle).foregroundStyle(r.failedCount > 0 ? Color.orange : Color.green)
                 VStack(alignment: .leading, spacing: 0) {
-                    Text("Freed \(Fmt.bytes(r.freedBytes))").font(.title2.weight(.semibold)).monospacedDigit()
-                    Text("Change in free space on the volume").font(.caption).foregroundStyle(.secondary)
+                    if trash && r.freedBytes <= 0 {
+                        Text("Moved to the Trash").font(.title2.weight(.semibold))
+                        Text("Empty the Trash to free \(Fmt.bytes(summary.expectedBytes))").font(.caption).foregroundStyle(.secondary)
+                    } else {
+                        Text("Freed \(Fmt.bytes(r.freedBytes))").font(.title2.weight(.semibold)).monospacedDigit()
+                        Text("Change in free space on the volume").font(.caption).foregroundStyle(.secondary)
+                    }
                 }
             }
             if r.failedCount > 0 {
-                Label("\(r.failedCount) item\(r.failedCount == 1 ? "" : "s") skipped (in use or protected by macOS)",
+                Label("\(r.failedCount) item\(r.failedCount == 1 ? "" : "s") could not be removed (in use or protected by macOS)",
                       systemImage: "exclamationmark.triangle")
                     .font(.callout).foregroundStyle(.orange)
             }
@@ -156,18 +258,49 @@ struct ResultSheet: View {
                     .font(.callout).foregroundStyle(.secondary)
             }
             if !r.messages.isEmpty {
-                DisclosureGroup("Details (\(r.messages.count))") {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(r.failedCount > 0 ? "What went wrong" : "Details").font(.headline)
                     ScrollView {
-                        Text(r.messages.joined(separator: "\n"))
-                            .font(.caption.monospaced()).textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .leading)
+                        VStack(alignment: .leading, spacing: 6) {
+                            ForEach(Array(orderedMessages(r.messages).enumerated()), id: \.offset) { _, line in
+                                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                                    Image(systemName: isFailure(line) ? "exclamationmark.triangle.fill" : "info.circle")
+                                        .foregroundStyle(isFailure(line) ? Color.orange : Color.secondary)
+                                        .font(.caption)
+                                    Text(line).font(.caption.monospaced()).textSelection(.enabled)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                }
+                                .accessibilityElement(children: .combine)
+                            }
+                        }
+                        .padding(8)
                     }
-                    .frame(maxHeight: 140)
+                    .frame(height: min(190, CGFloat(r.messages.count) * 34 + 20))
+                    .background(.background.secondary, in: RoundedRectangle(cornerRadius: 8))
+                    .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(.quaternary))
                 }
             }
-            HStack { Spacer(); Button("Done", action: onDone).keyboardShortcut(.defaultAction) }
+            HStack {
+                if !r.messages.isEmpty || r.failedCount > 0 {
+                    Button(copied ? "Copied" : "Copy details") { copyDetails() }
+                }
+                Spacer()
+                Button("Done", action: onDone).keyboardShortcut(.defaultAction)
+            }
         }
         .padding(20)
-        .frame(width: 460)
+        .frame(width: 520)
+    }
+
+    private func copyDetails() {
+        let r = summary.result
+        var text = "Mac Cleaner result\n"
+        text += "Mode: \(trash ? "Move to Trash" : "Delete permanently")\n"
+        text += "Freed: \(Fmt.bytes(r.freedBytes))\n"
+        text += "Failed: \(r.failedCount)\n"
+        if !r.messages.isEmpty { text += "\n" + r.messages.joined(separator: "\n") + "\n" }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        copied = true
     }
 }
