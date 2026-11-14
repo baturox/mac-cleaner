@@ -3,7 +3,7 @@ import CleanerCore
 import Observation
 
 enum AppSection: String, CaseIterable, Identifiable, Hashable {
-    case overview, cleanup, projects, repos, explore
+    case overview, cleanup, projects, repos, explore, history
     var id: String { rawValue }
     var title: String {
         switch self {
@@ -12,6 +12,7 @@ enum AppSection: String, CaseIterable, Identifiable, Hashable {
         case .projects: "Projects"
         case .repos: "Repos"
         case .explore: "Explore"
+        case .history: "History"
         }
     }
     var symbol: String {
@@ -21,6 +22,7 @@ enum AppSection: String, CaseIterable, Identifiable, Hashable {
         case .projects: "hammer"
         case .repos: "square.on.square.dashed"
         case .explore: "folder.badge.questionmark"
+        case .history: "clock.arrow.circlepath"
         }
     }
     var shortcutKey: KeyEquivalent {
@@ -30,6 +32,7 @@ enum AppSection: String, CaseIterable, Identifiable, Hashable {
         case .projects: "3"
         case .repos: "4"
         case .explore: "5"
+        case .history: "6"
         }
     }
 }
@@ -151,6 +154,9 @@ final class AppModel {
     let isMock: Bool
     let home: URL
     let explore: ExploreModel
+    let history: HistoryModel
+    /// Totals from the audit log, for the Overview's "Freed so far".
+    var auditStats = AuditStats()
     let notifier = LowSpaceNotifier()
 
     var section: AppSection = .overview
@@ -212,6 +218,7 @@ final class AppModel {
         self.home = home
         self.disk = engine.diskInfo()
         self.explore = ExploreModel(engine: engine, home: home)
+        self.history = HistoryModel(engine: engine)
         if let raw = Prefs.store.string(forKey: Prefs.Key.lastSection), let s = AppSection(rawValue: raw) { section = s }
         startMonitoring()
     }
@@ -220,6 +227,14 @@ final class AppModel {
 
     var isScanning: Bool { isScanningCategories || isScanningProjects || isScanningRepos }
     var isBusy: Bool { sheet != nil }
+    func refreshAuditStats() {
+        let engine = self.engine
+        Task {
+            auditStats = await engine.auditStats(since: nil)
+            await history.reload()
+        }
+    }
+
     var hasAnyScan: Bool { hasScannedCategories || hasScannedProjects || hasScannedRepos }
 
     private func exact(_ c: CleanCategory) -> Int64 { c.sizeIsUpperBound ? 0 : c.sizeBytes }
@@ -246,7 +261,7 @@ final class AppModel {
         case .repos:
             guard hasScannedRepos, extraCopyBytes > 0 else { return nil }
             return Fmt.bytes(extraCopyBytes)
-        case .explore: return nil
+        case .explore, .history: return nil
         }
     }
 
@@ -426,6 +441,7 @@ final class AppModel {
         Task {
             await engine.configure(Prefs.engineSettings)
             recheckFullDiskAccess()
+            refreshAuditStats()
             scanAll()
         }
     }
@@ -720,8 +736,9 @@ final class AppModel {
                 // reached without a symlink and never follows one while deleting.
                 result = await engine.clean(categories: cats, mode: mode, progress: relay.handler)
             case .projects(let urls), .explorer(let urls):
+                let purpose: DeletePurpose = { if case .projects = plan.source { return .projectArtifacts } else { return .explorer } }()
                 let checked = mock ? (urls, []) : await Task.detached { Self.revalidate(urls) }.value
-                result = await engine.delete(urls: checked.0, mode: mode, progress: relay.handler)
+                result = await engine.delete(urls: checked.0, mode: mode, purpose: purpose, progress: relay.handler)
                 result.failedCount += checked.1.count
                 result.messages = checked.1 + result.messages
             case .clones(let unforced, let forced):
@@ -793,6 +810,7 @@ final class AppModel {
             scanRepos()
         }
         refreshDisk()
+        refreshAuditStats()
         sheet = .result(CleanSummary(result: result, expectedBytes: plan.expectedBytes, mode: plan.mode))
     }
 

@@ -14,6 +14,7 @@ struct SettingsView: View {
     @AppStorage(Prefs.Key.lowSpaceGB, store: Prefs.store) private var lowGB = 10
     @AppStorage(Prefs.Key.showMenuBar, store: Prefs.store) private var showMenuBar = true
     @AppStorage(Prefs.Key.notifications, store: Prefs.store) private var notifications = true
+    @AppStorage(Prefs.Key.recordAuditLog, store: Prefs.store) private var recordAudit = true
 
     #if DEBUG
     @State private var tab = Prefs.isMock ? (ProcessInfo.processInfo.environment["MACCLEANER_TAB"] ?? "general") : "general"
@@ -28,7 +29,7 @@ struct SettingsView: View {
 
     /// Changes that make the current scan results out of date.
     private var scanFingerprint: String { "\(protectedRaw)|\(retention)|\(minMB)|\(rootsRaw)" }
-    private var otherFingerprint: String { "\(deleteMode)|\(lowGB)|\(showMenuBar)|\(notifications)|\(idleDays)" }
+    private var otherFingerprint: String { "\(recordAudit)|\(deleteMode)|\(lowGB)|\(showMenuBar)|\(notifications)|\(idleDays)" }
 
     var body: some View {
         TabView(selection: $tab) {
@@ -78,6 +79,13 @@ struct SettingsView: View {
                     Text("Notifications are only available in the packaged app.").font(.callout).foregroundStyle(.secondary)
                 }
             } header: { Text("Low disk space") }
+
+            Section {
+                Toggle("Keep a history of what is deleted", isOn: $recordAudit)
+                Text("Every clean, delete and clone removal is recorded on this Mac (paths, sizes, outcome; never file contents) and shown in History. The file is readable by you only and never leaves this Mac. Paths can be sensitive: clear the history or turn this off if you share the machine. The MCP cleanup tools refuse to run while this is off.")
+                    .font(.callout).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } header: { Text("History") }
         }
         .formStyle(.grouped)
     }

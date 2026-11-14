@@ -42,6 +42,7 @@ enum Prefs {
             Key.repoSort: "size",
             Key.itemSort: "size",
             Key.collapsedGroups: "",
+            Key.recordAuditLog: true,
         ])
         return s
     }()
@@ -65,6 +66,7 @@ enum Prefs {
         static let repoSort = "repoSort"
         static let itemSort = "itemSort"
         static let collapsedGroups = "collapsedGroups"
+        static let recordAuditLog = "recordAuditLog"
     }
 
     // MARK: JSON-encoded string lists (AppStorage cannot hold arrays)
@@ -98,7 +100,8 @@ enum Prefs {
     }
 
     static var engineSettings: EngineSettings {
-        EngineSettings(protectedPaths: protectedPaths, sessionRetentionDays: sessionRetentionDays)
+        EngineSettings(protectedPaths: protectedPaths, sessionRetentionDays: sessionRetentionDays,
+                       recordAuditLog: store.bool(forKey: Key.recordAuditLog))
     }
 
     // MARK: Settings shared with the command line tool
@@ -113,6 +116,7 @@ enum Prefs {
             if s != engineSettings {
                 store.set(encodeList(s.protectedPaths), forKey: Key.protectedPaths)
                 store.set(s.sessionRetentionDays, forKey: Key.sessionRetentionDays)
+                store.set(s.recordAuditLog, forKey: Key.recordAuditLog)
             }
         } else {
             shared.save(engineSettings)

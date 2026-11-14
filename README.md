@@ -26,6 +26,9 @@
     <td><img src="docs/screenshots/repos.png" alt="Repos: every clone and worktree with its backup status"></td>
     <td><img src="docs/screenshots/repos-remove-warning.png" alt="Removing a clone that is not backed up needs an explicit confirmation"></td>
   </tr>
+  <tr>
+    <td colspan="2"><img src="docs/screenshots/history.png" alt="History: every deletion made by the app, the command line or an AI agent, with items and outcomes (mock data)"></td>
+  </tr>
 </table>
 
 Mac Cleaner is a free, open-source macOS app (with a command-line tool) that frees up the disk space developers actually lose: `node_modules` and Rust `target` folders in dozens of projects, duplicate git clones and worktrees left behind by coding agents, Claude Code / Cursor / Codex session data, Hugging Face and Ollama model downloads, npm / pnpm / uv / Homebrew caches, Xcode DerivedData and simulators, Docker images.
@@ -59,6 +62,8 @@ Mac Cleaner knows these places. It shows what each one is, how big it is, whethe
 - **Repos.** Every clone and worktree, grouped by repository, with a "clean & pushed" status, so leftover agent worktrees can be removed without losing work.
 - **Explore.** Drill down by size, like a disk-usage tree.
 - **What grew.** What got bigger since the last scan: the answer to "what filled my disk?".
+- **History.** A local audit log of every deletion (what, how big, by the app, the CLI or an AI agent, and whether it worked), searchable and exportable.
+- **MCP server for AI agents.** `mac-cleaner mcp` lets Claude Code, Cursor, Codex and others inspect disk usage and, only if you opt in, run a tightly limited two-step cleanup.
 - **Menu bar item** with a low-space warning.
 - **Delete permanently or move to the Trash**, and **protected folders** that are never touched.
 - **A CLI** with `--json` output on every read command.
@@ -123,6 +128,7 @@ To grant it: **System Settings > Privacy & Security > Full Disk Access**, add *M
 3. **Projects** lists rebuildable build folders with project idle time. Old, idle, big ones first.
 4. **Repos** lists every clone and worktree by repository, with its status. Remove the ones that are fully backed up: committed, pushed to a network remote, and with no ignored files (such as `.env`) that exist only there. A copy that is not backed up can only be selected after you turn on *Allow removal* for that one copy and type a confirmation phrase.
 5. **Explore** drills into any folder by size.
+6. **History** lists every deletion newest first (when, by which client, what, how much, how many failed), with a search over paths and names, filters by client and date, the items of each operation with *Reveal in Finder* for those that still exist, *Export…* (JSON or CSV) and *Clear history…*. Overview shows *Freed so far* from the same log. See [History and privacy](#history-and-privacy).
 
 Settings hold the protected folders and how old AI session data must be before it is offered (default 30 days). Both are stored in `~/Library/Application Support/MacCleaner/settings.json`, which the command-line tool reads too, so a folder you protect in the app is protected in the CLI. Deleting can be permanent or move items to the Trash.
 
@@ -137,6 +143,8 @@ mac-cleaner [command] [options]
   repos      Every git clone and worktree, grouped, with backup status
   explore    The biggest children of a folder
   growth     Save a snapshot and show what grew since the previous one
+  history    What Mac Cleaner deleted (the local audit log); `history clear` erases it
+  mcp        MCP server on stdio for AI coding agents
   doctor     Explain the disk numbers and report the environment
 ```
 
@@ -228,6 +236,17 @@ mac-cleaner doctor                      # disk numbers, Full Disk Access, protec
 
 `doctor --json` is what we ask for in bug reports. It contains numbers, tool locations and your protected-folder list (remove that from the paste if the paths are private), but no other file names. The tool locations are the ones Mac Cleaner itself would run (see *Safety model*), which can differ from your shell's `PATH`.
 
+### History
+
+```sh
+mac-cleaner history                                  # the newest 20 operations
+mac-cleaner history --since 7d --client mcp --items  # what AI agents removed this week, item by item
+mac-cleaner history --json                           # full records (paths included)
+mac-cleaner history clear                            # erase the history (asks first; -y to skip)
+```
+
+`--since` takes a date (`2025-01-31`) or an age (`24h`, `7d`, `2w`); `--client` is `app`, `cli` or `mcp`; `--limit N` caps the rows. Terminal output has control characters in names replaced, like every other command.
+
 ### JSON output
 
 Every read command takes `--json` and prints **only** JSON on stdout (progress and messages go to stderr). `--json` never deletes: with `clean`, `projects` and `repos` it implies `--dry-run`.
@@ -250,6 +269,98 @@ All documents carry `"schemaVersion": 1`; fields are only ever added within a sc
 | `doctor` | `cliVersion`, `macOSVersion`, `architecture`, `disk`, `fullDiskAccess`, `tools[]`, `apfsVolumes[]`, `apfsContainerFreeBytes`, `localSnapshots[]`, `swapBytes`, `settings` (file, status, protectedPaths, extraProtectedPaths, builtInProtectedPaths, sessionRetentionDays) |
 
 `disk` is `{totalBytes, usedBytes, freeBytes, availableWithPurgeableBytes, purgeableBytes}`.
+
+## History and privacy
+
+Every clean, delete and clone removal made through the engine (the app, the CLI and the MCP server alike) is recorded in `~/Library/Application Support/MacCleaner/audit.jsonl`: one JSON line per operation with its start and end time, who did it (`app`, `cli`, `mcp`) and the app version, the kind of operation, permanent or Trash, free space before and after, and for every item its path, name, category or build-folder kind, size, what was done (deleted, moved to the Trash, or the command that ran) and the outcome (`ok`, `failed`, `refused` with the reason). For clones it also records the remote, the branch, whether the copy was fully backed up and whether it was forced. A huge clean is capped at 5,000 listed items plus a count and size of the rest.
+
+- **Paths are sensitive.** They can reveal project names, client names and what you work on. The file is created readable by you only (mode 0600, in a 0700 folder), it never leaves your Mac (this project contains no network code), and file *contents* are never recorded. If you share the machine, or export the history to send it somewhere, look at it first.
+- **You are in control.** *Clear history…* in the app and `mac-cleaner history clear` erase it (with confirmation). *Settings > General > Keep a history of what is deleted* turns recording off (default on); the setting lives in the shared settings file, so the CLI and the MCP server obey it too.
+- **The log cannot be deleted by the tool itself.** `~/Library/Application Support/MacCleaner` is on the built-in protected list.
+- **Robust and concurrent.** Records are appended under an advisory lock with one `write` per line and an `fsync`, so the app, the CLI and the MCP server can write at the same time; the log rotates at about 10 MB (`audit.jsonl` and `audit.1.jsonl`); a truncated or corrupt line is skipped (and counted) when reading. A failure to write the log never undoes a deletion; it is reported with the result.
+- **Size of a record.** For deletions through `delete`, sizes are measured right before the removal (a clean uses the sizes from its scan). Items moved to the Trash are recorded as such; they free no space until the Trash is emptied.
+
+## Use it from your AI agent (MCP)
+
+`mac-cleaner mcp` starts a [Model Context Protocol](https://modelcontextprotocol.io) server on stdio, so coding agents can answer "where did my disk go?" themselves and, if you allow it, do a very limited cleanup. It is part of the same binary as the CLI (`mac-cleaner`), needs nothing else and makes no network connections. It speaks MCP revision **2026-07-28** and, for clients that still use the `initialize` handshake, 2025-11-25, 2025-06-18, 2025-03-26 and 2024-11-05.
+
+### Set it up
+
+Install the CLI first (see [Install the command-line tool](#install-the-command-line-tool)); the examples assume `mac-cleaner` is on your `PATH`, otherwise use its full path.
+
+**Claude Code** (add `--scope user` before the `--` to make it available in every project):
+
+```sh
+claude mcp add mac-cleaner -- mac-cleaner mcp
+claude mcp get mac-cleaner        # check that it was added
+```
+
+**Cursor**: add this to `~/.cursor/mcp.json` (or `.cursor/mcp.json` in a project):
+
+```json
+{
+  "mcpServers": {
+    "mac-cleaner": { "command": "mac-cleaner", "args": ["mcp"] }
+  }
+}
+```
+
+**Any other client** (Codex, Claude Desktop, Windsurf, ...): the generic `mcpServers` block above works; the command is `mac-cleaner` and the arguments are `["mcp"]`. Check your client's documentation for where it keeps that file.
+
+By default the server is **read-only**. To let the agent plan and apply a limited cleanup, *you* add `--allow-clean` (the agent cannot do this itself):
+
+```sh
+claude mcp add mac-cleaner -- mac-cleaner mcp --allow-clean --min-idle-days 30 --max-plan-gb 5
+```
+
+| Flag | Meaning |
+| --- | --- |
+| `--allow-clean` | Offer `plan_cleanup` and `apply_cleanup`. Without it those tools do not exist. |
+| `--trash` | Move items to the Trash instead of deleting them permanently. |
+| `--min-idle-days N` | Build folders of projects idle fewer than N days are never planned (default 14, minimum 1). |
+| `--max-plan-gb N` | Largest single plan (default 10). |
+| `--max-session-gb N` | Most one server process may remove in total (default 30). |
+| `--protect <path>` | Global option: also protect this folder (the app's protected folders always apply). |
+
+### Tools
+
+| Tool | What it does | Annotations |
+| --- | --- | --- |
+| `disk_status` | Total, used, free and purgeable space; Full Disk Access | read-only, idempotent |
+| `scan_cleanup` | Cleanup categories with id, group, safety level, size, item count (optional `group`) | read-only, idempotent |
+| `list_category_items` | Items of one category, paged | read-only, idempotent |
+| `scan_projects` | Rebuildable build folders (root, min size, min idle days, kinds), paged | read-only, idempotent |
+| `scan_repos` | Git clones and worktrees with backup status, untrusted-config and ignored-file signals, paged | read-only, idempotent |
+| `explore_folder` | Biggest children of a folder, inside your home and temp folders only; protected locations are refused and hidden | read-only, idempotent |
+| `growth_report` | Takes a size snapshot (the only thing it writes, in Mac Cleaner's own history file) and reports what grew | not read-only, not destructive |
+| `audit_history` | What was deleted, by whom, paged | read-only, idempotent |
+| `plan_cleanup` | *Only with `--allow-clean`.* Builds a plan and returns a `plan_id`; deletes nothing | read-only |
+| `apply_cleanup` | *Only with `--allow-clean`.* Executes exactly one stored plan, once | **destructive**, not idempotent |
+
+Every result is structured JSON plus a one-line text summary, and every list is bounded (page with `limit` and `offset`).
+
+### The security model, in plain words
+
+The caller is a language model, and the names of files and folders on your disk are text an attacker may have written (an unpacked archive, a cloned repository, a downloaded file). So:
+
+1. **Off by default.** Without `--allow-clean` no deleting tool is listed or callable, and the server's instructions say so and tell the *user* how to enable it. A corrupt settings file, or the audit log being turned off, also disables them.
+2. **Two steps, and no paths.** `plan_cleanup` builds a plan on the server from Mac Cleaner's own scan results and returns a `plan_id` with the exact categories, items and total size. `apply_cleanup` takes only that `plan_id` and `confirm: true`. There is no tool that accepts a path to delete. A plan is immutable, expires after 10 minutes and works once. Both tools tell the model to show the plan to you and get your approval first.
+3. **Only rebuildable things can be in a plan.** Categories marked *safe* whose items are plain files (or the fixed cache-prune commands), and build folders (`node_modules`, `target`, ...) of projects idle at least N days. Never *caution* categories, never Time Machine snapshots, clones, worktrees, the Trash, explorer paths, or anything forced. The build folders are re-scanned right before deleting and anything that changed (gone, a different kind, the project was touched since) is skipped and reported.
+4. **Limits.** A size ceiling per plan and per session, and at most 3 applies per 10 minutes. Permanent by default, `--trash` for the Trash.
+5. **Everything is on the record.** Each apply is written to the audit log with client `mcp` and the plan id (`mac-cleaner history --client mcp --items`).
+6. **File-system text is inert data.** Names, paths, branches and tool messages are stripped of control and direction-override characters and length-capped before they are returned, always as quoted JSON string values, and the server instructions and tool descriptions say they are untrusted data and not instructions.
+7. **Same protections as the CLI.** Protected folders and retention from the shared settings are re-read on every call; the engine's own deletion rules (home and temp areas only, no symlinks, no protected paths) apply to every deletion. `explore_folder` refuses `~/.ssh`, keychains and your protected folders.
+
+What this cannot do: it cannot stop you from approving a bad plan, and an attacker who can already run code as you does not need this server (see [SECURITY.md](SECURITY.md)).
+
+### Example prompts
+
+- "How much free space do I have, and what are the five biggest things I could reclaim?"
+- "Which `node_modules` and `target` folders belong to projects idle for more than 60 days? List them by size."
+- "Do I have duplicate clones of any repository? Which ones are fully backed up?"
+- "What grew the most since the last time I checked?"
+- "What did you delete in the last week?" (uses `audit_history`)
+- With `--allow-clean`: "Plan a cleanup of safe caches and build folders of projects idle for 30+ days, show me the plan, and apply it only after I say yes."
 
 ## What it cleans
 
@@ -291,6 +402,8 @@ Mac Cleaner deletes files. These are the rules it follows, and the reasons you c
 - **Docker means the Docker on this Mac.** Docker categories appear only when the selected Docker endpoint is a local socket, the category shows that endpoint, and every prune command names it explicitly.
 - **Everything is listed and confirmed first.** You see what will be removed and how big it is before anything is deleted, including the total number of files and folders behind the rows shown. `-n/--dry-run` shows the plan and does nothing. Right before deleting, anything that changed type since the scan (a folder that became a link or a file) is skipped and reported.
 - **Recent AI sessions are kept.** Session data newer than the retention period (default 30 days) is never offered.
+- **A local audit log.** Every deletion is recorded (paths, sizes, outcomes, who asked) in a file only you can read, so you can always see what happened; see [History and privacy](#history-and-privacy).
+- **AI agents get less than you do.** The MCP server is read-only unless you start it with `--allow-clean`, and even then an agent can only plan and apply a cleanup of safe categories and idle projects' build folders, in two steps, with limits, and never choose a path; see [Use it from your AI agent](#use-it-from-your-ai-agent-mcp).
 - **No network access, no telemetry.** Mac Cleaner makes no network connections and sends nothing anywhere. It runs local tools (`du`, `git`, `docker`, `ollama`, `tmutil`, `diskutil`) for what it reports.
 
 What this does **not** protect against is listed under "Known limitations" in [SECURITY.md](SECURITY.md): above all, another program already running as you can do anything Mac Cleaner can.
