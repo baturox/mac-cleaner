@@ -2,12 +2,36 @@
 import Foundation
 
 public struct LiveEngine: CleanerEngine {
-    public init() {}
+    let env: EngineEnvironment
+    let settingsBox: SettingsBox
+
+    public init() { self.init(env: .live) }
+
+    init(env: EngineEnvironment, settings: SettingsBox = SettingsBox()) {
+        self.env = env
+        self.settingsBox = settings
+    }
+
+    // MARK: Settings & context
+
+    public func configure(_ settings: EngineSettings) async {
+        settingsBox.settings = settings
+    }
+
+    func context(progress: @escaping ProgressHandler = { _ in }) -> ScanContext {
+        let s = settingsBox.settings
+        return ScanContext(env: env, settings: s, guardian: PathGuard(env: env, settings: s), progress: progress)
+    }
+
+    var deleter: Deleter {
+        let s = settingsBox.settings
+        return Deleter(env: env, guardian: PathGuard(env: env, settings: s))
+    }
 
     // MARK: Disk info
 
     public func diskInfo() -> DiskInfo {
-        let url = URL(fileURLWithPath: NSHomeDirectory())
+        let url = URL(fileURLWithPath: env.home)
         let keys: Set<URLResourceKey> = [.volumeTotalCapacityKey, .volumeAvailableCapacityKey,
                                          .volumeAvailableCapacityForImportantUsageKey]
         guard let v = try? url.resourceValues(forKeys: keys) else {
@@ -20,169 +44,48 @@ public struct LiveEngine: CleanerEngine {
                         availableWithPurgeableBytes: important < free ? free : important)
     }
 
+    // MARK: Full Disk Access
+
+    /// Reading the TCC database or Safari's folder is refused (EPERM/EACCES) without Full Disk Access.
+    public func hasFullDiskAccess() -> Bool {
+        let probes = [env.home + "/Library/Application Support/com.apple.TCC/TCC.db", env.home + "/Library/Safari"]
+        var sawDenial = false
+        for p in probes {
+            let fd = open(p, O_RDONLY)
+            if fd >= 0 { close(fd); return true }
+            if errno == EPERM || errno == EACCES { sawDenial = true }
+        }
+        return !sawDenial
+    }
+
     // MARK: Categories
 
     public func scanCategories(progress: @escaping ProgressHandler) async -> [CleanCategory] {
-        let found = await boundedMap(categoryDefs, limit: 8) { def in
-            await Self.measure(def, progress: progress)
-        }.compactMap { $0 }
+        let ctx = context(progress: progress)
+        let defs = makeCategoryDefs(env: env)
+        typealias Scanner = @Sendable (ScanContext) async -> [CleanCategory]
+        var scanners: [Scanner] = defs.map { def in { ctx in await GenericScanner.measure(def, ctx: ctx).map { [$0] } ?? [] } }
+        scanners += [
+            { await ClaudeScanner.scan($0) }, { await IDEScanner.scan($0) }, { await BrowserDownloadsScanner.scan($0) },
+            { await ModelsScanner.scan($0) }, { await ToolchainScanner.scan($0) }, { await XcodeScanner.scan($0) },
+            { await ContainerScanner.scan($0) }, { await PersonalScanner.scan($0) },
+        ]
+        let found = await withTaskGroup(of: [CleanCategory].self) { group -> [CleanCategory] in
+            var pending = scanners.makeIterator()
+            var running = 0
+            var all: [CleanCategory] = []
+            while running < 10, let s = pending.next() { group.addTask { await s(ctx) }; running += 1 }
+            while let batch = await group.next() {
+                all += batch
+                if let s = pending.next() { group.addTask { await s(ctx) } }
+            }
+            return all
+        }
+        if Task.isCancelled { return [] }
         return found.sorted {
             if $0.sizeIsUpperBound != $1.sizeIsUpperBound { return !$0.sizeIsUpperBound }
             return $0.sizeBytes > $1.sizeBytes
         }
-    }
-
-    private static func snapshotDates() async -> [String] {
-        let r = await runCommand(["tmutil", "listlocalsnapshotdates", "/"])
-        return r.stdout.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { $0.first?.isNumber == true && $0.count > 1 && $0.dropFirst().first?.isNumber == true }
-    }
-
-    private static func isAvailable(_ def: CatDef) async -> Bool {
-        if def.id == "snapshots" {
-            guard ToolPaths.which("tmutil") != nil else { return false }
-            return !(await snapshotDates()).isEmpty
-        }
-        if !def.needs.isEmpty && ToolPaths.which(def.needs) == nil { return false }
-        if def.id == "docker" { return (await runCommand(["docker", "info"], timeout: 8)).ok }
-        return true
-    }
-
-    private static func itemPaths(of def: CatDef) -> [String] {
-        let cutoff = Date().timeIntervalSince1970 - Double(def.minAgeDays) * 86400
-        var seen = Set<String>(), out: [String] = []
-        for g in def.globs {
-            for p in expandPattern(g) {
-                if def.exclude.contains((p as NSString).lastPathComponent) { continue }
-                if def.minAgeDays > 0 {
-                    var st = stat()
-                    guard lstat(p, &st) == 0 else { continue }
-                    if Double(st.st_mtimespec.tv_sec) > cutoff { continue }
-                }
-                if seen.insert(p).inserted { out.append(p) }
-            }
-        }
-        return out
-    }
-
-    private static func measure(_ def: CatDef, progress: ProgressHandler) async -> CleanCategory? {
-        if Task.isCancelled { return nil }
-        guard await isAvailable(def) else { return nil }
-        progress("Measuring \(def.name)…")
-        let commands = def.cmds
-        func make(items: [CleanItem], size: Int64, upper: Bool) -> CleanCategory {
-            CleanCategory(id: def.id, name: def.name, detail: def.detail, level: def.level, symbol: def.symbol,
-                          items: items, commands: commands, sizeBytes: size, sizeIsUpperBound: upper)
-        }
-        let oneMB: Int64 = 1 << 20
-
-        if !def.globs.isEmpty {
-            let paths = await onBackground { itemPaths(of: def) }
-            if paths.isEmpty && commands.isEmpty { return nil }
-            let sizes = await duSizes(paths)
-            let items = paths.map { CleanItem(url: URL(fileURLWithPath: $0), sizeBytes: sizes[$0] ?? 0) }
-                .sorted { $0.sizeBytes > $1.sizeBytes }
-            let total = items.reduce(Int64(0)) { $0 + $1.sizeBytes }
-            if total < oneMB && commands.isEmpty { return nil }
-            return make(items: items, size: total, upper: false)
-        }
-
-        if def.measure.isEmpty { return make(items: [], size: 0, upper: true) }   // brew, snapshots, simulators
-        let shown = await onBackground { def.measure.flatMap { expandPattern($0) } }
-        let total = shown.isEmpty ? 0 : (await duSizes(shown)).values.reduce(0, +)
-        if total < oneMB && commands.isEmpty { return nil }
-        return make(items: [], size: total, upper: true)
-    }
-
-    // MARK: Projects
-
-    private static let always: Set<String> = ["node_modules"]
-    private static let withSibling: [String: [String]] = [
-        ".next": ["package.json"], ".nuxt": ["package.json"], ".turbo": ["package.json"],
-        ".svelte-kit": ["package.json"], ".parcel-cache": ["package.json"], ".expo": ["package.json"],
-        "target": ["Cargo.toml"], "Pods": ["Podfile"],
-        "build": ["build.gradle", "build.gradle.kts", "pubspec.yaml"],
-        ".gradle": ["build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts"],
-        ".dart_tool": ["pubspec.yaml"],
-    ]
-    private static let venvs: Set<String> = [".venv", "venv", "env"]
-    private static let skipTop: Set<String> = ["Library", "Applications", "Pictures", "Music", "Movies", "Public"]
-
-    private static func isArtifact(parent: String, name: String, siblings: Set<String>) -> Bool {
-        if always.contains(name) { return true }
-        if let needs = withSibling[name] { return needs.contains { siblings.contains($0) } }
-        if venvs.contains(name) {
-            var isDir: ObjCBool = false
-            return FileManager.default.fileExists(atPath: parent + "/" + name + "/pyvenv.cfg", isDirectory: &isDir) && !isDir.boolValue
-        }
-        return false
-    }
-
-    private static func lastTouched(project: String, artifacts: Set<String>) -> TimeInterval {
-        guard let entries = readDir(project) else { return 0 }
-        var paths = entries.map(\.name).filter { !artifacts.contains($0) }.map { project + "/" + $0 }
-        paths += [".git/index", ".git/HEAD", ".git/logs/HEAD"].map { project + "/" + $0 }
-        if let src = readDir(project + "/src") { paths += src.prefix(200).map { project + "/src/" + $0.name } }
-        var newest: TimeInterval = 0
-        for p in paths {
-            var st = stat()
-            if lstat(p, &st) == 0 {
-                newest = max(newest, TimeInterval(st.st_mtimespec.tv_sec) + TimeInterval(st.st_mtimespec.tv_nsec) / 1e9)
-            }
-        }
-        return newest
-    }
-
-    private static func findProjects(root: String, flag: CancelFlag, progress: ProgressHandler) -> [(project: String, matched: Set<String>)] {
-        var hits: [(String, Set<String>)] = []
-        var stack = [root]
-        while let dir = stack.popLast() {
-            if flag.isSet { break }
-            if dir == root || (dir as NSString).deletingLastPathComponent == root {
-                progress("Searching \((dir as NSString).lastPathComponent)…")
-            }
-            guard let entries = readDir(dir) else { continue }
-            let names = Set(entries.map(\.name))
-            var matched = Set<String>()
-            var descend: [String] = []
-            for e in entries where e.isDir {
-                if isArtifact(parent: dir, name: e.name, siblings: names) { matched.insert(e.name); continue }
-                if e.name.hasPrefix(".") { continue }
-                if dir == Roots.home && skipTop.contains(e.name) { continue }
-                descend.append(dir + "/" + e.name)
-            }
-            if !matched.isEmpty { hits.append((dir, matched)) }
-            stack += descend
-        }
-        return hits
-    }
-
-    public func scanProjects(root: URL, minBytes: Int64, progress: @escaping ProgressHandler) async -> [ProjectArtifact] {
-        let rootPath = realPath(root.path) ?? root.path
-        let flag = CancelFlag()
-        let hits = await withTaskCancellationHandler {
-            await onBackground { Self.findProjects(root: rootPath, flag: flag, progress: progress) }
-        } onCancel: { flag.set() }
-        if Task.isCancelled { return [] }
-
-        let now = Date().timeIntervalSince1970
-        var candidates: [(path: String, kind: String, project: String, idle: Int)] = []
-        for (project, matched) in hits {
-            let touched = await onBackground { Self.lastTouched(project: project, artifacts: matched) }
-            let idle = max(0, Int((now - touched) / 86400))
-            for m in matched.sorted() { candidates.append((project + "/" + m, m, project, idle)) }
-        }
-        progress("Measuring \(candidates.count) build folders…")
-        let sized = await boundedMap(candidates, limit: 8) { c -> (Int64) in
-            (await duSizes([c.path]))[c.path] ?? 0
-        }
-        var out: [ProjectArtifact] = []
-        for (c, size) in zip(candidates, sized) where size >= minBytes {
-            out.append(ProjectArtifact(url: URL(fileURLWithPath: c.path, isDirectory: true), kind: c.kind,
-                                       projectURL: URL(fileURLWithPath: c.project, isDirectory: true),
-                                       sizeBytes: size, idleDays: c.idle))
-        }
-        return out.sorted { $0.sizeBytes > $1.sizeBytes }
     }
 
     // MARK: Folder listing
@@ -214,36 +117,46 @@ public struct LiveEngine: CleanerEngine {
     // MARK: Cleaning / deleting
 
     public func clean(categories: [CleanCategory], progress: @escaping ProgressHandler) async -> CleanResult {
+        await clean(categories: categories, mode: .permanent, progress: progress)
+    }
+
+    public func clean(categories: [CleanCategory], mode: DeleteMode, progress: @escaping ProgressHandler) async -> CleanResult {
         let before = diskInfo().freeBytes
+        let deleter = self.deleter
         var failed = 0
         var messages: [String] = []
         for cat in categories {
+            if Task.isCancelled { break }
             progress("Cleaning \(cat.name)…")
-            if !cat.items.isEmpty {
-                let paths = cat.items.map { $0.url.path }
-                let r = await onBackground { Deleter.remove(paths) }
+            let pathItems = cat.items.filter { $0.deleteCommand == nil }
+            if !pathItems.isEmpty {
+                let paths = pathItems.map { $0.url.path }
+                let r = await onBackground { deleter.remove(paths, mode: mode) }
                 failed += r.failed
                 messages += r.messages
             }
-            if cat.id == "snapshots" {
-                for date in await Self.snapshotDates() {
-                    progress("Deleting snapshot \(date)…")
-                    let r = await runCommand(["tmutil", "deletelocalsnapshots", date])
-                    if !r.ok {
-                        messages.append("Could not delete snapshot \(date) — try: sudo tmutil deletelocalsnapshots \(date)")
-                    }
+            for item in cat.items {
+                guard let cmd = item.deleteCommand else { continue }
+                progress("Removing \(item.displayName)…")
+                let r = await runAllowed(cmd, timeout: 600)
+                if !r.ok {
+                    failed += 1
+                    messages.append("\(item.displayName): \(Self.failureText(cmd, r))")
                 }
+            }
+            if cat.id == "snapshots" {
+                let r = await GenericScanner.snapshotCleanup(progress: progress)
+                failed += r.failed
+                messages += r.messages
             }
             for cmd in cat.commands {
                 progress("Running \(cmd.joined(separator: " "))…")
-                let r = await runCommand(cmd, timeout: 1800)
-                let text = cmd.joined(separator: " ")
-                if !r.launched {
-                    messages.append("\(text): \(cmd.first ?? "tool") not found")
-                } else if r.timedOut {
-                    messages.append("\(text): timed out")
+                let r = await runAllowed(cmd, timeout: 1800)
+                if r.ok {
+                    messages.append("\(cmd.joined(separator: " ")): \(String(r.lastLine.prefix(100)))")
                 } else {
-                    messages.append("\(text): \(String(r.lastLine.prefix(100)))")
+                    failed += 1
+                    messages.append("\(cmd.joined(separator: " ")): \(Self.failureText(cmd, r))")
                 }
             }
         }
@@ -251,14 +164,37 @@ public struct LiveEngine: CleanerEngine {
     }
 
     public func delete(urls: [URL], progress: @escaping ProgressHandler) async -> CleanResult {
+        await delete(urls: urls, mode: .permanent, progress: progress)
+    }
+
+    public func delete(urls: [URL], mode: DeleteMode, progress: @escaping ProgressHandler) async -> CleanResult {
         let before = diskInfo().freeBytes
         progress("Deleting \(urls.count) \(urls.count == 1 ? "item" : "items")…")
         let paths = urls.map { $0.path }
-        let r = await onBackground { Deleter.remove(paths) }
+        let deleter = self.deleter
+        let r = await onBackground { deleter.remove(paths, mode: mode) }
         return await finish(before: before, failed: r.failed, messages: r.messages)
     }
 
-    private func finish(before: Int64, failed: Int, messages: [String]) async -> CleanResult {
+    /// Runs a command only if the allowlist accepts it (see `CommandPolicy`).
+    func runAllowed(_ argv: [String], timeout: TimeInterval) async -> ProcResult {
+        guard CommandPolicy.isAllowed(argv) else {
+            return ProcResult(status: 126, stdout: "", stderr: "refused: command is not on the allowlist", timedOut: false, launched: false)
+        }
+        return await runCommand(argv, timeout: timeout)
+    }
+
+    private static func failureText(_ cmd: [String], _ r: ProcResult) -> String {
+        if !r.launched {
+            return r.status == 126 ? "refused (command is not allowed)" : "\(cmd.first ?? "tool") not found"
+        }
+        if r.timedOut { return "timed out" }
+        let tail = (r.stdout + "\n" + r.stderr).split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }.suffix(2).joined(separator: " ")
+        return "failed (exit \(r.status))" + (tail.isEmpty ? "" : ": " + String(tail.prefix(200)))
+    }
+
+    func finish(before: Int64, failed: Int, messages: [String]) async -> CleanResult {
         try? await Task.sleep(nanoseconds: 1_000_000_000)
         let after = diskInfo().freeBytes
         return CleanResult(freedBytes: max(after - before, 0), failedCount: failed, messages: messages)
