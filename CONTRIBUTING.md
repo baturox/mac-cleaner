@@ -12,7 +12,7 @@ should be added (including for argument parsing).
 swift build                    # engine, app and CLI
 swift test                     # all tests
 swift build --product mac-cleaner && .build/debug/mac-cleaner scan   # try the CLI
-MACCLEANER_MOCK=1 swift run MacCleaner                               # app with fake data
+MACCLEANER_MOCK=1 swift run MacCleaner                               # app with fake data (debug builds only)
 scripts/build-app.sh --open    # release app bundle in dist/
 ```
 
@@ -34,9 +34,10 @@ VERSION                the single source of the version (also keep Sources/CLI/V
 ### The contract file
 
 `Sources/CleanerCore/Models.swift` defines the types and the `CleanerEngine` protocol that the engine, the
-app and the CLI share. Changing it affects all three, so change it deliberately, in its own pull request,
-with defaults for new protocol methods so older conformers keep compiling. The JSON the CLI prints uses
-these Codable types; renaming a field is a breaking change to that output.
+app and the CLI share. Changing it affects all three (and the mock engine), so change it deliberately, update
+every user of it in the same pull request, and give new protocol methods and initializer parameters defaults
+so older conformers keep compiling. The JSON the CLI prints uses these Codable types; renaming a field is a
+breaking change to that output.
 
 ## How to add a cleanup category safely
 
@@ -58,9 +59,32 @@ A category is a named group of paths (or commands) that the user can reclaim. Ru
    retention. Do not work around them.
 8. **Hermetic tests.** Build a fake home in a temporary directory, point the category at it, and assert on
    what is found and what is removed. Tests must never read or write outside their temporary folder or
-   depend on tools installed on the machine.
+   depend on tools installed on the machine. A test never starts a real third-party program: fixtures
+   have no tools installed unless the test injects a `FakeTools` box (see `Tests/CleanerCoreTests/TestSupport.swift`).
+9. **Locations come from the tool's defaults, not from the environment.** If a tool lets an environment
+   variable move its cache, add an entry to `OverrideScanner` (`Overrides.swift`) that says what the folder
+   must contain and which entries may become items. Such items are always `caution`.
+10. **Commands are exact shapes.** A new cleanup command needs its complete argv added to `CommandPolicy`
+    (`Safety.swift`), with a strict pattern for any variable argument, and a test with shapes that must be
+    refused. Anything read from disk (a name, an identifier) must match that pattern before it is used.
 
 If you are unsure, open a "New cleanup target" issue first.
+
+## Rules for engine code that touches the file system or runs programs
+
+These exist because the app usually has Full Disk Access and deletes irreversibly. See SECURITY.md.
+
+- **Deleting** goes through `Deleter` only. Never `FileManager.removeItem`, never a path-based walk.
+- **Listing things to delete** goes through `env.expandPattern` / `SafeGlob`, which refuse symlinked
+  folders and, in shared temp areas, anything the user does not own.
+- **git** is run only through `Git.open` (the configuration audit) followed by `Git.run`. There is no other
+  way to obtain the `GitRepo` value `Git.run` needs; do not add one. New read-only git commands must pass
+  `--ignore-submodules=all` where git would otherwise enter a submodule.
+- **Other programs** are run through `env.run([...])`, which resolves the tool with the ownership checks and
+  gives it the constructed environment. Do not read `ProcessInfo.processInfo.environment` to build a child
+  environment, and do not add a variable to it without a reason written next to it.
+- The mock engine and every `MACCLEANER_*` hook are inside `#if DEBUG`. Keep it that way: an environment
+  variable must not change what a release build does.
 
 ## CLI changes
 
