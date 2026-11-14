@@ -63,20 +63,9 @@ func resolvePath(_ raw: String, home: URL) -> URL {
     return URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(raw)
 }
 
-/// Display width of a string, ignoring ANSI escape sequences.
+/// Display width of a string, ignoring the CLI's own style marks.
 func visibleWidth(_ s: String) -> Int {
-    var n = 0
-    var inEscape = false
-    for ch in s {
-        if inEscape {
-            if ch.isLetter { inEscape = false }
-        } else if ch == "\u{1B}" {
-            inEscape = true
-        } else {
-            n += 1
-        }
-    }
-    return n
+    TerminalText.plain(s).count
 }
 
 func truncate(_ s: String, to width: Int) -> String {

@@ -9,7 +9,7 @@ signal(SIGPIPE, SIG_IGN)
 let console = StandardConsole()
 let rootTask = Task {
     let code = await runCLI(arguments: Array(CommandLine.arguments.dropFirst()),
-                            engine: LiveEngine(), console: console)
+                            engine: LiveEngine(), console: console, settingsStore: .standard)
     exit(code)
 }
 

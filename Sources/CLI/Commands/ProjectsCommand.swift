@@ -19,6 +19,7 @@ enum ProjectsCommand {
             throw UsageError("refusing to delete without confirmation because stdin is not a terminal; add -y (or -n to list only)",
                              command: "projects")
         }
+        if !listOnly { try ctx.requireUsableSettings() }
         var isDir: ObjCBool = false
         guard FileManager.default.fileExists(atPath: root.path, isDirectory: &isDir), isDir.boolValue else {
             throw RuntimeFailure("\(abbreviateHome(root.path, home: ctx.home)) is not a folder")

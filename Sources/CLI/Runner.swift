@@ -16,11 +16,18 @@ func runCLI(arguments: [String],
             console: Console,
             environment: [String: String] = ProcessInfo.processInfo.environment,
             home: URL = URL(fileURLWithPath: NSHomeDirectory()),
-            probe: any SystemProbe = LiveProbe()) async -> Int32 {
+            probe: any SystemProbe = LiveProbe(),
+            settingsStore: SettingsStore? = nil) async -> Int32 {
     var rest = arguments
     var json = false
     var noColor = false
     var wantsHelp = false
+    var protect: [String] = []
+
+    /// Help text is several lines; the console prints (and sanitizes) one line per call.
+    func printLines(_ text: String) {
+        for line in text.split(separator: "\n", omittingEmptySubsequences: false) { console.out(String(line)) }
+    }
 
     func style(_ noColorFlag: Bool) -> Style {
         let allowed = console.stdoutIsTTY && !noColorFlag && !json
@@ -37,6 +44,12 @@ func runCLI(arguments: [String],
                 console.out("mac-cleaner \(cliVersion)")
                 return ExitCode.ok
             case "-h", "--help": wantsHelp = true
+            case "--protect":
+                guard rest.count >= 2 else { throw UsageError("option '--protect' needs a value (PATH)") }
+                protect.append(rest[1])
+                rest.removeFirst()
+            case _ where first.hasPrefix("--protect="):
+                protect.append(String(first.dropFirst("--protect=".count)))
             default:
                 throw UsageError("unknown option '\(first)'" + (first.hasPrefix("--") ? " (see --help)" : " (see --help)"))
             }
@@ -50,9 +63,9 @@ func runCLI(arguments: [String],
         if name == "help" {
             if let target = rest.first {
                 guard let spec = Commands.named(target) else { throw unknownCommand(target) }
-                console.out(Help.command(spec))
+                printLines(Help.command(spec))
             } else {
-                console.out(Help.general())
+                printLines(Help.general())
             }
             return ExitCode.ok
         }
@@ -62,20 +75,46 @@ func runCLI(arguments: [String],
         }
         guard let spec = Commands.named(name) else { throw unknownCommand(name) }
         if wantsHelp {
-            console.out(Help.command(spec))
+            printLines(Help.command(spec))
             return ExitCode.ok
         }
 
         let parsed = try ArgumentParser.parse(rest, spec: spec)
         if parsed.flag("help") {
-            console.out(Help.command(spec))
+            printLines(Help.command(spec))
             return ExitCode.ok
         }
         json = json || parsed.flag("json")
         noColor = noColor || parsed.flag("no-color")
+        protect += parsed.list("protect")
 
-        let ctx = Context(engine: engine, console: console, style: style(noColor), json: json,
+        // The same protected folders and retention the app uses, plus --protect for this run.
+        let loaded = settingsStore?.load() ?? .missing
+        var settings = loaded.settings
+        var extra: [String] = []
+        for raw in protect {
+            let trimmed = raw.trimmingCharacters(in: .whitespaces)
+            guard !trimmed.isEmpty else { throw UsageError("option '--protect' needs a folder path", command: name) }
+            extra.append(resolvePath(trimmed, home: home).standardizedFileURL.path)
+        }
+        settings.protectedPaths += extra
+        await engine.configure(settings)
+
+        var ctx = Context(engine: engine, console: console, style: style(noColor), json: json,
                           home: home, environment: environment, probe: probe)
+        ctx.settings = settings
+        ctx.extraProtected = extra
+        ctx.settingsFile = settingsStore.map { abbreviateHome($0.fileURL.path, home: home) }
+        ctx.settingsProblem = loaded.problem
+        switch loaded {
+        case .missing: ctx.settingsStatus = "missing"
+        case .loaded: ctx.settingsStatus = "ok"
+        case .corrupt: ctx.settingsStatus = "corrupt"
+        }
+        if let problem = loaded.problem, name != "doctor" {
+            console.err("mac-cleaner: warning: the settings file \(ctx.settingsFile ?? "settings.json") cannot be used (\(problem)); "
+                        + "scanning with default settings. Deleting is disabled until it is fixed (see `mac-cleaner doctor`).")
+        }
         switch name {
         case "scan": return try await ScanCommand.run(parsed, ctx)
         case "clean": return try await CleanCommand.run(parsed, ctx)

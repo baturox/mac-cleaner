@@ -85,6 +85,9 @@ struct RepoCloneReport: Codable {
     /// Contract type `RepoClone`.
     var clone: RepoClone
     var isFullyBackedUp: Bool
+    /// False when git was not run in this working copy because its own git configuration could run programs
+    /// (see `clone.untrustedConfigKeys`); its counts are then unknown and it is never removable.
+    var wasInspected: Bool
     /// Human-readable status, e.g. "clean & pushed" or "3 uncommitted, 1 unpushed".
     var status: String
     /// True when `--remove-clean` would remove this clone.
@@ -121,6 +124,23 @@ struct DoctorReport: Codable {
     var apfsContainerFreeBytes: Int64?
     var localSnapshots: [LocalSnapshot]
     var swapBytes: Int64?
+    var settings: SettingsReport
+}
+
+/// What protects the user's own folders in this run.
+struct SettingsReport: Codable, Equatable {
+    /// The shared settings file (written by the app, read by both).
+    var file: String?
+    /// "ok", "missing" (defaults apply) or "corrupt" (defaults apply and nothing can be deleted).
+    var status: String
+    var problem: String?
+    /// From the settings file.
+    var protectedPaths: [String]
+    /// Added with `--protect` for this run.
+    var extraProtectedPaths: [String]
+    /// Always protected; "~" is the home folder, entries with "*" are patterns.
+    var builtInProtectedPaths: [String]
+    var sessionRetentionDays: Int
 }
 
 struct DetectedTool: Codable, Equatable {
@@ -155,6 +175,7 @@ enum JSONOutput {
 
 extension Context {
     func emit<T: Encodable>(_ value: T) {
-        console.out(JSONOutput.encode(value))
+        // Not sanitized: JSON escapes control characters itself, and the data must stay exact.
+        console.outRaw(JSONOutput.encode(value))
     }
 }

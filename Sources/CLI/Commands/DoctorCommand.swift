@@ -13,7 +13,12 @@ enum DoctorCommand {
             cliVersion: cliVersion, macOSVersion: probe.osVersion(), architecture: probe.architecture(),
             disk: DiskReport(disk), fullDiskAccess: fda, tools: probe.detectedTools(home: ctx.home),
             apfsVolumes: apfs?.volumes ?? [], apfsContainerFreeBytes: apfs?.containerFreeBytes,
-            localSnapshots: snapshots ?? [], swapBytes: probe.swapBytes())
+            localSnapshots: snapshots ?? [], swapBytes: probe.swapBytes(),
+            settings: SettingsReport(file: ctx.settingsFile, status: ctx.settingsStatus, problem: ctx.settingsProblem,
+                                     protectedPaths: ctx.settings.protectedPaths.filter { !ctx.extraProtected.contains($0) },
+                                     extraProtectedPaths: ctx.extraProtected,
+                                     builtInProtectedPaths: ProtectedLocations.builtIn(),
+                                     sessionRetentionDays: ctx.settings.sessionRetentionDays))
         try Task.checkCancellation()
 
         if ctx.json {
@@ -39,6 +44,28 @@ enum DoctorCommand {
             ctx.out("  " + s.yellow("not granted") + s.dim("  - some folders are hidden from this process; sizes may be too small"))
             ctx.out(s.dim("  Grant it to your terminal app: System Settings > Privacy & Security > Full Disk Access."))
         }
+
+        ctx.out()
+        ctx.out(s.bold("Protected folders") + s.dim("  (never listed, measured or deleted; shared with the app)"))
+        let st = report.settings
+        switch st.status {
+        case "ok": ctx.out(s.dim("  Settings file: \(st.file ?? "-")"))
+        case "corrupt":
+            ctx.out("  " + s.red("Settings file \(st.file ?? "-") cannot be used: \(st.problem ?? "unreadable")."))
+            ctx.out(s.yellow("  Defaults are used for scanning and every deleting command refuses to run. Open the app once to"))
+            ctx.out(s.yellow("  rewrite the file, or remove it to go back to the defaults."))
+        default: ctx.out(s.dim("  Settings file: \(st.file ?? "-") (not there yet; defaults apply. The app writes it.)"))
+        }
+        if st.protectedPaths.isEmpty && st.extraProtectedPaths.isEmpty {
+            ctx.out("  Yours: none " + s.dim("(add them in the app's Settings, or with --protect <path> for one run)"))
+        } else {
+            for p in st.protectedPaths { ctx.out("  " + p) }
+            for p in st.extraProtectedPaths { ctx.out("  " + abbreviateHome(p, home: ctx.home) + s.dim("  (--protect)")) }
+        }
+        ctx.out(s.dim("  Built in (\(st.builtInProtectedPaths.count)): credentials, keys, tool settings and AI-tool memory, e.g."))
+        ctx.out(s.dim("    " + st.builtInProtectedPaths.prefix(8).joined(separator: ", ") + ", …"))
+        ctx.out(s.dim("    `mac-cleaner doctor --json` lists all of them."))
+        ctx.out("  Session retention: \(st.sessionRetentionDays) days " + s.dim("(AI-tool sessions newer than this are never offered)"))
 
         ctx.out()
         ctx.out(s.bold("Optional tools found") + s.dim("  (their caches get cleanup categories)"))

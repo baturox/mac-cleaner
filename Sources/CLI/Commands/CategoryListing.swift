@@ -47,8 +47,9 @@ enum CategoryListing {
 
     /// Resolves what `clean` should act on.
     /// - explicit `ids` are always included (unknown ids are a usage error);
-    /// - `safe` / `all` / `group` select by criteria: `safe` keeps safe ones, `all` keeps everything, and
-    ///   `group` (alone, or with either) limits the criteria to that group.
+    /// - `safe` / `all` / `group` select by criteria: `all` takes everything, `safe` only safe categories, and
+    ///   `group` limits either to one group. `group` on its own means the SAFE categories of that group:
+    ///   "caution" categories are only ever selected by `all` or by naming their ids.
     static func select(from cats: [CleanCategory], ids: [String], safe: Bool, all: Bool,
                        group: CategoryGroup?) throws -> [CleanCategory] {
         var chosen = Set<String>()
@@ -64,7 +65,7 @@ enum CategoryListing {
         if safe || all || group != nil {
             for c in cats {
                 if let group, c.group != group { continue }
-                if safe && !all && c.level != .safe { continue }
+                if !all && c.level != .safe { continue }
                 chosen.insert(c.id)
             }
         }

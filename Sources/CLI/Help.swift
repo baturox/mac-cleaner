@@ -28,7 +28,7 @@ enum Commands {
         options: [
             OptionSpec("safe", "Select every \"safe\" category (rebuilt automatically)."),
             OptionSpec("all", "Select every category, including \"caution\" ones."),
-            OptionSpec("group", value: "GROUP", "Limit --safe/--all to one group: \(groupNames)."),
+            OptionSpec("group", value: "GROUP", "Only this group (its safe categories, unless --all): \(groupNames)."),
             OptionSpec("trash", "Move items to the Trash instead of deleting them permanently."),
             OptionSpec("dry-run", short: "n", "Show what would be removed; delete nothing."),
             OptionSpec("yes", short: "y", "Do not ask for confirmation (required when not on a terminal)."),
@@ -41,7 +41,9 @@ enum Commands {
         ],
         notes: [
             "With no ids and no --safe/--all/--group, an interactive picker opens.",
-            "--safe and --group narrow each other; --all selects every category (limited by --group). Ids are added on top.",
+            "--group alone selects the SAFE categories of that group. \"Caution\" categories are only selected by --all or by",
+            "naming their ids. Ids are added on top of --safe/--all/--group.",
+            "The plan lists the items behind every category (first \(CleanCommand.itemsShownPerCategory) each), also with -y.",
             "--json implies --dry-run and prints the plan.",
         ]
     )
@@ -90,8 +92,11 @@ enum Commands {
             "mac-cleaner repos --json",
         ],
         notes: [
-            "--remove-clean only removes copies with no uncommitted work, nothing unpushed and no stash. It never forces,",
-            "and it always keeps at least one working copy of each repository.",
+            "--remove-clean only removes copies with no uncommitted work, nothing unpushed to a network remote, no stash and",
+            "no ignored files that exist only there (.env, local data). It never forces, and it always keeps at least one",
+            "working copy of each repository. A remote that is a folder on this disk does not count as a backup.",
+            "A repository whose own git configuration could run programs (hooks path, filters, fsmonitor, aliases…) is",
+            "listed as \"untrusted git config - not inspected\": git is never run in it and it is never removed.",
             "--json implies --dry-run.",
         ]
     )
@@ -126,7 +131,8 @@ enum Commands {
         maxPositionals: 0,
         options: [],
         examples: ["mac-cleaner doctor", "mac-cleaner doctor --json"],
-        notes: ["Read-only. Runs `diskutil apfs list` and `tmutil listlocalsnapshots /`."]
+        notes: ["Read-only. Runs `diskutil apfs list` and `tmutil listlocalsnapshots /`.",
+                "Also shows the protected folders and retention in force, and where each helper tool would be run from."]
     )
 
     static let all: [CommandSpec] = [scan, clean, projects, repos, explore, growth, doctor]
@@ -153,6 +159,7 @@ enum Help {
             "GLOBAL OPTIONS",
             "  --json        Machine-readable output on stdout (read commands; implies --dry-run when deleting)",
             "  --no-color    Disable colors (colors are only used on a terminal; NO_COLOR is honored)",
+            "  --protect <path>  Never list or delete this folder in this run (repeatable; adds to the app's list)",
             "  --version     Print the version",
             "  -h, --help    Help (also: mac-cleaner help <command>)",
             "",
@@ -167,6 +174,7 @@ enum Help {
             "  mac-cleaner doctor                # why is my free space not what Finder says?",
             "",
             "Nothing is deleted without confirmation. Use -n/--dry-run to preview.",
+            "Protected folders and the retention period set in the app apply here too (`mac-cleaner doctor` shows them).",
         ])
         return lines.joined(separator: "\n")
     }

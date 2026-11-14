@@ -20,8 +20,10 @@ final class FakeConsole: Console, @unchecked Sendable {
     var stdout: String { lock.lock(); defer { lock.unlock() }; return _out.joined(separator: "\n") }
     var stderr: String { lock.lock(); defer { lock.unlock() }; return _err.joined(separator: "") }
 
-    func out(_ line: String) { lock.lock(); _out.append(line); lock.unlock() }
-    func err(_ line: String) { lock.lock(); _err.append(line + "\n"); lock.unlock() }
+    // Like the real console: lines are sanitized, raw output (JSON) is not.
+    func out(_ line: String) { lock.lock(); _out.append(TerminalText.render(line)); lock.unlock() }
+    func outRaw(_ text: String) { lock.lock(); _out.append(text); lock.unlock() }
+    func err(_ line: String) { lock.lock(); _err.append(TerminalText.render(line) + "\n"); lock.unlock() }
     func errRaw(_ text: String) { lock.lock(); _err.append(text); lock.unlock() }
     func readLine() -> String? { input.isEmpty ? nil : input.removeFirst() }
 }
@@ -49,6 +51,9 @@ final class FakeEngine: CleanerEngine, @unchecked Sendable {
     private(set) var cleanedCalls: [(ids: [String], mode: DeleteMode)] = []
     private(set) var deletedCalls: [(urls: [URL], mode: DeleteMode)] = []
     private(set) var removeCalls: [(clones: [RepoClone], force: Bool, mode: DeleteMode)] = []
+    private(set) var configured: [EngineSettings] = []
+
+    func configure(_ settings: EngineSettings) async { lock.withLock { configured.append(settings) } }
 
     func diskInfo() -> DiskInfo { DiskInfo(totalBytes: 1_000_000_000_000, freeBytes: 200_000_000_000, availableWithPurgeableBytes: 230_000_000_000) }
     func scanCategories(progress: @escaping ProgressHandler) async -> [CleanCategory] { categories }
@@ -87,15 +92,16 @@ func makeCategory(_ id: String, group: CategoryGroup = .system, level: SafetyLev
                   itemsSelectable: selectable)
 }
 
-func makeClone(_ path: String, linked: Bool = false, uncommitted: Int = 0, unpushed: Int? = 0, stash: Bool = false,
-               idle: Int = 10, size: Int64 = 1_000_000) -> RepoClone {
-    RepoClone(url: URL(fileURLWithPath: path), branch: "main", isLinkedWorktree: linked, uncommittedCount: uncommitted,
-              unpushedCount: unpushed, hasStash: stash, lastCommit: nil, idleDays: idle, sizeBytes: size, artifactBytes: 0)
+func makeClone(_ path: String, branch: String? = "main", linked: Bool = false, uncommitted: Int = 0, unpushed: Int? = 0,
+               stash: Bool = false, idle: Int = 10, size: Int64 = 1_000_000, ignored: Int = 0, untrusted: [String]? = nil) -> RepoClone {
+    RepoClone(url: URL(fileURLWithPath: path), branch: branch, isLinkedWorktree: linked, uncommittedCount: uncommitted,
+              unpushedCount: unpushed, hasStash: stash, lastCommit: nil, idleDays: idle, sizeBytes: size, artifactBytes: 0,
+              ignoredFileCount: ignored, untrustedConfigKeys: untrusted)
 }
 
 func invoke(_ args: [String], engine: FakeEngine = FakeEngine(), console: FakeConsole = FakeConsole(),
-         environment: [String: String] = [:]) async -> (code: Int32, out: String, err: String) {
+            environment: [String: String] = [:], settingsStore: SettingsStore? = nil) async -> (code: Int32, out: String, err: String) {
     let code = await runCLI(arguments: args, engine: engine, console: console, environment: environment,
-                            home: URL(fileURLWithPath: "/Users/tester"), probe: FakeProbe())
+                            home: URL(fileURLWithPath: "/Users/tester"), probe: FakeProbe(), settingsStore: settingsStore)
     return (code, console.stdout, console.stderr)
 }

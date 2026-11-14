@@ -28,6 +28,7 @@ enum CleanCommand {
             throw UsageError("refusing to delete without confirmation because stdin is not a terminal; add -y (or -n to preview)",
                              command: "clean")
         }
+        if !dryRun { try ctx.requireUsableSettings() }
 
         let progress = ProgressLine(console: ctx.console)
         let cats = await ctx.engine.scanCategories(progress: progress.handler)
@@ -157,6 +158,8 @@ enum CleanCommand {
                                 rows: rows, style: s) {
             ctx.out(line)
         }
+        // What exactly is behind each row: with -y nobody is asked, so the output is the only record.
+        printItems(selected, ctx)
         ctx.out()
         var total = "Total: " + formatBytes(t.exact)
         if t.upperBound > 0 { total += " + up to \(formatBytes(t.upperBound))" }
@@ -168,6 +171,29 @@ enum CleanCommand {
             ctx.out(s.dim("Moved items free no space until you empty the Trash."))
         } else if !dryRun {
             ctx.out(s.dim("Permanent deletion cannot be undone."))
+        }
+    }
+
+    static let itemsShownPerCategory = 8
+
+    /// The items (and commands) of every selected category, capped per category with an honest remainder.
+    static func printItems(_ selected: [CleanCategory], _ ctx: Context) {
+        let s = ctx.style
+        for c in selected where !c.items.isEmpty || !c.commands.isEmpty {
+            ctx.out()
+            let count = c.items.isEmpty ? "" : "  \(c.items.count) item\(c.items.count == 1 ? "" : "s")"
+            ctx.out("  " + s.bold(c.id) + s.dim(count))
+            for item in c.items.prefix(itemsShownPerCategory) {
+                let what = item.deleteCommand.map { "runs: " + $0.joined(separator: " ") } ?? abbreviateHome(item.url.path, home: ctx.home)
+                var line = "    \(formatBytes(item.sizeBytes).leftPadded(9))  "
+                if let label = item.label, item.deleteCommand == nil { line += label + s.dim("  " + what) } else { line += what }
+                ctx.out(line)
+            }
+            if c.items.count > itemsShownPerCategory {
+                let rest = c.items.dropFirst(itemsShownPerCategory)
+                ctx.out(s.dim("    … and \(rest.count) more (\(formatBytes(rest.reduce(Int64(0)) { $0 + $1.sizeBytes })))"))
+            }
+            for cmd in c.commands { ctx.out("    " + s.dim("runs: ") + cmd.joined(separator: " ")) }
         }
     }
 

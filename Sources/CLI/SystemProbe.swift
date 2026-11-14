@@ -1,4 +1,5 @@
 // Read-only questions about the machine, used by `doctor`. Behind a protocol so tests can fake it.
+import CleanerCore
 import Foundation
 
 protocol SystemProbe: Sendable {
@@ -27,22 +28,12 @@ struct LiveProbe: SystemProbe {
         }
     }
 
+    /// The tools as the ENGINE would find them: its own search order and trust checks, not this shell's
+    /// PATH. A tool that is installed but missing here was rejected (see SECURITY.md, "Helper programs").
     func detectedTools(home: URL) -> [DetectedTool] {
-        var dirs = (ProcessInfo.processInfo.environment["PATH"] ?? "").split(separator: ":").map(String.init)
-        let extra = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", home.path + "/.cargo/bin",
-                     home.path + "/.bun/bin", home.path + "/.local/bin", home.path + "/go/bin"]
-        for e in extra where !dirs.contains(e) { dirs.append(e) }
-        var found: [DetectedTool] = []
-        for name in optionalToolNames {
-            for d in dirs {
-                let p = d + "/" + name
-                if FileManager.default.isExecutableFile(atPath: p) {
-                    found.append(DetectedTool(name: name, path: abbreviateHome(p, home: home)))
-                    break
-                }
-            }
+        optionalToolNames.compactMap { name in
+            ToolLocator.path(for: name).map { DetectedTool(name: name, path: abbreviateHome($0, home: home)) }
         }
-        return found
     }
 
     func apfsLayout() -> (volumes: [APFSVolume], containerFreeBytes: Int64?)? {
@@ -103,6 +94,8 @@ func runProcess(_ argv: [String], timeout: TimeInterval) -> Data? {
     let p = Process()
     p.executableURL = URL(fileURLWithPath: exe)
     p.arguments = Array(argv.dropFirst())
+    // A fixed, minimal environment: nothing from this process reaches the helper.
+    p.environment = ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": NSHomeDirectory(), "LANG": "C", "LC_ALL": "C"]
     let out = Pipe()
     p.standardOutput = out
     p.standardError = FileHandle.nullDevice

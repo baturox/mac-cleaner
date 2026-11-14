@@ -44,16 +44,20 @@ struct CommandSpec {
 struct ParsedArguments: Equatable {
     var flags: Set<String> = []
     var values: [String: String] = [:]
+    /// Every value of options that may be repeated (`--protect a --protect b`), in order.
+    var lists: [String: [String]] = [:]
     var positionals: [String] = []
 
     func flag(_ name: String) -> Bool { flags.contains(name) }
     func value(_ name: String) -> String? { values[name] }
+    func list(_ name: String) -> [String] { lists[name] ?? [] }
 }
 
 /// Options every command accepts.
 let globalOptions: [OptionSpec] = [
     OptionSpec("json", "Print machine-readable JSON (and nothing else) on stdout."),
     OptionSpec("no-color", "Never use colors (also honors NO_COLOR)."),
+    OptionSpec("protect", value: "PATH", "Also protect this folder (and everything in it) for this run; repeatable."),
     OptionSpec("help", short: "h", "Show help for this command."),
 ]
 
@@ -92,14 +96,17 @@ enum ArgumentParser {
                 }
                 let opt = try lookupLong(name)
                 if opt.value != nil {
+                    let v: String
                     if let inline {
-                        result.values[opt.long] = inline
+                        v = inline
                     } else if i < args.count {
-                        result.values[opt.long] = args[i]
+                        v = args[i]
                         i += 1
                     } else {
                         throw fail("option '--\(name)' needs a value (\(opt.value ?? "VALUE"))")
                     }
+                    result.values[opt.long] = v
+                    result.lists[opt.long, default: []].append(v)
                 } else {
                     if inline != nil { throw fail("option '--\(name)' does not take a value") }
                     result.flags.insert(opt.long)
@@ -124,6 +131,7 @@ enum ArgumentParser {
                         i += 1
                     }
                     result.values[opt.long] = v
+                    result.lists[opt.long, default: []].append(v)
                     break
                 } else {
                     result.flags.insert(opt.long)

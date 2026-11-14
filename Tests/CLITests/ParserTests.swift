@@ -54,7 +54,7 @@ final class ParserTests: XCTestCase {
         XCTAssertEqual(formatDelta(-2_000_000), "-2.0 MB")
         XCTAssertEqual(formatSize(1_000_000_000, upperBound: true), "≤ 1.0 GB")
         XCTAssertEqual(abbreviateHome("/Users/t/x", home: URL(fileURLWithPath: "/Users/t")), "~/x")
-        XCTAssertEqual(visibleWidth("\u{1B}[31mred\u{1B}[0m"), 3)
+        XCTAssertEqual(visibleWidth(Style(enabled: true).red("red")), 3, "the CLI's own color marks take no room")
     }
 
     func testAPFSAndSnapshotParsers() {
