@@ -34,6 +34,8 @@ public struct SettingsStore: Sendable {
         var version: Int
         var protectedPaths: [String]
         var sessionRetentionDays: Int
+        /// Added later; absent in older files (= on).
+        var recordAuditLog: Bool?
     }
 
     public init(directory: URL) {
@@ -53,7 +55,8 @@ public struct SettingsStore: Sendable {
         guard let file = try? JSONDecoder().decode(File.self, from: data) else { return .corrupt(reason: "it is not valid settings JSON") }
         guard file.version == 1 else { return .corrupt(reason: "it was written by a newer version (format \(file.version))") }
         guard (0...100_000).contains(file.sessionRetentionDays) else { return .corrupt(reason: "sessionRetentionDays is out of range") }
-        return .loaded(EngineSettings(protectedPaths: file.protectedPaths, sessionRetentionDays: file.sessionRetentionDays))
+        return .loaded(EngineSettings(protectedPaths: file.protectedPaths, sessionRetentionDays: file.sessionRetentionDays,
+                                      recordAuditLog: file.recordAuditLog ?? true))
     }
 
     /// Writes atomically (temporary file + rename), readable by the user only.
@@ -65,7 +68,8 @@ public struct SettingsStore: Sendable {
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
             let data = try encoder.encode(File(version: 1, protectedPaths: settings.protectedPaths,
-                                               sessionRetentionDays: settings.sessionRetentionDays))
+                                               sessionRetentionDays: settings.sessionRetentionDays,
+                                               recordAuditLog: settings.recordAuditLog))
             try data.write(to: fileURL, options: [.atomic])
             chmod(fileURL.path, 0o600)
             return true

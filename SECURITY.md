@@ -119,6 +119,51 @@ A repository's local configuration can make ordinary read-only git commands run 
 - The mock engine and the `MACCLEANER_*` environment hooks used for screenshots exist in debug builds only.
 - The app and CLI make no network connections and send no telemetry.
 
+## MCP server (`mac-cleaner mcp`)
+
+**Threat model.** The caller is a language model that may be under prompt injection. File and folder names,
+paths, branch names and tool output on the user's disk are attacker-controlled text that the server hands to
+that model. The server therefore assumes that any model output (tool name, arguments, the decision to apply a
+plan) can be adversarial, and that the model's judgment is not a security boundary.
+
+**What the server will never do**
+
+- Delete anything unless the *user* started it with `--allow-clean`. Without the flag the deleting tools are
+  not listed and cannot be called. A corrupt settings file or a turned-off audit log disables them too.
+- Accept a path (or any file name) to delete. Plans are built server-side from the engine's own scan results;
+  `apply_cleanup` takes only a `plan_id` and `confirm: true`.
+- Put a *caution* category, Time Machine snapshots, an item removed by a tool command, a clone or worktree, the
+  Trash, an explorer path or a forced removal into a plan. Build folders are planned only for projects idle for
+  at least the configured number of days (default 14, at least 1; the model cannot lower it), and are
+  re-validated with a fresh project scan right before deleting.
+- Apply a plan twice, after it expired (10 minutes), above the per-plan or per-session size ceiling, or more
+  than 3 times in 10 minutes. The plan is marked used before anything runs.
+- Skip the audit log: every apply is recorded with client `mcp` and the plan id.
+- List or measure the protected folders (built-in list and the user's), or inspect anything outside the home
+  folder and the temp areas. `explore_folder` resolves symlinks before checking, and omits protected children.
+- Return unsanitized file-system text: control characters, line breaks, direction overrides and zero-width
+  characters are removed and lengths are capped; text always travels as quoted JSON string values, and the
+  server instructions and each relevant tool description say it is data, not instructions.
+- Write anything to stdout except protocol messages (logs go to stderr), read an unbounded line (1 MiB limit),
+  open a network connection, or run a command that is not on the engine's allowlist.
+
+**Residual risks (not fixed)**
+
+- A user who approves a plan without reading it deletes what is in it. The plan is limited to rebuildable
+  data, but rebuilding can cost time (and bandwidth).
+- A "safe" cache category can still hold something a particular tool did not expect to lose; that is the
+  same risk as the app's *safe* level.
+- `growth_report` writes a snapshot to Mac Cleaner's own history file; it is the only write besides the audit
+  log and plan state kept in memory.
+- Plans and rate limits live in the server process. Restarting the server resets the session ceiling and the
+  rate limit; whoever can restart it with different flags is the user, or a program already running as the user.
+- The 2026-07-28 client `_meta` fields other than the protocol version are accepted but not required, and the
+  server answers every request statelessly under that revision.
+
+**The audit log** holds paths. It is created 0600 in a 0700 folder under a protected path, never leaves the
+machine, and never contains file contents. A program running as the same user can read, edit or delete it
+(see "Same-user attackers"): it is an aid for the user, not tamper-proof evidence.
+
 ## Known limitations
 
 These are real and not fixed. Please do not report them as new findings, but do tell us if you see a way to

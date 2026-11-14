@@ -32,6 +32,20 @@ First public release.
   signing and notarization; generated app icon; Homebrew cask template.
 - GitHub Actions for CI and tagged releases.
 
+- **History / audit log.** Every clean, delete and clone removal is recorded in
+  `~/Library/Application Support/MacCleaner/audit.jsonl` (append-only JSON Lines, mode 0600, `flock` + `fsync`,
+  rotated at ~10 MB, corrupt lines skipped). New *History* screen in the app (search, client and date filters,
+  items with Reveal in Finder, JSON/CSV export, clear), "Freed so far" on the Overview, `mac-cleaner history`
+  and `mac-cleaner history clear`, and a setting to turn recording off. New engine API: `auditLog`, `auditStats`,
+  `clearAuditLog`, `AuditRecord`/`AuditItem`, `LiveEngine(client:appVersion:)` and
+  `delete(urls:mode:purpose:progress:)`.
+- **MCP server for AI agents.** `mac-cleaner mcp` (MCP 2026-07-28, with `initialize`-based negotiation down to
+  2024-11-05): read-only tools for disk status, cleanup categories, build folders, repositories, folder sizes,
+  growth and the audit history. With `--allow-clean` the user can opt in to a two-step `plan_cleanup` /
+  `apply_cleanup` limited to safe categories and idle projects' build folders, with expiring single-use plans,
+  size ceilings, a rate limit and audit records. See the README and SECURITY.md.
+- `mac-cleaner doctor` mentions the MCP command.
+
 ### Security
 
 Hardening after a security review, before the first release. Details and the remaining limitations are in

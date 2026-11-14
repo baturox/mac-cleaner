@@ -8,8 +8,11 @@ signal(SIGPIPE, SIG_IGN)
 
 let console = StandardConsole()
 let rootTask = Task {
-    let code = await runCLI(arguments: Array(CommandLine.arguments.dropFirst()),
-                            engine: LiveEngine(), console: console, settingsStore: .standard)
+    let arguments = Array(CommandLine.arguments.dropFirst())
+    // Deletions are logged with the client that asked for them.
+    let client: AuditClient = commandName(in: arguments) == "mcp" ? .mcp : .cli
+    let code = await runCLI(arguments: arguments,
+                            engine: LiveEngine(client: client, appVersion: cliVersion), console: console, settingsStore: .standard)
     exit(code)
 }
 

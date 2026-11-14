@@ -335,6 +335,7 @@ extension LiveEngine {
         let before = diskInfo().freeBytes
         let ctx = context()
         let deleter = Deleter(env: env, guardian: ctx.guardian)
+        var audit = AuditDraft(kind: .removeClones, mode: mode)
         var failed = 0
         var messages: [String] = []
         for clone in clones {
@@ -342,15 +343,23 @@ extension LiveEngine {
             let path = clone.url.path
             let name = (path as NSString).lastPathComponent
             progress("Checking \(name)…")
+            func record(_ outcome: AuditOutcome, _ reason: String?, state: RepoState? = nil, backedUp: Bool? = nil, action: AuditAction = .deleted) {
+                audit.add(AuditItem(path: path, name: name, sizeBytes: clone.sizeBytes, action: action, outcome: outcome, reason: reason,
+                                    remote: state?.remote, branch: state?.branch ?? clone.branch,
+                                    fullyBackedUp: backedUp ?? clone.isFullyBackedUp, forced: force))
+            }
             guard deleter.isAllowed(path) else {
-                failed += 1; messages.append("Refused (outside the allowed area, reached through a symlink, or protected): \(path)"); continue
+                let m = "Refused (outside the allowed area, reached through a symlink, or protected): \(path)"
+                failed += 1; messages.append(m); record(.refused, m); continue
             }
             // Never trust the caller's view of the folder: re-read what is on disk right now.
             guard let kind = RepoWalker.classify(path) else {
-                failed += 1; messages.append("\(name) is not a git working copy; left untouched"); continue
+                let m = "\(name) is not a git working copy; left untouched"
+                failed += 1; messages.append(m); record(.refused, m); continue
             }
             if kind == .submodule {
-                failed += 1; messages.append("\(name) is a submodule; left untouched"); continue
+                let m = "\(name) is a submodule; left untouched"
+                failed += 1; messages.append(m); record(.refused, m); continue
             }
             var isLinked = false
             if case .linked = kind { isLinked = true }
@@ -358,15 +367,20 @@ extension LiveEngine {
             if let keys = state.untrustedKeys {
                 // Not even with force: git is never run here, so nobody knows what the folder holds.
                 failed += 1
-                messages.append("Kept \(name): its git configuration could run programs (\(keys.joined(separator: ", "))), so it was not inspected and is never removed from here. Review it and delete the folder yourself if you want it gone.")
+                let m = "Kept \(name): its git configuration could run programs (\(keys.joined(separator: ", "))), so it was not inspected and is never removed from here. Review it and delete the folder yourself if you want it gone."
+                messages.append(m)
+                record(.refused, m, state: state, backedUp: false)
                 continue
             }
+            let backedUp = RepoInspector.risk(state, isLinkedWorktree: isLinked) == nil
             if !force {
                 if let why = RepoInspector.risk(state, isLinkedWorktree: isLinked) {
-                    failed += 1; messages.append("Kept \(name): \(why). Back it up or remove it with force."); continue
+                    failed += 1; messages.append("Kept \(name): \(why). Back it up or remove it with force.")
+                    record(.refused, "Kept: \(why)", state: state, backedUp: false); continue
                 }
                 if !isLinked, let why = await Self.nestedRisk(path: path, env: env, guardian: ctx.guardian) {
-                    failed += 1; messages.append("Kept \(name): \(why). Back it up or remove it with force."); continue
+                    failed += 1; messages.append("Kept \(name): \(why). Back it up or remove it with force.")
+                    record(.refused, "Kept: \(why)", state: state, backedUp: false); continue
                 }
             }
             // For a linked worktree, git in the main clone does the bookkeeping. The main clone's shared
@@ -381,18 +395,23 @@ extension LiveEngine {
                 var r = await Git.run(mainRepo, ["worktree", "remove", "--force", path], env: env, timeout: 300, mutating: true)
                 if !r.ok { r = await Git.run(mainRepo, ["worktree", "remove", "--force", "--force", path], env: env, timeout: 300, mutating: true) }
                 if !r.ok {
-                    failed += 1; messages.append("Could not remove worktree \(name): \(String(r.lastLine.prefix(160)))")
+                    let m = "Could not remove worktree \(name): \(String(r.lastLine.prefix(160)))"
+                    failed += 1; messages.append(m)
+                    record(.failed, m, state: state, backedUp: backedUp)
+                } else {
+                    record(.ok, nil, state: state, backedUp: backedUp)
                 }
                 _ = await Git.run(mainRepo, ["worktree", "prune"], env: env, timeout: 60, mutating: true)
             } else {
-                let r = await onBackground { deleter.remove([path], mode: mode) }
+                let r = (await onBackground { deleter.removeEach([path], mode: mode) })[0]
                 failed += r.failed; messages += r.messages
+                record(r.outcome, r.reason, state: state, backedUp: backedUp, action: r.trashed ? .movedToTrash : .deleted)
                 if let mainRepo {
                     _ = await Git.run(mainRepo, ["worktree", "prune"], env: env, timeout: 60, mutating: true)
                 }
             }
         }
-        return await finish(before: before, failed: failed, messages: messages)
+        return await finish(before: before, failed: failed, messages: messages, audit: audit)
     }
 
     /// Reasons deleting a normal clone would lose more than the clone itself: linked worktrees hanging off it

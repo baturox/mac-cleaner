@@ -96,62 +96,74 @@ struct Deleter: Sendable {
 
     // MARK: Removing
 
+    /// What happened to one path.
+    struct PathResult: Sendable {
+        var path: String
+        var failed = 0
+        var messages: [String] = []
+        var outcome: AuditOutcome = .ok
+        /// Note for the audit log (why it failed or was refused, or "already gone").
+        var reason: String?
+        var trashed = false
+    }
+
     /// Removes `paths`. Returns (failed entry count, messages). Blocking; call off the main thread.
     /// Items in the Trash are always removed permanently, whatever the mode.
     func remove(_ paths: [String], mode: DeleteMode = .permanent) -> (failed: Int, messages: [String]) {
-        var failed = 0
-        var messages: [String] = []
-        let trashDir = env.home + "/.Trash/"
-        for path in paths {
-            let name = (path as NSString).lastPathComponent
-            guard isAllowed(path), let (parent, last) = split(path) else {
-                failed += 1
-                messages.append("Refused (outside the allowed area, reached through a symlink, or protected): \(path)")
-                continue
-            }
-            // From here on the parent is held open; the path string is not resolved again.
-            guard let parentFD = openDirectory(parent) else {
-                var st = stat()
-                if lstat(parent, &st) != 0 && errno == ENOENT { continue }
-                failed += 1
-                messages.append("Refused (its folder changed, is a symlink, or belongs to another user): \(path)")
-                continue
-            }
-            defer { close(parentFD) }
-            var st = stat()
-            if fstatat(parentFD, last, &st, AT_SYMLINK_NOFOLLOW) != 0 {
-                if errno != ENOENT { failed += 1; messages.append("Could not access \(path)") }
-                continue
-            }
-            let shared = env.sharedRoot(containing: path) != nil
-            if shared && st.st_uid != env.uid {
-                failed += 1
-                messages.append("Refused (belongs to another user): \(path)")
-                continue
-            }
-            if guardian.isProtectedID(FileID(st)) {
-                failed += 1
-                messages.append("Refused (protected): \(path)")
-                continue
-            }
-            if mode == .trash && !path.hasPrefix(trashDir) {
-                do { try env.trash(URL(fileURLWithPath: path)) } catch {
-                    failed += 1
-                    messages.append("Could not move \(name) to the Trash")
-                }
-                continue
-            }
-            var walk = Walk(rootDev: st.st_dev, requiredOwner: shared ? env.uid : nil, guardian: guardian)
-            let e = walk.remove(parentFD, last)
-            if e > 0 { walk.failed += 1 }
-            if walk.failed > 0 {
-                failed += walk.failed
-                var note = "\(walk.failed) \(walk.failed == 1 ? "entry" : "entries") in \(name) could not be removed (in use or protected by macOS)"
-                if walk.skippedForeign > 0 { note += "; \(walk.skippedForeign) changed or did not belong to you and were left alone" }
-                messages.append(note)
-            }
+        let results = removeEach(paths, mode: mode)
+        return (results.reduce(0) { $0 + $1.failed }, results.flatMap { $0.messages })
+    }
+
+    /// Like `remove`, with the outcome of every path (same order).
+    func removeEach(_ paths: [String], mode: DeleteMode = .permanent) -> [PathResult] {
+        paths.map { removeOne($0, mode: mode) }
+    }
+
+    private func removeOne(_ path: String, mode: DeleteMode) -> PathResult {
+        var res = PathResult(path: path)
+        func fail(_ outcome: AuditOutcome, _ message: String) -> PathResult {
+            res.failed += 1; res.messages.append(message); res.outcome = outcome; res.reason = message
+            return res
         }
-        return (failed, messages)
+        let trashDir = env.home + "/.Trash/"
+        let name = (path as NSString).lastPathComponent
+        guard isAllowed(path), let (parent, last) = split(path) else {
+            return fail(.refused, "Refused (outside the allowed area, reached through a symlink, or protected): \(path)")
+        }
+        // From here on the parent is held open; the path string is not resolved again.
+        guard let parentFD = openDirectory(parent) else {
+            var st = stat()
+            if lstat(parent, &st) != 0 && errno == ENOENT { res.reason = "already gone"; return res }
+            return fail(.refused, "Refused (its folder changed, is a symlink, or belongs to another user): \(path)")
+        }
+        defer { close(parentFD) }
+        var st = stat()
+        if fstatat(parentFD, last, &st, AT_SYMLINK_NOFOLLOW) != 0 {
+            if errno != ENOENT { return fail(.failed, "Could not access \(path)") }
+            res.reason = "already gone"
+            return res
+        }
+        let shared = env.sharedRoot(containing: path) != nil
+        if shared && st.st_uid != env.uid { return fail(.refused, "Refused (belongs to another user): \(path)") }
+        if guardian.isProtectedID(FileID(st)) { return fail(.refused, "Refused (protected): \(path)") }
+        if mode == .trash && !path.hasPrefix(trashDir) {
+            do { try env.trash(URL(fileURLWithPath: path)); res.trashed = true } catch {
+                return fail(.failed, "Could not move \(name) to the Trash")
+            }
+            return res
+        }
+        var walk = Walk(rootDev: st.st_dev, requiredOwner: shared ? env.uid : nil, guardian: guardian)
+        let e = walk.remove(parentFD, last)
+        if e > 0 { walk.failed += 1 }
+        if walk.failed > 0 {
+            res.failed = walk.failed
+            var note = "\(walk.failed) \(walk.failed == 1 ? "entry" : "entries") in \(name) could not be removed (in use or protected by macOS)"
+            if walk.skippedForeign > 0 { note += "; \(walk.skippedForeign) changed or did not belong to you and were left alone" }
+            res.messages.append(note)
+            res.outcome = .failed
+            res.reason = note
+        }
+        return res
     }
 
     /// One recursive removal. All state lives here; nothing in it holds a path.

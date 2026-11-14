@@ -77,6 +77,7 @@ struct ContentView: View {
         case .projects: ProjectsView(model: model)
         case .repos: ReposView(model: model)
         case .explore: ExploreView(model: model, explore: model.explore)
+        case .history: HistoryView(model: model, history: model.history)
         }
     }
 
@@ -173,6 +174,10 @@ struct ContentView: View {
                 for c in g.clones { model.setClone(c, selected: true) }
                 model.requestRemoveClones(model.selectedClones)
             }
+        case "history":
+            model.section = .history
+            await model.history.reload()
+            for r in model.history.records.prefix(3).dropFirst() { model.history.expanded.insert(r.id) }
         case "settings":
             openSettings()
         case "focus":

@@ -104,6 +104,7 @@ func runCLI(arguments: [String],
                           home: home, environment: environment, probe: probe)
         ctx.settings = settings
         ctx.extraProtected = extra
+        ctx.settingsStore = settingsStore
         ctx.settingsFile = settingsStore.map { abbreviateHome($0.fileURL.path, home: home) }
         ctx.settingsProblem = loaded.problem
         switch loaded {
@@ -122,6 +123,8 @@ func runCLI(arguments: [String],
         case "repos": return try await ReposCommand.run(parsed, ctx)
         case "explore": return try await ExploreCommand.run(parsed, ctx)
         case "growth": return try await GrowthCommand.run(parsed, ctx)
+        case "history": return try await HistoryCommand.run(parsed, ctx)
+        case "mcp": return try await MCPCommand.run(parsed, ctx)
         case "doctor": return try await DoctorCommand.run(parsed, ctx)
         default: throw unknownCommand(name)
         }
@@ -143,6 +146,17 @@ func runCLI(arguments: [String],
         console.err("mac-cleaner: \(error.localizedDescription)")
         return ExitCode.failure
     }
+}
+
+/// The command the arguments select (`scan` when none), skipping the global options.
+func commandName(in arguments: [String]) -> String {
+    var i = 0
+    while i < arguments.count, arguments[i].hasPrefix("-"), arguments[i] != "--" {
+        if arguments[i] == "--protect" { i += 1 }
+        i += 1
+    }
+    if i < arguments.count, arguments[i] == "--" { i += 1 }
+    return i < arguments.count ? arguments[i] : "scan"
 }
 
 /// A failure that is not the user's usage mistake (exit code 1).

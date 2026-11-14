@@ -62,7 +62,7 @@ struct MacCleanerApp: App {
     init() {
         #if DEBUG
         let mock = Prefs.isMock
-        let engine: any CleanerEngine = mock ? MockEngine() : LiveEngine()
+        let engine: any CleanerEngine = mock ? MockEngine() : LiveEngine(client: .app)
         let m = AppModel(engine: engine, isMock: mock)
         // Screenshot hooks (only with the mock engine, only in debug builds).
         let env = ProcessInfo.processInfo.environment
@@ -71,7 +71,7 @@ struct MacCleanerApp: App {
         if mock, env["MACCLEANER_APPEARANCE"] == "dark" { NSApplication.shared.appearance = NSAppearance(named: .darkAqua) }
         #else
         // Release builds: always the real engine, and no environment variable changes the app's behavior.
-        let m = AppModel(engine: LiveEngine(), isMock: false)
+        let m = AppModel(engine: LiveEngine(client: .app), isMock: false)
         #endif
         _model = State(initialValue: m)
     }

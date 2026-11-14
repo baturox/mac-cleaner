@@ -135,7 +135,59 @@ enum Commands {
                 "Also shows the protected folders and retention in force, and where each helper tool would be run from."]
     )
 
-    static let all: [CommandSpec] = [scan, clean, projects, repos, explore, growth, doctor]
+    static let history = CommandSpec(
+        name: "history",
+        summary: "Show what Mac Cleaner deleted (the local audit log); `history clear` erases it",
+        usage: "history [clear] [--limit N] [--since <date|7d|24h>] [--client app|cli|mcp] [--items] [-y]",
+        positionalHelp: ["clear   Erase the whole history (asks first; -y skips the question)."],
+        maxPositionals: 1,
+        options: [
+            OptionSpec("limit", value: "N", "Show the newest N operations (default 20)."),
+            OptionSpec("since", value: "WHEN", "Only operations since a date (2025-01-31) or an age (7d, 24h, 2w)."),
+            OptionSpec("client", value: "NAME", "Only operations started by app, cli or mcp."),
+            OptionSpec("items", "Also list the items of every shown operation."),
+            OptionSpec("yes", short: "y", "With `clear`: do not ask for confirmation."),
+        ],
+        examples: [
+            "mac-cleaner history",
+            "mac-cleaner history --since 7d --client mcp --items",
+            "mac-cleaner history --json | jq '.records[].items[].path'",
+            "mac-cleaner history clear",
+        ],
+        notes: [
+            "Read-only (except `clear`). Every clean, delete and clone removal is recorded with the paths, sizes and outcomes,",
+            "in ~/Library/Application Support/MacCleaner/audit.jsonl. Paths can be sensitive; the file stays on this Mac and is",
+            "readable by you only. File contents are never recorded. Turn recording off in the app's Settings.",
+        ]
+    )
+
+    static let mcp = CommandSpec(
+        name: "mcp",
+        summary: "Run a Model Context Protocol server on stdio for AI coding agents",
+        usage: "mcp [--allow-clean] [--trash] [--min-idle-days N] [--max-plan-gb N] [--max-session-gb N]",
+        positionalHelp: [],
+        maxPositionals: 0,
+        options: [
+            OptionSpec("allow-clean", "Let the agent PLAN and, after the user approves, APPLY a limited cleanup. Off by default."),
+            OptionSpec("trash", "With --allow-clean: move to the Trash instead of deleting permanently."),
+            OptionSpec("min-idle-days", value: "N", "With --allow-clean: only build folders of projects idle at least N days (default 14, minimum 1)."),
+            OptionSpec("max-plan-gb", value: "N", "With --allow-clean: largest single plan in GB (default 10)."),
+            OptionSpec("max-session-gb", value: "N", "With --allow-clean: most this server process may remove in total, in GB (default 30)."),
+        ],
+        examples: [
+            "claude mcp add mac-cleaner -- mac-cleaner mcp",
+            "claude mcp add mac-cleaner -- mac-cleaner mcp --allow-clean --min-idle-days 30",
+        ],
+        notes: [
+            "Speaks newline-delimited JSON-RPC on stdin/stdout (MCP 2026-07-28, and 2025-11-25 down to 2024-11-05); logs go to stderr.",
+            "Without --allow-clean every tool is read-only and no deletion tool is even listed.",
+            "With --allow-clean, deleting is two steps (plan_cleanup, then apply_cleanup with the plan id), only safe categories and",
+            "build folders of idle projects can be in a plan, and every apply is written to the audit log (`mac-cleaner history`).",
+            "--json and the global options do not apply. Start it from your agent's MCP configuration, not by hand.",
+        ]
+    )
+
+    static let all: [CommandSpec] = [scan, clean, projects, repos, explore, growth, history, mcp, doctor]
 
     static func named(_ name: String) -> CommandSpec? { all.first { $0.name == name } }
 }
@@ -171,6 +223,8 @@ enum Help {
             "  mac-cleaner clean --safe -n       # preview the safe cleanup",
             "  mac-cleaner projects ~/Developer  # stale node_modules / target / .next",
             "  mac-cleaner repos --multiple-only # duplicate clones and leftover agent worktrees",
+            "  mac-cleaner history               # what did Mac Cleaner delete?",
+            "  mac-cleaner mcp                   # MCP server for AI agents (see `mac-cleaner help mcp`)",
             "  mac-cleaner doctor                # why is my free space not what Finder says?",
             "",
             "Nothing is deleted without confirmation. Use -n/--dry-run to preview.",

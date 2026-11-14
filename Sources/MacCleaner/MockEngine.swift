@@ -26,6 +26,65 @@ final class MockEngine: CleanerEngine, @unchecked Sendable {
         lock.withLock { self.settings = settings }
     }
 
+    // MARK: Audit log (fake history for screenshots)
+
+    private var mockAudit: [AuditRecord]?
+
+    private func makeAudit() -> [AuditRecord] {
+        func it(_ rel: String, _ name: String, _ mb: Int64, cat: String? = nil, kind: String? = nil, outcome: AuditOutcome = .ok,
+                reason: String? = nil, action: AuditAction = .deleted) -> AuditItem {
+            AuditItem(path: home + "/" + rel, name: name, categoryID: cat, artifactKind: kind, sizeBytes: mb * MB, action: action,
+                      outcome: outcome, reason: reason)
+        }
+        func rec(_ ago: Double, _ client: AuditClient, _ kind: AuditOperationKind, _ items: [AuditItem], mode: DeleteMode = .permanent,
+                 plan: String? = nil) -> AuditRecord {
+            let start = Date().addingTimeInterval(-ago * 3600)
+            let freed = mode == .trash ? 0 : items.filter { $0.outcome == .ok }.reduce(0) { $0 + $1.sizeBytes }
+            return AuditRecord(startedAt: start, endedAt: start.addingTimeInterval(4), client: client, appVersion: "0.1.0", kind: kind, mode: mode,
+                               planID: plan, freeBytesBefore: 6 * GB, freeBytesAfter: 6 * GB + freed, freedBytes: freed, itemCount: items.count,
+                               failedItemCount: items.filter { $0.outcome != .ok }.count, items: items)
+        }
+        return [
+            rec(1.5, .app, .cleanup, [it("Library/Caches/com.apple.dt.Xcode", "Xcode caches", 2_400, cat: "xcode-derived"),
+                                      it("Library/Developer/Xcode/DerivedData/Shop-abc", "Shop (DerivedData)", 5_100, cat: "xcode-derived"),
+                                      it(".npm/_cacache", "npm cache", 3_800, cat: "npm"),
+                                      it("Library/Caches/Homebrew", "Homebrew downloads", 1_200, cat: "homebrew")]),
+            rec(20, .mcp, .projectArtifacts, [it("Developer/shop-web/node_modules", "shop-web/node_modules", 1_900, kind: "node_modules"),
+                                              it("Developer/old-api/target", "old-api/target", 4_200, kind: "target"),
+                                              it("Developer/landing/.next", "landing/.next", 640, kind: "next")], plan: "plan_3f9a0c21d4b7e605"),
+            rec(55, .cli, .cleanup, [it("Library/Caches/pip", "pip cache", 780, cat: "pip"),
+                                     it("Library/Logs/DiagnosticReports", "Diagnostic reports", 310, cat: "logs", outcome: .failed,
+                                        reason: "3 entries in DiagnosticReports could not be removed (in use or protected by macOS)")]),
+            rec(30 * 24, .app, .removeClones, [AuditItem(path: home + "/Developer/shop-web-copy", name: "shop-web-copy", sizeBytes: 2_800 * MB, action: .deleted,
+                                                          outcome: .ok, remote: "github.com/acme/shop-web", branch: "main", fullyBackedUp: true, forced: false),
+                                               AuditItem(path: home + "/Developer/scratch-agent-wt", name: "scratch-agent-wt", sizeBytes: 900 * MB, action: .deleted,
+                                                         outcome: .refused, reason: "Kept: 2 uncommitted changes. Back it up or remove it with force.",
+                                                         remote: "github.com/acme/api", branch: "agent/try-1", fullyBackedUp: false, forced: false)]),
+            rec(8 * 24, .app, .explorerDelete, [it("Downloads/installer-old.dmg", "installer-old.dmg", 1_100)], mode: .trash),
+            rec(11 * 24, .cli, .projectArtifacts, [it("Developer/blog/node_modules", "blog/node_modules", 820, kind: "node_modules"),
+                                                   it("Developer/blog/.astro", "blog/.astro", 40, kind: ".astro")]),
+            rec(21 * 24, .app, .cleanup, [it("Library/Caches/Google/Chrome", "Chrome cache", 1_700, cat: "user-caches"),
+                                          it("Library/Application Support/Code/Cache", "VS Code cache", 460, cat: "ide-caches")]),
+            rec(40 * 24, .mcp, .cleanup, [it(".cache/huggingface/xet", "Hugging Face xet cache", 6_300, cat: "hf-xet")], plan: "plan_77c1be90a2d4f318"),
+        ]
+    }
+
+    func auditLog(limit: Int, before: Date?) async -> [AuditRecord] {
+        let all = lock.withLock { () -> [AuditRecord] in
+            if mockAudit == nil { mockAudit = makeAudit() }
+            return mockAudit ?? []
+        }
+        return Array(all.filter { before == nil || $0.startedAt < before! }.sorted { $0.startedAt > $1.startedAt }.prefix(limit))
+    }
+
+    func auditStats(since: Date?) async -> AuditStats {
+        let all = await auditLog(limit: 100_000, before: nil).filter { since == nil || $0.startedAt >= since! }
+        return AuditStats(operations: all.count, freedBytes: all.reduce(0) { $0 + $1.freedBytes },
+                          itemsRemoved: all.reduce(0) { $0 + $1.items.filter { $0.outcome == .ok }.count }, skippedLines: 0)
+    }
+
+    func clearAuditLog() async { lock.withLock { mockAudit = [] } }
+
     func hasFullDiskAccess() -> Bool {
         ProcessInfo.processInfo.environment["MACCLEANER_FDA"] == "granted"
     }

@@ -70,6 +70,21 @@ struct OverviewView: View {
                 .font(.callout).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
             }
             Spacer()
+            if model.auditStats.operations > 0 {
+                Button { model.section = .history } label: {
+                    VStack(alignment: .trailing, spacing: 1) {
+                        Text("Freed so far").font(.caption).foregroundStyle(.secondary)
+                        Text(Fmt.bytes(model.auditStats.freedBytes)).font(.title3.weight(.semibold)).monospacedDigit()
+                        Text("in \(model.auditStats.operations) operation\(model.auditStats.operations == 1 ? "" : "s")")
+                            .font(.caption2).foregroundStyle(.secondary)
+                    }
+                    .padding(.trailing, 6)
+                }
+                .buttonStyle(.plain)
+                .help("Everything Mac Cleaner removed, from the history. Click to open it.")
+                .accessibilityLabel("Freed so far \(Fmt.bytes(model.auditStats.freedBytes)) in \(model.auditStats.operations) operations")
+                .accessibilityHint("Opens History")
+            }
             Button {
                 if model.isScanning { model.stopScanning() } else { model.scanAll() }
             } label: {
