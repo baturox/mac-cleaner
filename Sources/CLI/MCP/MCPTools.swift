@@ -190,7 +190,7 @@ final class MCPTools: @unchecked Sendable {
                     "before": Self.p("string", "ISO 8601 time; only operations that started before it (paging)."),
                     "client": Self.p("string", "Only app, cli or mcp.", extra: ["enum": ["app", "cli", "mcp"]]),
                     "include_items": Self.p("boolean", "Also list items (default false)."),
-                    "items_limit": Self.p("integer", "Items per operation when include_items (default 10, maximum 50).", extra: ["minimum": 1, "maximum": 50]),
+                    "items_limit": Self.p("integer", "Items per operation when include_items (default 10, maximum 25).", extra: ["minimum": 1, "maximum": 25]),
                  ]),
                  output: Self.out(["records": ["type": "array"], "next_before": ["type": ["string", "null"]], "skipped_unreadable_lines": ["type": "integer"]]),
                  readOnly: true, destructive: false, idempotent: true),
@@ -460,7 +460,7 @@ final class MCPTools: @unchecked Sendable {
         let a = try ToolArgs(raw, allowed: ["limit", "before", "client", "include_items", "items_limit"])
         let limit = try a.int("limit", default: 10, range: 1...25)
         let withItems = try a.bool("include_items", default: false)
-        let itemsLimit = try a.int("items_limit", default: 10, range: 1...50)
+        let itemsLimit = try a.int("items_limit", default: 10, range: 1...25)
         var before: Date?
         if let b = try a.string("before", max: 40) {
             guard let d = ISO8601DateFormatter().date(from: b) ?? fractionalISO(b) else { throw ToolError("'before' must be an ISO 8601 time like 2026-01-31T12:00:00Z.") }
