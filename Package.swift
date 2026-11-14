@@ -14,5 +14,6 @@ let package = Package(
         .executableTarget(name: "MacCleaner", dependencies: ["CleanerCore"], path: "Sources/MacCleaner"),
         .executableTarget(name: "CLI", dependencies: ["CleanerCore"], path: "Sources/CLI"),
         .testTarget(name: "CleanerCoreTests", dependencies: ["CleanerCore"], path: "Tests/CleanerCoreTests"),
+        .testTarget(name: "CLITests", dependencies: ["CLI", "CleanerCore"], path: "Tests/CLITests"),
     ]
 )
