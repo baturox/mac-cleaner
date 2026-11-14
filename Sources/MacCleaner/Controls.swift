@@ -99,10 +99,10 @@ struct Banner<Actions: View>: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text(title).font(.callout.weight(.semibold))
                 Text(message).font(.callout).foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+                    .lineLimit(3)
                 HStack { actions }.padding(.top, 4)
             }
-            Spacer(minLength: 8)
+            .frame(maxWidth: .infinity, alignment: .leading)
             if let onDismiss {
                 Button(action: onDismiss) { Image(systemName: "xmark") }
                     .buttonStyle(.borderless)
@@ -112,7 +112,7 @@ struct Banner<Actions: View>: View {
         }
         .padding(12)
         .background(tint.opacity(0.12))
-        .overlay(alignment: .bottom) { Divider() }
+        .overlay(alignment: .bottom) { Rectangle().fill(.separator).frame(height: 1) }
         .accessibilityElement(children: .contain)
     }
 }

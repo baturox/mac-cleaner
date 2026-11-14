@@ -226,6 +226,11 @@ struct ResultSheet: View {
             .contains { l.contains($0) }
     }
 
+    /// Failures first, then the remaining notes in their original order.
+    private func orderedMessages(_ lines: [String]) -> [String] {
+        lines.filter(isFailure) + lines.filter { !isFailure($0) }
+    }
+
     var body: some View {
         let r = summary.result
         VStack(alignment: .leading, spacing: 14) {
@@ -257,7 +262,7 @@ struct ResultSheet: View {
                     Text(r.failedCount > 0 ? "What went wrong" : "Details").font(.headline)
                     ScrollView {
                         VStack(alignment: .leading, spacing: 6) {
-                            ForEach(Array(r.messages.enumerated()), id: \.offset) { _, line in
+                            ForEach(Array(orderedMessages(r.messages).enumerated()), id: \.offset) { _, line in
                                 HStack(alignment: .firstTextBaseline, spacing: 6) {
                                     Image(systemName: isFailure(line) ? "exclamationmark.triangle.fill" : "info.circle")
                                         .foregroundStyle(isFailure(line) ? Color.orange : Color.secondary)

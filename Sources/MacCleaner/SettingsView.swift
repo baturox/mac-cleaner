@@ -15,6 +15,7 @@ struct SettingsView: View {
     @AppStorage(Prefs.Key.showMenuBar, store: Prefs.store) private var showMenuBar = true
     @AppStorage(Prefs.Key.notifications, store: Prefs.store) private var notifications = true
 
+    @State private var tab = Prefs.isMock ? (ProcessInfo.processInfo.environment["MACCLEANER_TAB"] ?? "general") : "general"
     @State private var selectedProtected: String?
     @State private var selectedRoot: String?
 
@@ -26,10 +27,10 @@ struct SettingsView: View {
     private var otherFingerprint: String { "\(deleteMode)|\(lowGB)|\(showMenuBar)|\(notifications)|\(idleDays)" }
 
     var body: some View {
-        TabView {
-            general.tabItem { Label("General", systemImage: "gearshape") }
-            protection.tabItem { Label("Protection", systemImage: "lock.shield") }
-            scanning.tabItem { Label("Scanning", systemImage: "magnifyingglass") }
+        TabView(selection: $tab) {
+            general.tabItem { Label("General", systemImage: "gearshape") }.tag("general")
+            protection.tabItem { Label("Protection", systemImage: "lock.shield") }.tag("protection")
+            scanning.tabItem { Label("Scanning", systemImage: "magnifyingglass") }.tag("scanning")
         }
         .frame(width: 560, height: 520)
         .onChange(of: scanFingerprint) { model.settingsDidChange(scanRelevant: true) }

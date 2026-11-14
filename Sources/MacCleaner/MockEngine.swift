@@ -356,10 +356,10 @@ final class MockEngine: CleanerEngine, @unchecked Sendable {
             var h: UInt64 = 1469598103934665603
             for b in id.utf8 { h = (h ^ UInt64(b)) &* 1099511628211 }
             let r = Double(h % 1000) / 1000
-            let overrides: [String: Double] = ["claude-sessions": 0.5, "derived-data": 0.42, "hf": 0.82, "ollama": 0.7,
+            let overrides: [String: Double] = ["claude-sessions": 0.55, "derived-data": 0.55, "hf": 0.9, "ollama": 0.85,
                                                "node-versions": 1.0, "cursor-workspaces": 0.7, "simulators": 1.0]
             if let o = overrides[id] { return o }
-            if id.hasSuffix("/rust-gateway/target") { return 0.3 }
+            if id.hasSuffix("/rust-gateway/target") { return 0.6 }
             if r < 0.22 { return 0.45 + r }        // grew a lot
             if r < 0.30 { return 1.18 }            // shrank (user cleaned something)
             return 1.0
