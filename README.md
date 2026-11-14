@@ -24,11 +24,13 @@
   </tr>
   <tr>
     <td><img src="docs/screenshots/repos.png" alt="Repos: every clone and worktree with its backup status"></td>
-    <td></td>
+    <td><img src="docs/screenshots/repos-remove-warning.png" alt="Removing a clone that is not backed up needs an explicit confirmation"></td>
   </tr>
 </table>
 
-Mac Cleaner is a free, open-source macOS app (with a command-line tool) that finds the disk space developers actually lose: build folders in dozens of projects, duplicate clones and worktrees left behind by coding agents, AI tool session data, model downloads, package-manager caches, simulators.
+Mac Cleaner is a free, open-source macOS app (with a command-line tool) that frees up the disk space developers actually lose: `node_modules` and Rust `target` folders in dozens of projects, duplicate git clones and worktrees left behind by coding agents, Claude Code / Cursor / Codex session data, Hugging Face and Ollama model downloads, npm / pnpm / uv / Homebrew caches, Xcode DerivedData and simulators, Docker images.
+
+If your Mac says the disk is full and "System Data" is enormous, this is the tool that tells you which folders it really is, and which of them are safe to delete.
 
 ## Why another cleaner?
 

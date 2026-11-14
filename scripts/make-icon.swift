@@ -56,49 +56,95 @@ func drawIcon(_ ctx: CGContext, small: Bool) {
 
     // Soft shadow under the body.
     ctx.saveGState()
-    ctx.setShadow(offset: CGSize(width: 0, height: -12), blur: 28, color: color(0x000000, 0.35))
+    ctx.setShadow(offset: CGSize(width: 0, height: -12), blur: 28, color: color(0x000000, 0.40))
     ctx.addPath(shape)
-    ctx.setFillColor(color(0x1B2766))
+    ctx.setFillColor(color(0x0C0E1D))
     ctx.fillPath()
     ctx.restoreGState()
 
-    // Body gradient.
+    // Body: deep ink gradient with a faint glow behind the artwork.
     ctx.saveGState()
     ctx.addPath(shape)
     ctx.clip()
     let gradient = CGGradient(colorsSpace: space,
-                              colors: [color(0x4466F0), color(0x1B2766)] as CFArray, locations: [0, 1])!
+                              colors: [color(0x2B3158), color(0x0C0E1D)] as CFArray, locations: [0, 1])!
     ctx.drawLinearGradient(gradient, start: CGPoint(x: 512, y: 924), end: CGPoint(x: 512, y: 100), options: [])
-    // Gentle highlight on the upper edge.
-    let gloss = CGGradient(colorsSpace: space,
-                           colors: [color(0xFFFFFF, 0.16), color(0xFFFFFF, 0)] as CFArray, locations: [0, 1])!
-    ctx.drawLinearGradient(gloss, start: CGPoint(x: 512, y: 924), end: CGPoint(x: 512, y: 640), options: [])
+    let glow = CGGradient(colorsSpace: space,
+                          colors: [color(0x35D6C3, 0.26), color(0x35D6C3, 0)] as CFArray, locations: [0, 1])!
+    ctx.drawRadialGradient(glow, startCenter: CGPoint(x: 512, y: 512), startRadius: 0,
+                           endCenter: CGPoint(x: 512, y: 512), endRadius: 400, options: [])
+    // Hairline highlight along the upper edge.
+    let edge = CGGradient(colorsSpace: space,
+                          colors: [color(0xFFFFFF, 0.22), color(0xFFFFFF, 0)] as CFArray, locations: [0, 1])!
+    ctx.addPath(shape)
+    ctx.setLineWidth(small ? 0 : 6)
+    ctx.replacePathWithStrokedPath()
+    ctx.clip()
+    ctx.drawLinearGradient(edge, start: CGPoint(x: 512, y: 924), end: CGPoint(x: 512, y: 560), options: [])
     ctx.restoreGState()
 
-    // Gauge ring.
+    // Storage gauge: a dim track with a gap at the bottom, and a bright arc for the space won back.
     let center = CGPoint(x: 512, y: 512)
-    let radius: CGFloat = 262
-    let width: CGFloat = small ? 118 : 100
-    arc(ctx, center: center, radius: radius, from: 0, to: 359.9, width: width, color: color(0xFFFFFF, 0.20))
-    arc(ctx, center: center, radius: radius, from: 0, to: 232, width: width, color: color(0xFFFFFF))        // used
-    arc(ctx, center: center, radius: radius, from: 262, to: 322, width: width, color: color(0x3DDC97))      // freed
+    let radius: CGFloat = 268
+    let width: CGFloat = small ? 96 : 62
+    let sweepStart: CGFloat = -138, sweepEnd: CGFloat = 138   // degrees clockwise from 12 o'clock
+    let fillEnd: CGFloat = 62
+    arc(ctx, center: center, radius: radius, from: sweepStart, to: sweepEnd, width: width, color: color(0xFFFFFF, 0.13))
 
-    // Terminal prompt ">_" in the middle (dropped at tiny sizes where it would only be noise).
-    if !small {
-        ctx.saveGState()
-        ctx.setStrokeColor(color(0xFFFFFF))
-        ctx.setLineWidth(40)
-        ctx.setLineCap(.round)
-        ctx.setLineJoin(.round)
-        ctx.move(to: CGPoint(x: 438, y: 594))
-        ctx.addLine(to: CGPoint(x: 520, y: 512))
-        ctx.addLine(to: CGPoint(x: 438, y: 430))
-        ctx.strokePath()
-        ctx.move(to: CGPoint(x: 548, y: 430))
-        ctx.addLine(to: CGPoint(x: 618, y: 430))
-        ctx.strokePath()
-        ctx.restoreGState()
+    let stops: [(CGFloat, (CGFloat, CGFloat, CGFloat))] = [
+        (0.0, (0.36, 0.96, 0.73)),   // mint
+        (0.55, (0.22, 0.78, 0.98)),  // sky
+        (1.0, (0.55, 0.52, 1.00)),   // violet
+    ]
+    func ramp(_ t: CGFloat) -> CGColor {
+        var lo = stops[0], hi = stops[stops.count - 1]
+        for i in 0..<(stops.count - 1) where t >= stops[i].0 && t <= stops[i + 1].0 { lo = stops[i]; hi = stops[i + 1] }
+        let f = hi.0 == lo.0 ? 0 : (t - lo.0) / (hi.0 - lo.0)
+        return CGColor(srgbRed: lo.1.0 + (hi.1.0 - lo.1.0) * f, green: lo.1.1 + (hi.1.1 - lo.1.1) * f,
+                       blue: lo.1.2 + (hi.1.2 - lo.1.2) * f, alpha: 1)
     }
+    let toRad = { (d: CGFloat) in (90 - d) * .pi / 180 }
+    let pieces = 240
+    ctx.saveGState()
+    ctx.setLineWidth(width)
+    ctx.setLineCap(.butt)
+    for i in 0..<pieces {
+        let t0 = CGFloat(i) / CGFloat(pieces), t1 = CGFloat(i + 1) / CGFloat(pieces)
+        let d0 = sweepStart + (fillEnd - sweepStart) * t0
+        let d1 = sweepStart + (fillEnd - sweepStart) * t1 + 0.4   // slight overlap hides seams
+        ctx.setStrokeColor(ramp(t0))
+        ctx.addArc(center: center, radius: radius, startAngle: toRad(d0), endAngle: toRad(d1), clockwise: true)
+        ctx.strokePath()
+    }
+    for (d, t) in [(sweepStart, CGFloat(0)), (fillEnd, CGFloat(1))] {   // round ends
+        let p = CGPoint(x: center.x + radius * cos(toRad(d)), y: center.y + radius * sin(toRad(d)))
+        ctx.setFillColor(ramp(t))
+        ctx.fillEllipse(in: CGRect(x: p.x - width / 2, y: p.y - width / 2, width: width, height: width))
+    }
+    ctx.restoreGState()
+
+    // Sparkle: "clean". One large four-point star, plus a small companion at larger sizes.
+    func sparkle(at c: CGPoint, radius r: CGFloat, pinch: CGFloat) -> CGPath {
+        let path = CGMutablePath()
+        let k = r * pinch
+        path.move(to: CGPoint(x: c.x, y: c.y + r))
+        path.addQuadCurve(to: CGPoint(x: c.x + r, y: c.y), control: CGPoint(x: c.x + k, y: c.y + k))
+        path.addQuadCurve(to: CGPoint(x: c.x, y: c.y - r), control: CGPoint(x: c.x + k, y: c.y - k))
+        path.addQuadCurve(to: CGPoint(x: c.x - r, y: c.y), control: CGPoint(x: c.x - k, y: c.y - k))
+        path.addQuadCurve(to: CGPoint(x: c.x, y: c.y + r), control: CGPoint(x: c.x - k, y: c.y + k))
+        path.closeSubpath()
+        return path
+    }
+    ctx.saveGState()
+    ctx.setShadow(offset: .zero, blur: 46, color: color(0x5CF5BA, 0.55))
+    ctx.setFillColor(color(0xFFFFFF))
+    ctx.addPath(sparkle(at: CGPoint(x: small ? 512 : 496, y: small ? 512 : 496), radius: small ? 170 : 150, pinch: 0.16))
+    ctx.fillPath()
+    if !small {
+        ctx.addPath(sparkle(at: CGPoint(x: 624, y: 632), radius: 54, pinch: 0.16))
+        ctx.fillPath()
+    }
+    ctx.restoreGState()
 }
 
 func render(pixels: Int) -> CGImage {
