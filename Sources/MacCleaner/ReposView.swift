@@ -71,7 +71,7 @@ struct ReposView: View {
         } else if model.stoppedSections.contains(.repos) {
             VStack {
                 EmptyStateView(title: "Scan stopped", message: "The scan was stopped before it finished.", symbol: "stop.circle")
-                Button("Scan again") { model.scanRepos() }.buttonStyle(.borderedProminent)
+                Button("Scan again") { model.scanRepos(fresh: true) }.buttonStyle(.borderedProminent)
             }
         } else if model.hasScannedRepos {
             EmptyStateView(title: "No repositories found",
@@ -114,7 +114,7 @@ struct ReposView: View {
                     Button("None") { model.selectedCloneIDs.removeAll() }.disabled(model.selectedCloneIDs.isEmpty)
                 }
                 .menuStyle(.borderlessButton).fixedSize()
-                Button { model.scanRepos() } label: { Image(systemName: "arrow.clockwise") }
+                Button { model.scanRepos(fresh: true) } label: { Image(systemName: "arrow.clockwise") }
                     .buttonStyle(.borderless).help("Rescan repositories")
                     .accessibilityLabel("Rescan repositories")
                     .disabled(model.isScanningRepos)

@@ -445,14 +445,33 @@ final class AppModel {
             await engine.configure(Prefs.engineSettings)
             recheckFullDiskAccess()
             refreshAuditStats()
-            scanAll()
+            if isMock {
+                scanAll()
+            } else {
+                // Walking the home folder for build folders and repositories is the heavy part: it starts when
+                // one of those screens is opened (or a rescan is pressed), not at launch.
+                refreshDisk()
+                scanCategories()
+                sectionOpened()
+            }
         }
     }
 
+    /// Starts the scan of the screen that was just opened, once. A later refresh button rescans.
+    func sectionOpened() {
+        switch section {
+        case .projects: if !hasScannedProjects && !isScanningProjects && !stoppedSections.contains(.projects) { scanProjects() }
+        case .repos: if !hasScannedRepos && !isScanningRepos && !stoppedSections.contains(.repos) { scanRepos() }
+        default: break
+        }
+    }
+
+    /// Every scan, from scratch: the folder walk kept by the engine is dropped first.
     func scanAll() {
         guard !isBusy, !isScanning else { return }
         resultsStale = false
         refreshDisk()
+        engine.discardScanCache()
         let c = scanCategories()
         let p = scanProjects()
         scanRepos()
@@ -503,9 +522,12 @@ final class AppModel {
         return task
     }
 
+    /// `fresh`: a rescan the user asked for; the engine's kept walk is dropped first. The first scan of a
+    /// screen may reuse a walk another screen just made.
     @discardableResult
-    func scanProjects() -> Task<Bool, Never> {
+    func scanProjects(fresh: Bool = false) -> Task<Bool, Never> {
         if isScanningProjects, let t = projectsTask { return t }
+        if fresh { engine.discardScanCache() }
         isScanningProjects = true
         stoppedSections.remove(.projects)
         projectProgress = "Starting…"
@@ -533,8 +555,9 @@ final class AppModel {
     }
 
     @discardableResult
-    func scanRepos() -> Task<Bool, Never> {
+    func scanRepos(fresh: Bool = false) -> Task<Bool, Never> {
         if isScanningRepos, let t = reposTask { return t }
+        if fresh { engine.discardScanCache() }
         isScanningRepos = true
         stoppedSections.remove(.repos)
         repoProgress = "Starting…"

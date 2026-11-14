@@ -60,7 +60,10 @@ struct ContentView: View {
                 ResultSheet(summary: summary) { model.sheet = nil }
             }
         }
-        .onChange(of: model.section) { Prefs.store.set(model.section.rawValue, forKey: Prefs.Key.lastSection) }
+        .onChange(of: model.section) {
+            Prefs.store.set(model.section.rawValue, forKey: Prefs.Key.lastSection)
+            model.sectionOpened()
+        }
         .onChange(of: columns) { Prefs.store.set(columns != .detailOnly, forKey: Prefs.Key.sidebarVisible) }
         .task {
             model.startIfNeeded()

@@ -135,7 +135,7 @@ struct ProjectsView: View {
         } else if model.stoppedSections.contains(.projects) {
             VStack {
                 EmptyStateView(title: "Scan stopped", message: "The scan was stopped before it finished.", symbol: "stop.circle")
-                Button("Scan again") { model.scanProjects() }.buttonStyle(.borderedProminent)
+                Button("Scan again") { model.scanProjects(fresh: true) }.buttonStyle(.borderedProminent)
             }
         } else if model.hasScannedProjects {
             EmptyStateView(title: "Nothing to reclaim here",
@@ -144,7 +144,7 @@ struct ProjectsView: View {
         } else {
             VStack {
                 EmptyStateView(title: "Nothing scanned yet", message: "Scan to find node_modules, target, .next and other rebuildable folders.", symbol: "magnifyingglass")
-                Button("Scan") { model.scanAll() }.buttonStyle(.borderedProminent)
+                Button("Scan") { model.scanProjects() }.buttonStyle(.borderedProminent)
             }
         }
     }
