@@ -15,7 +15,11 @@ struct SettingsView: View {
     @AppStorage(Prefs.Key.showMenuBar, store: Prefs.store) private var showMenuBar = true
     @AppStorage(Prefs.Key.notifications, store: Prefs.store) private var notifications = true
 
+    #if DEBUG
     @State private var tab = Prefs.isMock ? (ProcessInfo.processInfo.environment["MACCLEANER_TAB"] ?? "general") : "general"
+    #else
+    @State private var tab = "general"
+    #endif
     @State private var selectedProtected: String?
     @State private var selectedRoot: String?
 
@@ -83,7 +87,7 @@ struct SettingsView: View {
     private var protection: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text("Protected folders").font(.headline)
-            Text("These folders, and everything below them, are never listed, measured or deleted.")
+            Text("These folders, and everything below them, are never listed, measured or deleted. The `mac-cleaner` command line tool obeys the same list.")
                 .font(.callout).foregroundStyle(.secondary)
             pathList(paths: protectedPaths, selection: $selectedProtected,
                      empty: "No protected folders. Add the ones you never want touched.")

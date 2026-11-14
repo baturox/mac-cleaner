@@ -60,14 +60,19 @@ struct MacCleanerApp: App {
     @AppStorage(Prefs.Key.showMenuBar, store: Prefs.store) private var showMenuBar = true
 
     init() {
+        #if DEBUG
         let mock = Prefs.isMock
         let engine: any CleanerEngine = mock ? MockEngine() : LiveEngine()
         let m = AppModel(engine: engine, isMock: mock)
-        // Screenshot hooks (only meaningful with the mock).
+        // Screenshot hooks (only with the mock engine, only in debug builds).
         let env = ProcessInfo.processInfo.environment
         if mock, let raw = env["MACCLEANER_SECTION"], let s = AppSection(rawValue: raw) { m.section = s }
         if mock, env["MACCLEANER_APPEARANCE"] == "light" { NSApplication.shared.appearance = NSAppearance(named: .aqua) }
         if mock, env["MACCLEANER_APPEARANCE"] == "dark" { NSApplication.shared.appearance = NSAppearance(named: .darkAqua) }
+        #else
+        // Release builds: always the real engine, and no environment variable changes the app's behavior.
+        let m = AppModel(engine: LiveEngine(), isMock: false)
+        #endif
         _model = State(initialValue: m)
     }
 

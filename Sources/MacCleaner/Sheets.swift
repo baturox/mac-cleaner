@@ -18,6 +18,10 @@ struct ConfirmDeleteSheet: View {
             let noun = "working cop\(n == 1 ? "y" : "ies")"
             return trash ? "Move \(n) \(noun) to the Trash?" : "Remove \(n) \(noun) permanently?"
         }
+        if case .categories = plan.source {
+            let noun = "categor\(n == 1 ? "y" : "ies")"
+            return trash ? "Move \(n) \(noun) to the Trash?" : "Delete \(n) \(noun) permanently?"
+        }
         let noun = "item\(n == 1 ? "" : "s")"
         return trash ? "Move \(n) \(noun) to the Trash?" : "Delete \(n) \(noun) permanently?"
     }
@@ -44,6 +48,10 @@ struct ConfirmDeleteSheet: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(title).font(.title3.weight(.semibold))
                     Text(subtitle).font(.callout).foregroundStyle(.secondary)
+                    // The rows below can stand for many things each; say how many in total, up front.
+                    if let scope = plan.scopeLine {
+                        Text(scope).font(.callout.weight(.medium)).fixedSize(horizontal: false, vertical: true).padding(.top, 2)
+                    }
                 }
                 Spacer()
                 VStack(alignment: .trailing, spacing: 0) {

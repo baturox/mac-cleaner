@@ -64,7 +64,9 @@ struct ContentView: View {
         .onChange(of: columns) { Prefs.store.set(columns != .detailOnly, forKey: Prefs.Key.sidebarVisible) }
         .task {
             model.startIfNeeded()
+            #if DEBUG
             if model.isMock { await runMockHooks() }
+            #endif
         }
     }
 
@@ -122,8 +124,9 @@ struct ContentView: View {
         }
     }
 
-    // MARK: Screenshot hooks (mock engine only)
+    // MARK: Screenshot hooks (mock engine only, debug builds only)
 
+    #if DEBUG
     private func runMockHooks() async {
         let env = ProcessInfo.processInfo.environment
         guard let step = env["MACCLEANER_SHEET"] ?? env["MACCLEANER_ACTION"] else { return }
@@ -178,6 +181,7 @@ struct ContentView: View {
         default: break
         }
     }
+    #endif
 }
 
 /// Gives the main window a frame autosave name so size and position survive relaunches.

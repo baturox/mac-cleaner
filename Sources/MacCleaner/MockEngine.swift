@@ -1,3 +1,6 @@
+// Fake data for screenshots and UI work. Debug builds only: a release build contains neither this engine
+// nor the MACCLEANER_* environment hooks that drive it.
+#if DEBUG
 import Foundation
 import CleanerCore
 
@@ -287,10 +290,13 @@ final class MockEngine: CleanerEngine, @unchecked Sendable {
 
     private func repoList() -> [RepoGroup] {
         func clone(_ rel: String, branch: String?, worktree: Bool = false, uncommitted: Int = 0, unpushed: Int? = 0,
-                   stash: Bool = false, commit: Int, idle: Int, gb: Double, rebuildable: Double) -> RepoClone {
-            RepoClone(url: url(rel), branch: branch, isLinkedWorktree: worktree, uncommittedCount: uncommitted,
-                      unpushedCount: unpushed, hasStash: stash, lastCommit: daysAgo(commit), idleDays: idle,
-                      sizeBytes: Int64(gb * Double(GB)), artifactBytes: Int64(rebuildable * Double(GB)))
+                   stash: Bool = false, commit: Int, idle: Int, gb: Double, rebuildable: Double,
+                   ignored: Int = 0, untrusted: [String]? = nil) -> RepoClone {
+            RepoClone(url: url(rel), branch: untrusted == nil ? branch : nil, isLinkedWorktree: worktree, uncommittedCount: uncommitted,
+                      unpushedCount: untrusted == nil ? unpushed : nil, hasStash: stash,
+                      lastCommit: untrusted == nil ? daysAgo(commit) : nil, idleDays: idle,
+                      sizeBytes: Int64(gb * Double(GB)), artifactBytes: Int64(rebuildable * Double(GB)),
+                      ignoredFileCount: ignored, untrustedConfigKeys: untrusted)
         }
         func group(_ name: String, _ remote: String?, _ clones: [RepoClone]) -> RepoGroup {
             RepoGroup(id: remote ?? url(name).path, name: name, remote: remote, clones: clones.sorted { $0.sizeBytes > $1.sizeBytes })
@@ -312,7 +318,7 @@ final class MockEngine: CleanerEngine, @unchecked Sendable {
             ]),
             group("acme/design-system", "github.com/acme/design-system", [
                 clone("Developer/acme/design-system", branch: "main", commit: 14, idle: 14, gb: 1.4, rebuildable: 0.9),
-                clone("Documents/uni/design-system", branch: "main", commit: 280, idle: 280, gb: 1.3, rebuildable: 0.9),
+                clone("Documents/uni/design-system", branch: "main", commit: 280, idle: 280, gb: 1.3, rebuildable: 0.9, ignored: 2),
             ]),
             group("acme/mobile-app", "github.com/acme/mobile-app", [
                 clone("Developer/ios-playground", branch: "main", commit: 93, idle: 93, gb: 4.4, rebuildable: 3.8),
@@ -326,6 +332,10 @@ final class MockEngine: CleanerEngine, @unchecked Sendable {
             ]),
             group("rust-gateway", nil, [
                 clone("Developer/rust-gateway", branch: "main", uncommitted: 2, unpushed: nil, commit: 0, idle: 0, gb: 34.6, rebuildable: 33.8),
+            ]),
+            group("unpacked-sample", nil, [
+                clone("Downloads/unpacked-sample", branch: nil, commit: 0, idle: 3, gb: 0.4, rebuildable: 0,
+                      untrusted: ["core.fsmonitor", "filter.*.clean"]),
             ]),
             group("acme/docs-site", "github.com/acme/docs-site", [
                 clone("Desktop/Personal/blog", branch: "main", commit: 58, idle: 58, gb: 1.1, rebuildable: 1.0),
@@ -485,6 +495,11 @@ final class MockEngine: CleanerEngine, @unchecked Sendable {
         for c in clones {
             progress("Removing \(c.url.abbreviatedPath)…")
             await sleep(0.5)
+            if !c.wasInspected {
+                failed += 1
+                messages.append("Kept \(c.url.abbreviatedPath): its git configuration could run programs, so it was not inspected.")
+                continue
+            }
             if !c.isFullyBackedUp && !force {
                 failed += 1
                 messages.append("Refused to remove \(c.url.abbreviatedPath): it has work that is not backed up.")
@@ -502,3 +517,4 @@ final class MockEngine: CleanerEngine, @unchecked Sendable {
         return CleanResult(freedBytes: freed, failedCount: failed, messages: messages)
     }
 }
+#endif

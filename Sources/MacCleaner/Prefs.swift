@@ -3,10 +3,16 @@ import CleanerCore
 
 /// All persisted preferences. Views bind to these keys with `@AppStorage(..., store: Prefs.store)`;
 /// non-view code reads them through the typed accessors below.
-/// With the mock engine the preferences live in a throw-away suite that is reset on every launch,
-/// so screenshots are deterministic and the developer's real settings are never touched.
+/// With the mock engine (debug builds only) the preferences live in a throw-away suite that is reset on
+/// every launch, so screenshots are deterministic and the developer's real settings are never touched.
 enum Prefs {
+    #if DEBUG
+    /// `MACCLEANER_MOCK=1 swift run MacCleaner`. The mock engine and every `MACCLEANER_*` hook are compiled
+    /// out of release builds: an environment variable must not be able to change what a shipped app does.
     static let isMock = ProcessInfo.processInfo.environment["MACCLEANER_MOCK"] == "1"
+    #else
+    static let isMock = false
+    #endif
     private static let mockSuite = "MacCleaner.mock"
 
     static let store: UserDefaults = {
@@ -93,5 +99,29 @@ enum Prefs {
 
     static var engineSettings: EngineSettings {
         EngineSettings(protectedPaths: protectedPaths, sessionRetentionDays: sessionRetentionDays)
+    }
+
+    // MARK: Settings shared with the command line tool
+
+    /// Brings the app and `~/Library/Application Support/MacCleaner/settings.json` in line at launch.
+    /// A readable file wins (it is what the CLI has been obeying); a missing or unreadable one is rewritten
+    /// from the app's own preferences.
+    static func syncSharedSettings() {
+        guard !isMock else { return }
+        let shared = SettingsStore.standard
+        if case .loaded(let s) = shared.load() {
+            if s != engineSettings {
+                store.set(encodeList(s.protectedPaths), forKey: Key.protectedPaths)
+                store.set(s.sessionRetentionDays, forKey: Key.sessionRetentionDays)
+            }
+        } else {
+            shared.save(engineSettings)
+        }
+    }
+
+    /// Called whenever a setting changes, so the CLI sees the same protected folders and retention.
+    static func saveSharedSettings() {
+        guard !isMock else { return }
+        SettingsStore.standard.save(engineSettings)
     }
 }

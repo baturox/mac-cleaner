@@ -67,7 +67,8 @@ struct DeletionPlan: Identifiable {
         case categories([CleanCategory])
         case projects([URL])
         case explorer([URL])
-        case clones([RepoClone], force: Bool)
+        /// `forced` are the copies whose loss the user acknowledged; `force` is passed for those only.
+        case clones(unforced: [RepoClone], forced: [RepoClone])
     }
     let id = UUID()
     var source: Source
@@ -81,6 +82,11 @@ struct DeletionPlan: Identifiable {
     /// When set, the confirm button stays disabled until the user types exactly this.
     var confirmPhrase: String?
     var hasCommands = false
+    /// Everything that will be acted on, including what the list below does not show one by one
+    /// (a category row stands for all of its items).
+    var totalItemCount = 0
+    /// One line under the title that states the full scope, e.g. "1,284 files and folders in 12 categories".
+    var scopeLine: String?
 
     var isExplorer: Bool {
         if case .explorer = source { return true }
@@ -325,14 +331,18 @@ final class AppModel {
 
     // MARK: Repo selection
 
-    func isCloneSelectable(_ c: RepoClone) -> Bool { c.isFullyBackedUp || allowedCloneIDs.contains(c.id) }
+    /// A copy that was not inspected (untrusted git configuration) can never be selected: nobody knows what
+    /// it holds, and the engine refuses to remove it.
+    func isCloneSelectable(_ c: RepoClone) -> Bool {
+        c.wasInspected && (c.isFullyBackedUp || allowedCloneIDs.contains(c.id))
+    }
 
     func setClone(_ c: RepoClone, selected: Bool) {
         if selected, isCloneSelectable(c) { selectedCloneIDs.insert(c.id) } else { selectedCloneIDs.remove(c.id) }
     }
 
     func setAllowed(_ c: RepoClone, allowed: Bool) {
-        if allowed { allowedCloneIDs.insert(c.id) } else {
+        if allowed && c.wasInspected { allowedCloneIDs.insert(c.id) } else {
             allowedCloneIDs.remove(c.id)
             selectedCloneIDs.remove(c.id)
         }
@@ -398,6 +408,7 @@ final class AppModel {
 
     func settingsDidChange(scanRelevant: Bool) {
         let engine = self.engine
+        Prefs.saveSharedSettings()
         Task {
             await engine.configure(Prefs.engineSettings)
             if scanRelevant && hasAnyScan { resultsStale = true }
@@ -411,6 +422,7 @@ final class AppModel {
         guard !started else { return }
         started = true
         let engine = self.engine
+        Prefs.syncSharedSettings()
         Task {
             await engine.configure(Prefs.engineSettings)
             recheckFullDiskAccess()
@@ -592,10 +604,15 @@ final class AppModel {
                                  sizeIsUpperBound: c.sizeIsUpperBound, children: children(of: c))
         }
         let hasCommands = cats.contains { !$0.commands.isEmpty || $0.items.contains { $0.deleteCommand != nil } }
+        let itemCount = cats.reduce(0) { $0 + $1.items.count }
+        let commandCount = cats.reduce(0) { $0 + $1.commands.count }
+        var scope = "\(itemCount.formatted()) file\(itemCount == 1 ? "" : "s") and folder\(itemCount == 1 ? "" : "s") in \(cats.count) categor\(cats.count == 1 ? "y" : "ies")"
+        if commandCount > 0 { scope += ", plus \(commandCount) cleanup command\(commandCount == 1 ? "" : "s")" }
+        scope += ". Open a row to see what is in it."
         return DeletionPlan(source: .categories(cats), mode: Prefs.deleteMode, entries: entries,
                             expectedBytes: cats.reduce(0) { $0 + exact($1) },
                             cautionNames: cats.filter { $0.level == .caution }.map(\.name),
-                            hasCommands: hasCommands)
+                            hasCommands: hasCommands, totalItemCount: itemCount + commandCount, scopeLine: scope)
     }
 
     func requestCleanSafe() {
@@ -617,7 +634,7 @@ final class AppModel {
                           subtitle: $0.url.abbreviatedPath, symbol: "hammer", size: $0.sizeBytes)
         }
         sheet = .confirm(DeletionPlan(source: .projects(items.map(\.url)), mode: Prefs.deleteMode, entries: entries,
-                                      expectedBytes: items.reduce(0) { $0 + $1.sizeBytes }))
+                                      expectedBytes: items.reduce(0) { $0 + $1.sizeBytes }, totalItemCount: items.count))
     }
 
     func requestDeleteExplorer(_ items: [FolderEntry]) {
@@ -627,13 +644,18 @@ final class AppModel {
                           symbol: $0.isDirectory ? "folder" : "doc", size: $0.sizeBytes)
         }
         sheet = .confirm(DeletionPlan(source: .explorer(items.map(\.url)), mode: Prefs.deleteMode, entries: entries,
-                                      expectedBytes: items.reduce(0) { $0 + $1.sizeBytes }))
+                                      expectedBytes: items.reduce(0) { $0 + $1.sizeBytes }, totalItemCount: items.count))
     }
 
-    func requestRemoveClones(_ clones: [RepoClone]) {
+    func requestRemoveClones(_ requested: [RepoClone]) {
+        // Copies that were not inspected are never part of a removal.
+        let clones = requested.filter(\.wasInspected)
         guard !clones.isEmpty, !isBusy else { return }
         let ids = Set(clones.map(\.id))
-        let risky = clones.filter { !$0.isFullyBackedUp }
+        // Force is passed ONLY for copies whose "Allow removal" switch the user turned on. A copy that looked
+        // backed up at scan time goes through the engine's own re-check and is refused if that changed.
+        let removal = RepoRemovalPlan(clones: clones, acknowledged: allowedCloneIDs)
+        let risky = removal.forced
         var warnings: [String] = []
 
         for g in repoGroups where g.clones.count > 0 && Set(g.clones.map(\.id)).isSubset(of: ids) {
@@ -647,10 +669,16 @@ final class AppModel {
         let losses = risky.map { c -> LossLine in
             var d: [String] = []
             if c.uncommittedCount > 0 { d.append("\(c.uncommittedCount) uncommitted file\(c.uncommittedCount == 1 ? "" : "s")") }
+            let detachedWorktree = c.isLinkedWorktree && c.branch == nil
             if let u = c.unpushedCount {
-                if u > 0 { d.append("\(u) unpushed commit\(u == 1 ? "" : "s")") }
+                if u > 0 && (!c.isLinkedWorktree || detachedWorktree) { d.append("\(u) unpushed commit\(u == 1 ? "" : "s")") }
             } else if !c.isLinkedWorktree {
-                d.append("no remote: its commits exist only here")
+                d.append("no network remote: its commits exist only here")
+            } else if detachedWorktree {
+                d.append("a detached HEAD whose commits no remote has")
+            }
+            if c.ignoredFileCount > 0 {
+                d.append("\(c.ignoredFileCount) ignored file\(c.ignoredFileCount == 1 ? "" : "s") that exist only here (such as .env)")
             }
             if c.hasStash { d.append("stashed changes") }
             if d.isEmpty { d.append("work that is not backed up") }
@@ -670,9 +698,9 @@ final class AppModel {
             return DeletionEntry(name: c.url.lastPathComponent, subtitle: sub,
                                  symbol: c.isLinkedWorktree ? "square.stack.3d.up" : "folder", size: c.sizeBytes)
         }
-        sheet = .confirm(DeletionPlan(source: .clones(clones, force: !risky.isEmpty), mode: Prefs.deleteMode, entries: entries,
-                                      expectedBytes: clones.reduce(0) { $0 + $1.sizeBytes },
-                                      warnings: warnings, losses: losses, confirmPhrase: phrase))
+        sheet = .confirm(DeletionPlan(source: .clones(unforced: removal.unforced, forced: removal.forced), mode: Prefs.deleteMode,
+                                      entries: entries, expectedBytes: clones.reduce(0) { $0 + $1.sizeBytes },
+                                      warnings: warnings, losses: losses, confirmPhrase: phrase, totalItemCount: clones.count))
     }
 
     // MARK: Executing
@@ -683,18 +711,57 @@ final class AppModel {
         let relay = ProgressRelay { [weak self] in self?.cleanProgress = $0 }
         let engine = self.engine
         let mode = plan.mode
+        let mock = isMock
         Task {
-            let result: CleanResult
+            var result: CleanResult
             switch plan.source {
             case .categories(let cats):
+                // Category items are re-checked by the engine itself: it refuses any path that is no longer
+                // reached without a symlink and never follows one while deleting.
                 result = await engine.clean(categories: cats, mode: mode, progress: relay.handler)
             case .projects(let urls), .explorer(let urls):
-                result = await engine.delete(urls: urls, mode: mode, progress: relay.handler)
-            case .clones(let clones, let force):
-                result = await engine.removeClones(clones, force: force, mode: mode, progress: relay.handler)
+                let checked = mock ? (urls, []) : await Task.detached { Self.revalidate(urls) }.value
+                result = await engine.delete(urls: checked.0, mode: mode, progress: relay.handler)
+                result.failedCount += checked.1.count
+                result.messages = checked.1 + result.messages
+            case .clones(let unforced, let forced):
+                // Two calls: `force` covers a whole call, so it must never ride along with unacknowledged copies.
+                let checked = mock ? (unforced.map(\.url), []) : await Task.detached { Self.revalidate(unforced.map(\.url)) }.value
+                let stillThere = Set(checked.0.map(\.path))
+                result = await engine.removeClones(unforced.filter { stillThere.contains($0.url.path) }, force: false, mode: mode,
+                                                   progress: relay.handler)
+                result.failedCount += checked.1.count
+                result.messages = checked.1 + result.messages
+                if !forced.isEmpty {
+                    let r = await engine.removeClones(forced, force: true, mode: mode, progress: relay.handler)
+                    result.freedBytes += r.freedBytes
+                    result.failedCount += r.failedCount
+                    result.messages += r.messages
+                }
             }
             finish(plan, result)
         }
+    }
+
+    /// Right before deleting: is each thing still what the scan saw? A folder that has become a symlink or
+    /// a file (or the other way round) is skipped and reported instead of being acted on. Things that are
+    /// simply gone pass through; the engine ignores them.
+    nonisolated private static func revalidate(_ urls: [URL]) -> ([URL], [String]) {
+        var keep: [URL] = [], skipped: [String] = []
+        for url in urls {
+            var st = stat()
+            if lstat(url.path, &st) != 0 { keep.append(url); continue }
+            let kind = st.st_mode & S_IFMT
+            let name = url.lastPathComponent
+            if url.hasDirectoryPath && kind != S_IFDIR {
+                skipped.append("Skipped \(name): it was a folder when scanned and is now \(kind == S_IFLNK ? "a symbolic link" : "a file"). Scan again.")
+            } else if !url.hasDirectoryPath && kind == S_IFDIR {
+                skipped.append("Skipped \(name): it was a file when scanned and is now a folder. Scan again.")
+            } else {
+                keep.append(url)
+            }
+        }
+        return (keep, skipped)
     }
 
     private func finish(_ plan: DeletionPlan, _ result: CleanResult) {
@@ -711,7 +778,8 @@ final class AppModel {
         case .explorer(let urls):
             explore.didDelete(urls)
             pruneProjects(removed: urls, onlyIfGone: false)
-        case .clones(let clones, _):
+        case .clones(let unforced, let forced):
+            let clones = unforced + forced
             let gone = clones.filter { isMock || !FileManager.default.fileExists(atPath: $0.url.path) }
             let paths = Set(gone.map(\.id))
             repoGroups = repoGroups.compactMap { g in

@@ -183,7 +183,8 @@ struct ReposView: View {
             Toggle("", isOn: Binding(get: { selected }, set: { model.setClone(c, selected: $0) }))
                 .toggleStyle(.checkbox).labelsHidden().disabled(!selectable)
                 .accessibilityLabel("Select \(c.url.lastPathComponent)")
-                .accessibilityHint(selectable ? "" : "Turn on Allow removal first, this copy has unsaved work")
+                .accessibilityHint(selectable ? "" : (c.wasInspected ? "Turn on Allow removal first, this copy has unsaved work"
+                                                                    : "This copy was not inspected and cannot be removed here"))
                 .padding(.top, 2)
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 0) {
@@ -192,7 +193,7 @@ struct ReposView: View {
                 }
                 .lineLimit(1).truncationMode(.middle)
                 HStack(spacing: 5) {
-                    Chip(text: c.branch ?? "detached", tone: .neutral, symbol: "arrow.triangle.branch")
+                    if c.wasInspected { Chip(text: c.branch ?? "detached", tone: .neutral, symbol: "arrow.triangle.branch") }
                     if c.isLinkedWorktree { Chip(text: "worktree", tone: .info, symbol: "square.stack.3d.up") }
                     statusChips(c)
                 }
@@ -200,7 +201,11 @@ struct ReposView: View {
             .accessibilityElement(children: .combine)
             .accessibilityLabel(summary(c))
             Spacer(minLength: 8)
-            if !c.isFullyBackedUp {
+            if !c.wasInspected {
+                Text("Not removable here")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .help("Its git configuration could run programs (\((c.untrustedConfigKeys ?? []).joined(separator: ", "))), so Mac Cleaner did not run git in it and cannot tell what it holds. Review the folder and delete it yourself if you want it gone.")
+            } else if !c.isFullyBackedUp {
                 Toggle("Allow removal", isOn: Binding(get: { model.allowedCloneIDs.contains(c.id) },
                                                       set: { model.setAllowed(c, allowed: $0) }))
                     .toggleStyle(.checkbox).controlSize(.small)
@@ -212,7 +217,7 @@ struct ReposView: View {
                 if c.artifactBytes > 0 {
                     Text("\(Fmt.bytes(c.artifactBytes)) rebuildable").font(.caption).foregroundStyle(.secondary).monospacedDigit()
                 }
-                Text("commit \(Fmt.ago(c.lastCommit)) · idle \(Fmt.idle(c.idleDays))")
+                Text(c.wasInspected ? "commit \(Fmt.ago(c.lastCommit)) · idle \(Fmt.idle(c.idleDays))" : "idle \(Fmt.idle(c.idleDays))")
                     .font(.caption).foregroundStyle(.secondary).monospacedDigit()
             }
             .frame(minWidth: 130, alignment: .trailing)
@@ -228,25 +233,36 @@ struct ReposView: View {
     }
 
     @ViewBuilder private func statusChips(_ c: RepoClone) -> some View {
-        if c.isFullyBackedUp {
-            Chip(text: "clean & pushed", tone: .good, symbol: "checkmark.circle.fill")
+        if !c.wasInspected {
+            Chip(text: "untrusted git config — not inspected", tone: .bad, symbol: "exclamationmark.shield.fill")
+        } else if c.isFullyBackedUp {
+            Chip(text: c.unpushedCount == 0 ? "clean & pushed" : "clean", tone: .good, symbol: "checkmark.circle.fill")
         } else {
+            let detachedWorktree = c.isLinkedWorktree && c.branch == nil
             if c.uncommittedCount > 0 { Chip(text: "\(c.uncommittedCount) uncommitted", tone: .bad, symbol: "pencil.circle.fill") }
             if c.unpushedCount == nil {
-                Chip(text: "no remote", tone: .warn, symbol: "icloud.slash")
-            } else if let n = c.unpushedCount, n > 0, !c.isLinkedWorktree {
+                if !c.isLinkedWorktree || detachedWorktree { Chip(text: "no remote", tone: .warn, symbol: "icloud.slash") }
+            } else if let n = c.unpushedCount, n > 0, !c.isLinkedWorktree || detachedWorktree {
                 Chip(text: "\(n) unpushed", tone: .warn, symbol: "arrow.up.circle.fill")
+            }
+            if c.ignoredFileCount > 0 {
+                Chip(text: "\(c.ignoredFileCount) ignored-only file\(c.ignoredFileCount == 1 ? "" : "s")", tone: .warn, symbol: "eye.slash.fill")
+                    .help("Files git ignores that are not build output (.env, local databases, editor settings). They exist only in this copy and would be lost with it.")
             }
             if c.hasStash { Chip(text: "stash", tone: .warn, symbol: "tray.full.fill") }
         }
     }
 
     private func summary(_ c: RepoClone) -> String {
-        var parts = [c.url.lastPathComponent, c.branch ?? "detached head"]
+        var parts = [c.url.lastPathComponent]
+        if c.wasInspected { parts.append(c.branch ?? "detached head") }
         if c.isLinkedWorktree { parts.append("linked worktree") }
-        if c.isFullyBackedUp {
+        if !c.wasInspected {
+            parts.append("untrusted git configuration, not inspected")
+        } else if c.isFullyBackedUp {
             parts.append("clean and pushed")
         } else {
+            if c.ignoredFileCount > 0 { parts.append("\(c.ignoredFileCount) ignored files that exist only here") }
             if c.uncommittedCount > 0 { parts.append("\(c.uncommittedCount) uncommitted files") }
             if c.unpushedCount == nil { parts.append("no remote") }
             else if let n = c.unpushedCount, n > 0, !c.isLinkedWorktree { parts.append("\(n) unpushed commits") }
