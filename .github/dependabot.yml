@@ -1,3 +1,5 @@
+# Workflows pin actions to full commit SHAs with the version in a trailing comment
+# (`uses: actions/checkout@<sha> # v7.0.1`). Dependabot understands that form and updates both.
 version: 2
 updates:
   - package-ecosystem: github-actions

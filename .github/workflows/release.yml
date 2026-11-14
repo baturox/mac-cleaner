@@ -24,9 +24,19 @@ jobs:
       HAS_CERT: ${{ secrets.MACOS_CERTIFICATE_P12 != '' && secrets.MACOS_CERTIFICATE_PASSWORD != '' && secrets.MACOS_CODESIGN_IDENTITY != '' }}
       HAS_NOTARY: ${{ secrets.NOTARY_KEY_P8 != '' && secrets.NOTARY_KEY_ID != '' && secrets.NOTARY_ISSUER_ID != '' }}
     steps:
-      - uses: actions/checkout@v7
+      # Pinned to a full commit SHA (the tag is in the comment; Dependabot updates both).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+
+      - name: Verify the tag points at a commit on main
+        run: |
+          # A tag can be pushed for any commit. Only what has been merged into main may be released.
+          git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main; then
+            echo "::error::$GITHUB_REF_NAME ($GITHUB_SHA) is not an ancestor of origin/main. Merge first, then tag the merged commit."
+            exit 1
+          fi
 
       - name: Verify the tag matches VERSION
         run: |
@@ -55,10 +65,18 @@ jobs:
           MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
           MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
           MACOS_CODESIGN_IDENTITY: ${{ secrets.MACOS_CODESIGN_IDENTITY }}
+        # About the passwords on command lines below: `security` only accepts them as arguments (-p / -P);
+        # it has no option to read them from stdin or a file. They are therefore visible in the process list
+        # of this single-use runner for the fraction of a second each command runs. They are never echoed
+        # (no `set -x`; GitHub masks secret values in logs), the keychain password is random and used once,
+        # and the keychain and every key file are deleted by the "Remove signing material" step below, which
+        # runs even when the job fails.
         run: |
+          set +x
+          umask 077
           KEYCHAIN="$RUNNER_TEMP/release.keychain-db"
           KEYCHAIN_PASSWORD="$(uuidgen)"
-          echo "$MACOS_CERTIFICATE_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          printf '%s' "$MACOS_CERTIFICATE_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
           security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
           security set-keychain-settings -lut 21600 "$KEYCHAIN"
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
@@ -75,6 +93,7 @@ jobs:
           KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
           ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
         run: |
+          umask 077
           printf '%s' "$NOTARY_KEY_P8" > "$RUNNER_TEMP/AuthKey.p8"
           chmod 600 "$RUNNER_TEMP/AuthKey.p8"
           echo "NOTARY_KEY_PATH=$RUNNER_TEMP/AuthKey.p8" >> "$GITHUB_ENV"
@@ -117,3 +136,13 @@ jobs:
             "dist/MacCleaner-$VERSION.zip" \
             "dist/mac-cleaner-$VERSION-macos-universal.tar.gz" \
             "dist/SHA256SUMS"
+
+      # Always, also after a failed or cancelled job: nothing that can sign or notarize stays on the runner.
+      - name: Remove signing material
+        if: always()
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/release.keychain-db"
+          if [ -f "$KEYCHAIN" ]; then
+            security delete-keychain "$KEYCHAIN" || rm -f "$KEYCHAIN"
+          fi
+          rm -f "$RUNNER_TEMP/cert.p12" "$RUNNER_TEMP/AuthKey.p8"

@@ -3,7 +3,9 @@
 #
 # Usage: scripts/install-cli.sh [--copy] [--prefix DIR] [--from FILE] [--uninstall]
 #
-#   --copy        copy the binary instead of symlinking it
+#   --copy        copy the binary instead of symlinking it (always done when installing as root or into a
+#                 folder you do not own: a root-owned link to a file you can rewrite would let anything
+#                 running as you replace a program that others, or sudo, later run)
 #   --prefix DIR  install into DIR (default: /usr/local/bin if writable, else ~/.local/bin)
 #   --from FILE   the binary to install (default: the one inside an installed or freshly built app,
 #                 or .build/release/mac-cleaner)
@@ -51,11 +53,37 @@ fi
 }
 
 mkdir -p "$PREFIX"
+
+# Who are we, and whose folder is this?
+AS_ROOT=0
+[ "$(id -u)" = 0 ] && AS_ROOT=1
+PREFIX_OWNER="$(stat -f %u "$PREFIX")"
+if [ "$AS_ROOT" = 1 ] || [ "$PREFIX_OWNER" != "$(id -u)" ]; then
+  if [ "$MODE" = link ]; then
+    echo "Installing into a folder owned by another account (or as root): copying instead of linking."
+  fi
+  MODE=copy
+fi
+
 rm -f "$TARGET"
-if [ "$MODE" = copy ]; then cp "$FROM" "$TARGET"; else ln -s "$FROM" "$TARGET"; fi
+if [ "$MODE" = copy ]; then
+  if [ "$AS_ROOT" = 1 ]; then
+    # A regular root-owned file that only root can change. `install` copies the bytes; it does not run them.
+    install -m 0755 -o root -g wheel "$FROM" "$TARGET"
+  else
+    install -m 0755 "$FROM" "$TARGET"
+  fi
+else
+  ln -s "$FROM" "$TARGET"
+fi
 echo "Installed $TARGET ($MODE of $FROM)"
 case ":$PATH:" in
   *":$PREFIX:"*) ;;
   *) echo "Note: $PREFIX is not on your PATH. Add this to your shell profile:  export PATH=\"$PREFIX:\$PATH\"" ;;
 esac
-"$TARGET" --version
+if [ "$AS_ROOT" = 1 ]; then
+  # Never run the freshly installed program as root: it came from a location a normal account may control.
+  echo "Not running it as root. Check it yourself with:  mac-cleaner --version"
+else
+  "$TARGET" --version
+fi
