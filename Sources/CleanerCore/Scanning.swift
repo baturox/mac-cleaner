@@ -90,6 +90,7 @@ enum GenericScanner {
                     var st = stat()
                     guard lstat(p, &st) == 0 else { continue }
                     if Double(st.st_mtimespec.tv_sec) > cutoff { continue }
+                    if def.deepAge && hasActivity(since: Date(timeIntervalSince1970: cutoff), at: p) { continue }
                 }
                 if seen.insert(p).inserted { out.append(p) }
             }

@@ -64,18 +64,16 @@ enum ClaudeScanner {
 
     /// Project folder name from the working directory recorded in a transcript, else the encoded folder name.
     static func projectLabel(dir: String, dirName: String, entries: [DirEntry], home: String) -> String {
-        for e in entries where !e.isDir && e.name.hasSuffix(".jsonl") {
-            if let h = FileHandle(forReadingAtPath: dir + "/" + e.name) {
-                defer { try? h.close() }
-                if let data = try? h.read(upToCount: 64 * 1024),
-                   let text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1),
-                   let r = text.range(of: #""cwd":"([^"]+)""#, options: .regularExpression) {
-                    let cwd = text[r].dropFirst(7).dropLast()
-                    let base = (String(cwd) as NSString).lastPathComponent
-                    if !base.isEmpty { return base }
-                }
+        for e in entries.filter({ !$0.isDir && $0.name.hasSuffix(".jsonl") }).prefix(5) {
+            guard let h = FileHandle(forReadingAtPath: dir + "/" + e.name) else { continue }
+            defer { try? h.close() }
+            if let data = try? h.read(upToCount: 64 * 1024),
+               let text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1),
+               let r = text.range(of: #""cwd":"([^"]+)""#, options: .regularExpression) {
+                let cwd = text[r].dropFirst(7).dropLast()
+                let base = (String(cwd) as NSString).lastPathComponent
+                if !base.isEmpty { return base }
             }
-            break
         }
         let prefix = home.replacingOccurrences(of: "/", with: "-") + "-"
         return dirName.hasPrefix(prefix) ? String(dirName.dropFirst(prefix.count)) : dirName

@@ -291,3 +291,24 @@ func modificationDate(_ path: String) -> Date? {
     guard lstat(path, &st) == 0 else { return nil }
     return Date(timeIntervalSince1970: TimeInterval(st.st_mtimespec.tv_sec) + TimeInterval(st.st_mtimespec.tv_nsec) / 1e9)
 }
+
+/// True if anything at or below `path` (to a bounded number of entries, symlinks not followed) changed
+/// after `cutoff`. Used so that a folder that looks old by its own timestamp but is still being written to
+/// further down is not treated as idle.
+func hasActivity(since cutoff: Date, at path: String, maxEntries: Int = 50_000) -> Bool {
+    var stack = [path]
+    var seen = 0
+    while let p = stack.popLast() {
+        var st = stat()
+        guard lstat(p, &st) == 0 else { continue }
+        let m = Date(timeIntervalSince1970: TimeInterval(st.st_mtimespec.tv_sec))
+        if m > cutoff { return true }
+        guard (st.st_mode & S_IFMT) == S_IFDIR, let kids = readDir(p) else { continue }
+        for k in kids {
+            seen += 1
+            if seen > maxEntries { return false }
+            stack.append(p + "/" + k.name)
+        }
+    }
+    return false
+}

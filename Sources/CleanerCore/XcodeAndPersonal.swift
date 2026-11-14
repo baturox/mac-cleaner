@@ -203,7 +203,7 @@ enum ContainerScanner {
         guard let value = Double(number) else { return 0 }
         let unit = head.dropFirst(number.count).lowercased()
         let mult: Double = ["b": 1, "kb": 1e3, "mb": 1e6, "gb": 1e9, "tb": 1e12, "pb": 1e15][unit] ?? 1
-        return Int64(value * mult)
+        return Int64((value * mult).rounded())
     }
 
     struct Row: Equatable { var type: String; var reclaimable: Int64; var total: Int64 }

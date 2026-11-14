@@ -13,6 +13,8 @@ struct CatDef {
     /// Also require items to be older than `EngineSettings.sessionRetentionDays`.
     var useRetention = false
     var minAgeDays: Int = 0
+    /// Judge age by the newest change anywhere inside each item, not by the item's own timestamp.
+    var deepAge = false
     var globs: [String] = []
     /// fnmatch patterns on the last path component; matching items are dropped.
     var exclude: [String] = []
@@ -159,7 +161,7 @@ func makeCategoryDefs(env: EngineEnvironment) -> [CatDef] {
                level: .caution, symbol: "sparkles", group: .aiTools, useRetention: true,
                globs: ["~/.claude/todos/*", "~/.claude/file-history/*", "~/.claude/session-env/*"]),
         CatDef(id: "claude-scratch", name: "Claude Code scratch folders", detail: "Temporary working folders of finished Claude Code runs, untouched for a day",
-               level: .safe, symbol: "sparkles", group: .aiTools, minAgeDays: 1, globs: [env.privateTmp + "/claude-*/*"]),
+               level: .safe, symbol: "sparkles", group: .aiTools, minAgeDays: 1, deepAge: true, globs: [env.privateTmp + "/claude-*/*"]),
         CatDef(id: "claude-desktop-caches", name: "Claude desktop app caches", detail: "Web caches of the Claude app; rebuilt automatically",
                level: .safe, symbol: "bubble.left.and.bubble.right", group: .aiTools,
                globs: ["Cache", "Code Cache", "GPUCache", "DawnCache", "DawnGraphiteCache", "DawnWebGPUCache", "Crashpad/completed",
@@ -176,14 +178,14 @@ func makeCategoryDefs(env: EngineEnvironment) -> [CatDef] {
                level: .safe, symbol: "terminal", group: .aiTools, minAgeDays: 1,
                globs: ["~/.codex/shell_snapshots/*", "~/.codex/models_cache.json"]),
         CatDef(id: "gemini-history", name: "Gemini CLI & Antigravity history", detail: "Chats, checkpoints and agent artifacts older than the retention period",
-               level: .caution, symbol: "terminal", group: .aiTools, useRetention: true,
+               level: .caution, symbol: "terminal", group: .aiTools, useRetention: true, deepAge: true,
                globs: ["~/.gemini/tmp/*", "~/.gemini/history/*", "~/.gemini/antigravity/conversations/*",
                        "~/.gemini/antigravity/brain/*", "~/.gemini/antigravity/code_tracker/*"]),
         CatDef(id: "copilot-history", name: "GitHub Copilot CLI sessions & logs", detail: "Session state and logs older than the retention period",
-               level: .caution, symbol: "terminal", group: .aiTools, useRetention: true,
+               level: .caution, symbol: "terminal", group: .aiTools, useRetention: true, deepAge: true,
                globs: ["~/.copilot/logs/*", "~/.copilot/session-state/*"]),
         CatDef(id: "continue-history", name: "Continue sessions & logs", detail: "Chat sessions and logs older than the retention period",
-               level: .caution, symbol: "terminal", group: .aiTools, useRetention: true,
+               level: .caution, symbol: "terminal", group: .aiTools, useRetention: true, deepAge: true,
                globs: ["~/.continue/sessions/*", "~/.continue/logs/*", "~/.continue/dev_data/*"]),
         CatDef(id: "continue-index", name: "Continue codebase index", detail: "Search index of your code; rebuilt when Continue re-indexes",
                level: .safe, symbol: "terminal", group: .aiTools, globs: ["~/.continue/index/*"]),

@@ -204,9 +204,10 @@ enum GitArtifactFilter {
         var i = 0
         while i < rels.count {
             let chunk = Array(rels[i..<min(i + 100, rels.count)]); i += 100
-            let r = await runGit(repo, ["check-ignore", "-z", "--"] + chunk.map { $0 + "/" }, timeout: 30)
+            let r = await runGit(repo, ["-c", "core.quotePath=false", "check-ignore", "--"] + chunk.map { $0 + "/" }, timeout: 30)
             guard r.launched, !r.timedOut, r.status == 0 || r.status == 1 else { continue }
-            for p in r.stdout.split(separator: "\0") {
+            // Paths with quotes or control characters come back C-quoted and will not match: fail closed.
+            for p in r.stdout.split(whereSeparator: \.isNewline) {
                 var s = String(p)
                 if s.hasSuffix("/") { s.removeLast() }
                 out.insert(s)
