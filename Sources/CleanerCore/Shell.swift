@@ -183,15 +183,33 @@ func runCommand(_ argv: [String], timeout: TimeInterval = 120) async -> ProcResu
 
 // MARK: - du
 
+/// Counting semaphore for async code; bounds how many `du` processes run at once across all scanners.
+actor AsyncSemaphore {
+    private var available: Int
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+    init(_ count: Int) { available = count }
+    func acquire() async {
+        if available > 0 { available -= 1; return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+    func release() {
+        if waiters.isEmpty { available += 1 } else { waiters.removeFirst().resume() }
+    }
+}
+
+private let duLimiter = AsyncSemaphore(6)
+
 /// On-disk sizes in bytes (like `du -skx`), per path. Missing/unreadable paths are absent from the result.
 func duSizes(_ paths: [String]) async -> [String: Int64] {
     var result: [String: Int64] = [:]
     var i = 0
     while i < paths.count {
         if Task.isCancelled { break }
-        let batch = Array(paths[i..<min(i + 200, paths.count)])
-        i += 200
+        let batch = Array(paths[i..<min(i + 100, paths.count)])
+        i += 100
+        await duLimiter.acquire()
         let r = await runProcess("/usr/bin/du", ["-skx", "--"] + batch, timeout: 900)
+        await duLimiter.release()
         for line in r.stdout.split(separator: "\n") {
             guard let tab = line.firstIndex(of: "\t"), let kb = Int64(line[line.startIndex..<tab]) else { continue }
             result[String(line[line.index(after: tab)...])] = kb * 1024
@@ -238,9 +256,9 @@ func globPaths(_ pattern: String) -> [String] {
 }
 
 /// Glob that expands "~" and includes dotfiles for a trailing "/*".
-func expandPattern(_ pattern: String) -> [String] {
+func expandPattern(_ pattern: String, home: String = NSHomeDirectory()) -> [String] {
     var p = pattern
-    if p.hasPrefix("~/") { p = NSHomeDirectory() + p.dropFirst(1) }
+    if p.hasPrefix("~/") { p = home + p.dropFirst(1) }
     if p.hasSuffix("/*") {
         var out: [String] = []
         for parent in globPaths(String(p.dropLast(2))) {
@@ -255,4 +273,21 @@ func realPath(_ path: String) -> String? {
     guard let r = realpath(path, nil) else { return nil }
     defer { free(r) }
     return String(cString: r)
+}
+
+// MARK: - git
+
+/// Runs git against one working copy: no optional locks, no prompts, bounded time.
+func runGit(_ repo: String, _ args: [String], timeout: TimeInterval = 30) async -> ProcResult {
+    guard let exe = ToolPaths.which("git") else {
+        return ProcResult(status: 127, stdout: "", stderr: "git not found", timedOut: false, launched: false)
+    }
+    return await runProcess(exe, ["--no-optional-locks", "-C", repo] + args, timeout: timeout)
+}
+
+/// Modification time of a path without following symlinks.
+func modificationDate(_ path: String) -> Date? {
+    var st = stat()
+    guard lstat(path, &st) == 0 else { return nil }
+    return Date(timeIntervalSince1970: TimeInterval(st.st_mtimespec.tv_sec) + TimeInterval(st.st_mtimespec.tv_nsec) / 1e9)
 }

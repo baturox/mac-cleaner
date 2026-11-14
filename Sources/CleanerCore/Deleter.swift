@@ -1,39 +1,63 @@
-// Strict, symlink-safe permanent deletion.
+// Strict, symlink-safe deletion (permanent or to the Trash).
 import Foundation
 
-enum Deleter {
-    /// A path may be deleted only if, with its PARENT resolved, it lies >= 2 components below the real home,
-    /// >= 2 below the per-user temp root, or directly inside /private/tmp. The final component is never resolved.
-    static func isAllowed(_ path: String) -> Bool {
+struct Deleter: Sendable {
+    let env: EngineEnvironment
+    let guardian: PathGuard
+
+    /// A path may be removed only if, with its PARENT resolved, it lies >= 2 components below the real home,
+    /// >= 2 below the per-user temp root, directly inside /private/tmp, inside a Claude scratch folder
+    /// (/private/tmp/claude-*/…) or is Bazel's per-user output root. The final component is never resolved.
+    /// Protected paths (built-in and user-configured) are always refused.
+    func isAllowed(_ path: String) -> Bool {
         guard path.hasPrefix("/") else { return false }
         let comps = path.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
         guard let last = comps.last, last != ".", last != "..", !comps.contains(".."), !comps.contains(".") else { return false }
         let parent = "/" + comps.dropLast().joined(separator: "/")
         guard let realParent = realPath(parent) else { return false }
         let full = (realParent == "/" ? "" : realParent) + "/" + last
+        guard inAllowedArea(full, realParent: realParent) else { return false }
+        return !guardian.blocks(full)
+    }
 
-        var roots = [Roots.home]
-        if let v = Roots.varFolders { roots.append(v) }
+    private func inAllowedArea(_ full: String, realParent: String) -> Bool {
+        var roots = [env.home]
+        if let v = env.varFolders { roots.append(v) }
         for root in roots where full.hasPrefix(root + "/") {
             let rel = full.dropFirst(root.count + 1)
             return rel.split(separator: "/").count >= 2
         }
-        return realParent == "/private/tmp"
+        if realParent == env.privateTmp { return true }
+        let scratch = env.privateTmp + "/claude-"
+        if full.hasPrefix(scratch) && full.count > scratch.count && full.dropFirst(env.privateTmp.count + 1).contains("/") {
+            return true
+        }
+        if let bazel = env.bazelRoot, full == bazel || full.hasPrefix(bazel + "/") { return true }
+        return false
     }
 
-    /// Deletes `paths`. Returns (failed entry count, messages). Blocking; call off the main thread.
-    static func remove(_ paths: [String], progress: ProgressHandler? = nil) -> (failed: Int, messages: [String]) {
+    /// Removes `paths`. Returns (failed entry count, messages). Blocking; call off the main thread.
+    /// Items in the Trash are always removed permanently, whatever the mode.
+    func remove(_ paths: [String], mode: DeleteMode = .permanent) -> (failed: Int, messages: [String]) {
         var failed = 0
         var messages: [String] = []
+        let trashDir = env.home + "/.Trash/"
         for path in paths {
             guard isAllowed(path) else {
                 failed += 1
-                messages.append("Refused (outside the allowed area): \(path)")
+                messages.append("Refused (outside the allowed area or protected): \(path)")
                 continue
             }
             var st = stat()
             if lstat(path, &st) != 0 {
                 if errno != ENOENT { failed += 1; messages.append("Could not access \(path)") }
+                continue
+            }
+            if mode == .trash && !path.hasPrefix(trashDir) {
+                do { try env.trash(URL(fileURLWithPath: path)) } catch {
+                    failed += 1
+                    messages.append("Could not move \((path as NSString).lastPathComponent) to the Trash")
+                }
                 continue
             }
             let parent = (path as NSString).deletingLastPathComponent
@@ -47,7 +71,7 @@ enum Deleter {
         return (failed, messages)
     }
 
-    private static func removeTree(_ path: String, parent: String, rootDev: dev_t, failed: inout Int) {
+    private func removeTree(_ path: String, parent: String, rootDev: dev_t, failed: inout Int) {
         var st = stat()
         if lstat(path, &st) != 0 {
             if errno != ENOENT { failed += 1 }
