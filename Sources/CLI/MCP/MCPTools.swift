@@ -141,7 +141,8 @@ final class MCPTools: @unchecked Sendable {
         "offset": p("integer", "Items to skip (default 0).", extra: ["minimum": 0]),
     ]
 
-    private static func out(_ extra: [String: JSONValue]) -> JSONValue { schema(extra) }
+    /// Output schemas describe the main properties only; results may carry more, so they stay open.
+    private static func out(_ props: [String: JSONValue]) -> JSONValue { ["type": "object", "properties": .object(props)] }
 
     func definitions() -> [JSONValue] {
         let n = Self.untrusted
@@ -182,7 +183,7 @@ final class MCPTools: @unchecked Sendable {
                  readOnly: true, destructive: false, idempotent: true),
             tool("growth_report", "Growth report", "Scan, then save a size snapshot in Mac Cleaner's own history file (this is the only thing it writes) and report what grew since the previous snapshot taken at least an hour earlier. Can take a while." + n,
                  input: Self.schema([:]),
-                 output: Self.out(["previous_snapshot": ["type": ["string", "null"]], "free_bytes_change": ["type": "integer"], "entries": ["type": "array"]]),
+                 output: Self.out(["previous_snapshot": ["anyOf": [["type": "string"], ["type": "null"]]], "free_bytes_change": ["type": "integer"], "entries": ["type": "array"]]),
                  readOnly: false, destructive: false, idempotent: false),
             tool("audit_history", "Audit history", "What Mac Cleaner deleted (by the app, the CLI or this server): newest operations first, paged. Read-only." + n,
                  input: Self.schema([
@@ -192,7 +193,7 @@ final class MCPTools: @unchecked Sendable {
                     "include_items": Self.p("boolean", "Also list items (default false)."),
                     "items_limit": Self.p("integer", "Items per operation when include_items (default 10, maximum 25).", extra: ["minimum": 1, "maximum": 25]),
                  ]),
-                 output: Self.out(["records": ["type": "array"], "next_before": ["type": ["string", "null"]], "skipped_unreadable_lines": ["type": "integer"]]),
+                 output: Self.out(["records": ["type": "array"], "next_before": ["anyOf": [["type": "string"], ["type": "null"]]], "skipped_unreadable_lines": ["type": "integer"]]),
                  readOnly: true, destructive: false, idempotent: true),
         ]
         if cleanupListed {

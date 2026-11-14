@@ -101,6 +101,7 @@ final class MCPProtocolTests: XCTestCase {
             XCTAssertEqual(t["inputSchema"]?["type"]?.string, "object")
             XCTAssertEqual(t["outputSchema"]?["type"]?.string, "object")
             XCTAssertEqual(t["inputSchema"]?["additionalProperties"]?.bool, false)
+            XCTAssertNil(t["outputSchema"]?["additionalProperties"], "\(name): results may carry more than the schema lists (clients validate them)")
             XCTAssertTrue((t["description"]?.string ?? "").count > 20)
         }
         func ann(_ n: String, _ k: String) -> Bool? { tools.first { $0["name"]?.string == n }?["annotations"]?[k]?.bool }
