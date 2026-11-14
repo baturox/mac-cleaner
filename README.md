@@ -93,7 +93,11 @@ You are free to read the source and [build it yourself](#build-from-source) inst
 
 ### Homebrew
 
-A Homebrew cask template is in [`packaging/homebrew/`](packaging/homebrew/mac-cleaner.rb), but **there is no tap yet**, so `brew install` does not work today. Once a tap (`baturox/homebrew-tap`) is published this section will say so.
+```sh
+brew install --cask baturox/tap/mac-cleaner
+```
+
+This installs the app into `/Applications` and links the `mac-cleaner` command, from the tap [`baturox/homebrew-tap`](https://github.com/baturox/homebrew-tap). The cask pins the SHA-256 of the release DMG. Because the release is not notarized, macOS blocks both the app and the `mac-cleaner` command until you allow them; see [First launch](#first-launch-the-app-is-not-notarized) above. The cask's source template is in [`packaging/homebrew/`](packaging/homebrew/mac-cleaner.rb).
 
 ### Build from source
 
