@@ -12,3 +12,6 @@ __pycache__/
 
 *.iconset/
 *.middleman.*
+
+# Browser automation scratch
+.playwright-mcp/
