@@ -9,14 +9,14 @@ final class ScanTests: EngineTestCase {
         try f.file("cache/.hidden/a")
         try f.file("cache/visible/b")
         try f.file("cache/.dotfile")
-        let names = Set(expandPattern("~/cache/*", home: f.home).map { ($0 as NSString).lastPathComponent })
+        let names = Set(f.env.expandPattern("~/cache/*").map { ($0 as NSString).lastPathComponent })
         XCTAssertEqual(names, [".hidden", "visible", ".dotfile"])
     }
 
     func testExpandPatternExpandsTildeAgainstInjectedHome() throws {
         let f = try Fixture()
         try f.file("a1/x"); try f.file("a2/x"); try f.file("b/x")
-        let hits = expandPattern("~/a*", home: f.home).sorted()
+        let hits = f.env.expandPattern("~/a*").sorted()
         XCTAssertEqual(hits, [f.path("a1"), f.path("a2")])
     }
 
@@ -143,7 +143,10 @@ final class ScanTests: EngineTestCase {
         try workspace(f, "unmounted", "{\"folder\":\"file:///Volumes/DefinitelyNotMounted-\(UUID().uuidString)/proj\"}")
         try workspace(f, "nojson", nil)
         try workspace(f, "garbage", "not json")
-        let orphans = IDEScanner.orphanedWorkspaces(storageDir: f.path("storage"))
+        try f.dir("mounted-elsewhere")
+        try workspace(f, "volumes-root", "{\"folder\":\"file:///Volumes/proj\"}")
+        try workspace(f, "otherhost", "{\"folder\":\"file://fileserver/share/proj\"}")
+        let orphans = IDEScanner.orphanedWorkspaces(storageDir: f.path("storage"), home: f.home)
         XCTAssertEqual(Set(orphans.map { ($0.path as NSString).lastPathComponent }), ["gone", "gonews"])
         XCTAssertEqual(orphans.first { $0.path.hasSuffix("/gone") }?.folderName, "deleted project")
     }
@@ -185,7 +188,7 @@ final class ScanTests: EngineTestCase {
         try f.file(".cursor/extensions/a.b-2.0.0/f", bytes: 2 << 20)
         let cats = await IDEScanner.scan(f.context())
         let byId = Dictionary(uniqueKeysWithValues: cats.map { ($0.id, $0) })
-        XCTAssertEqual(byId["ide-stale-workspaces"]?.level, .safe)
+        XCTAssertEqual(byId["ide-stale-workspaces"]?.level, .caution, "holds editor chat history, which is not regenerable")
         XCTAssertEqual(byId["ide-stale-workspaces"]?.items.first?.label, "Cursor · gone-project")
         XCTAssertEqual(byId["ide-caches"]?.items.count, 1)
         XCTAssertEqual(byId["ide-history"]?.level, .caution)
@@ -215,7 +218,8 @@ final class ScanTests: EngineTestCase {
         XCTAssertEqual(hf.level, .caution)
         XCTAssertEqual(hf.group, .models)
         XCTAssertTrue(hf.itemsSelectable)
-        XCTAssertEqual(ModelsScanner.huggingFaceHub(f.env), hub)
+        XCTAssertEqual(ModelsScanner.huggingFaceHub(f.env), ModelsScanner.Location(path: hub, variable: "HF_HUB_CACHE"))
+        XCTAssertTrue(hf.detail.contains("HF_HUB_CACHE"), "the category says which variable named the folder")
     }
 
     func testOllamaManifestParsing() throws {
@@ -242,22 +246,27 @@ final class ScanTests: EngineTestCase {
     }
 
     func testOllamaCategoryUsesDeleteCommandsWhenInstalled() async throws {
-        let f = try Fixture()
-        try f.file(".ollama/models/blobs/sha256-aaa", bytes: 3 << 20)
-        try f.file(".ollama/models/manifests/registry.ollama.ai/library/tiny/latest",
-                   "{\"config\":{\"digest\":\"sha256:aaa\"},\"layers\":[]}")
-        let cats = await ModelsScanner.scan(f.context())
-        let ollama = try XCTUnwrap(cats.first { $0.id == "ollama-models" })
-        if ToolPaths.which("ollama") != nil {
-            XCTAssertEqual(ollama.items.first?.deleteCommand, ["ollama", "rm", "tiny:latest"])
-            XCTAssertEqual(ollama.items.first?.label, "tiny:latest")
-            XCTAssertTrue(CommandPolicy.isAllowed(ollama.items[0].deleteCommand!))
-        } else {
-            XCTAssertNil(ollama.items.first?.deleteCommand, "without ollama the whole models folder is the single item")
-            XCTAssertEqual(ollama.items.count, 1)
-            XCTAssertEqual(ollama.items.first?.url.path, f.path(".ollama/models"))
+        // Both situations are tested with a fake tool box, whatever is installed on this machine.
+        for installed in [true, false] {
+            let tools = FakeTools(installed: installed ? ["ollama"] : [])
+            let f = try Fixture(tools: tools.box)
+            try f.file(".ollama/models/blobs/sha256-aaa", bytes: 3 << 20)
+            try f.file(".ollama/models/manifests/registry.ollama.ai/library/tiny/latest",
+                       "{\"config\":{\"digest\":\"sha256:aaa\"},\"layers\":[]}")
+            let cats = await ModelsScanner.scan(f.context())
+            let ollama = try XCTUnwrap(cats.first { $0.id == "ollama-models" })
+            if installed {
+                XCTAssertEqual(ollama.items.first?.deleteCommand, ["ollama", "rm", "tiny:latest"])
+                XCTAssertEqual(ollama.items.first?.label, "tiny:latest")
+                XCTAssertTrue(CommandPolicy.isAllowed(ollama.items[0].deleteCommand!))
+            } else {
+                XCTAssertNil(ollama.items.first?.deleteCommand, "without ollama the whole models folder is the single item")
+                XCTAssertEqual(ollama.items.count, 1)
+                XCTAssertEqual(ollama.items.first?.url.path, f.path(".ollama/models"))
+            }
+            XCTAssertEqual(ollama.level, .caution)
+            XCTAssertTrue(tools.calls.isEmpty, "scanning must not run ollama")
         }
-        XCTAssertEqual(ollama.level, .caution)
     }
 
     // MARK: Toolchains
@@ -327,7 +336,9 @@ final class ScanTests: EngineTestCase {
         XCTAssertEqual(r[0].bytes, 8381044573)
         XCTAssertEqual(r[0].identifier, "AAA")
         XCTAssertNotNil(r[0].lastUsed)
-        XCTAssertTrue(CommandPolicy.isAllowed(["xcrun", "simctl", "runtime", "delete", r[0].identifier]))
+        XCTAssertFalse(CommandPolicy.isAllowed(["xcrun", "simctl", "runtime", "delete", r[0].identifier]),
+                       "an identifier that is not a UUID never becomes a command")
+        XCTAssertTrue(CommandPolicy.isAllowed(["xcrun", "simctl", "runtime", "delete", "0B9D0AA4-1C2D-4E5F-8A9B-0C1D2E3F4A5B"]))
     }
 
     func testSimulatorDevicesSkipBootedOnes() throws {
@@ -338,12 +349,13 @@ final class ScanTests: EngineTestCase {
             let plist: [String: Any] = ["UDID": udid, "name": name, "state": state, "runtime": "com.apple.CoreSimulator.SimRuntime.iOS-18-4"]
             try (plist as NSDictionary).write(to: URL(fileURLWithPath: dir + "/device.plist"))
         }
-        try device("AAAA", name: "iPhone 16", state: 1)
-        try device("BBBB", name: "iPad Pro", state: 3)
+        let a = "11111111-2222-3333-4444-555555555555", b = "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"
+        try device(a, name: "iPhone 16", state: 1)
+        try device(b, name: "iPad Pro", state: 3)
         let devices = XcodeScanner.simulatorDevices(devicesDir: f.path("Library/Developer/CoreSimulator/Devices"))
         let shutdown = devices.filter { $0.state == 1 }
         XCTAssertEqual(shutdown.map(\.label), ["iPhone 16 — iOS 18.4"])
-        XCTAssertEqual(devices.first { $0.udid == "BBBB" }?.state, 3, "the booted device is parsed so the scanner can skip it")
+        XCTAssertEqual(devices.first { $0.udid == b }?.state, 3, "the booted device is parsed so the scanner can skip it")
     }
 
     func testDockerParsing() {

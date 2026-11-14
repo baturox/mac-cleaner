@@ -19,8 +19,10 @@ enum ArtifactRules {
 
     static let all: [ArtifactRule] = [
         ArtifactRule(names: ["node_modules"]),
+        // `.wrangler` is deliberately absent: its `state` folder is the local development database
+        // (D1/KV/R2 data), which is not rebuilt by anything.
         ArtifactRule(names: [".next", ".nuxt", ".turbo", ".svelte-kit", ".parcel-cache", ".expo", ".output", ".vite", ".angular",
-                             ".astro", ".wrangler", ".vercel", ".open-next", "storybook-static", ".docusaurus", ".nx", ".serverless"],
+                             ".astro", ".vercel", ".open-next", "storybook-static", ".docusaurus", ".nx", ".serverless"],
                      markers: packageJSON),
         ArtifactRule(names: ["dist"], markers: ["package.json", "pyproject.toml", "setup.py"], risky: true),
         ArtifactRule(names: ["out", "coverage"], markers: packageJSON, risky: true),
@@ -32,7 +34,8 @@ enum ArtifactRules {
         ArtifactRule(names: [".dart_tool"], markers: ["pubspec.yaml"]),
         ArtifactRule(names: [".build"], markers: ["Package.swift"]),
         ArtifactRule(names: ["DerivedData"], markers: ["*.xcodeproj", "*.xcworkspace"]),
-        ArtifactRule(names: [".terraform"], markers: ["*.tf"]),
+        // Holds the selected workspace and, with a local backend, can sit next to state: only when git ignores it.
+        ArtifactRule(names: [".terraform"], markers: ["*.tf"], risky: true),
         ArtifactRule(names: ["zig-cache", ".zig-cache", "zig-out"], markers: ["build.zig"]),
         ArtifactRule(names: ["_build"], markers: ["mix.exs"]),
         ArtifactRule(names: ["deps"], markers: ["mix.exs"], risky: true),
@@ -48,6 +51,12 @@ enum ArtifactRules {
     ]
 
     static let venvNames: Set<String> = [".venv", "venv", "env"]
+
+    /// The folder name alone is one of the rebuildable kinds (no marker check). Only meaningful for folders
+    /// git already ignores, where it tells build output from data such as `.env`.
+    static func isArtifactName(_ name: String) -> Bool {
+        all.contains { $0.names.contains(name) || ($0.prefix.map { name.hasPrefix($0) } ?? false) }
+    }
 
     private static func hasMarker(_ markers: [String], siblings: Set<String>) -> Bool {
         if markers.isEmpty { return true }
@@ -125,7 +134,7 @@ enum ProjectWalker {
                 }
                 if e.name.hasPrefix(".") { continue }
                 if dir == home && skipTop.contains(e.name) { continue }
-                if guardian.isProtected(path) { continue }
+                if guardian.isProtected(path, checkAncestors: false) { continue }
                 descend.append((path, repo))
             }
             stack += descend
@@ -154,8 +163,9 @@ enum ProjectWalker {
 
 enum GitArtifactFilter {
     /// Drops candidates that contain git-tracked files and, for risky names, those that are not ignored by git
-    /// or not inside a git repository at all. If git cannot answer, the candidate is dropped.
-    static func filter(_ candidates: [ArtifactCandidate]) async -> [ArtifactCandidate] {
+    /// or not inside a git repository at all. If git cannot answer, or the repository's configuration is not
+    /// trusted (git is then not run in it at all), the candidate is dropped.
+    static func filter(_ candidates: [ArtifactCandidate], env: EngineEnvironment) async -> [ArtifactCandidate] {
         var byRepo: [String: [ArtifactCandidate]] = [:]
         var keep: [ArtifactCandidate] = []
         for c in candidates {
@@ -164,12 +174,13 @@ enum GitArtifactFilter {
         }
         let grouped = byRepo
         let repos = Array(grouped.keys)
-        let results = await boundedMap(repos, limit: 6) { repo -> [ArtifactCandidate] in
-            let cands = grouped[repo] ?? []
-            let rels = cands.map { relative($0.path, to: repo) }
-            guard let tracked = await trackedPaths(repo: repo, rels: rels) else { return [] }
+        let results = await boundedMap(repos, limit: 6) { root -> [ArtifactCandidate] in
+            let cands = grouped[root] ?? []
+            guard case .trusted(let repo) = await Git.open(root, env: env) else { return [] }
+            let rels = cands.map { relative($0.path, to: root) }
+            guard let tracked = await trackedPaths(repo: repo, rels: rels, env: env) else { return [] }
             let riskyRels = zip(cands, rels).filter { $0.0.risky }.map { $0.1 }
-            let ignored = riskyRels.isEmpty ? Set<String>() : await ignoredPaths(repo: repo, rels: riskyRels)
+            let ignored = riskyRels.isEmpty ? Set<String>() : await ignoredPaths(repo: repo, rels: riskyRels, env: env)
             var out: [ArtifactCandidate] = []
             for (c, rel) in zip(cands, rels) {
                 if tracked.contains(where: { $0 == rel || $0.hasPrefix(rel + "/") }) { continue }
@@ -186,12 +197,12 @@ enum GitArtifactFilter {
     }
 
     /// All tracked files below the given relative paths; nil if git failed.
-    static func trackedPaths(repo: String, rels: [String]) async -> [String]? {
+    static func trackedPaths(repo: GitRepo, rels: [String], env: EngineEnvironment) async -> [String]? {
         var out: [String] = []
         var i = 0
         while i < rels.count {
             let chunk = Array(rels[i..<min(i + 100, rels.count)]); i += 100
-            let r = await runGit(repo, ["ls-files", "-z", "--"] + chunk.map { ":(literal)" + $0 }, timeout: 30)
+            let r = await Git.run(repo, ["ls-files", "-z", "--"] + chunk.map { ":(literal)" + $0 }, env: env, timeout: 30)
             guard r.ok else { return nil }
             out += r.stdout.split(separator: "\0").map(String.init)
         }
@@ -199,12 +210,12 @@ enum GitArtifactFilter {
     }
 
     /// The subset of `rels` that git ignores (as directories).
-    static func ignoredPaths(repo: String, rels: [String]) async -> Set<String> {
+    static func ignoredPaths(repo: GitRepo, rels: [String], env: EngineEnvironment) async -> Set<String> {
         var out = Set<String>()
         var i = 0
         while i < rels.count {
             let chunk = Array(rels[i..<min(i + 100, rels.count)]); i += 100
-            let r = await runGit(repo, ["-c", "core.quotePath=false", "check-ignore", "--"] + chunk.map { $0 + "/" }, timeout: 30)
+            let r = await Git.run(repo, ["check-ignore", "--"] + chunk.map { $0 + "/" }, env: env, timeout: 30)
             guard r.launched, !r.timedOut, r.status == 0 || r.status == 1 else { continue }
             // Paths with quotes or control characters come back C-quoted and will not match: fail closed.
             for p in r.stdout.split(whereSeparator: \.isNewline) {
@@ -228,7 +239,7 @@ extension LiveEngine {
             ProjectWalker.find(root: root, home: home, guardian: guardian, stopAtNestedRepos: stopAtNestedRepos, flag: flag, progress: progress)
         }
         if flag.isSet { return [] }
-        return await GitArtifactFilter.filter(raw)
+        return await GitArtifactFilter.filter(raw, env: env)
     }
 
     /// Sizes for many paths: chunks measured concurrently, each chunk with one `du` call.

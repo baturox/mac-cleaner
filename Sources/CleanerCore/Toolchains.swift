@@ -3,7 +3,27 @@
 import Foundation
 
 enum ToolchainScanner {
-    struct Version: Equatable { var path: String; var label: String }
+    struct Version: Equatable {
+        var path: String
+        var label: String
+        /// Set when the manager's folder was named by an environment variable.
+        var variable: String? = nil
+    }
+
+    /// A version manager's folder: the default, or the one an environment variable names.
+    struct Root { var path: String; var variable: String? }
+
+    static func root(_ ctx: ScanContext, _ names: [String], default def: String) -> Root {
+        if let o = EnvOverride.directory(names, env: ctx.env) { return Root(path: o.path, variable: o.variable) }
+        return Root(path: def, variable: nil)
+    }
+
+    /// A version folder is listed as-is in a default location. In a location that comes from an environment
+    /// variable it must also contain something only a real installation has (`bin/node`, `bin/rustc`, …), so
+    /// a variable pointing at an unrelated folder yields nothing.
+    static func accepts(_ root: Root, _ versionPath: String, markers: [String], ctx: ScanContext) -> Bool {
+        root.variable == nil || markers.contains { ctx.env.exists(versionPath + "/" + $0) }
+    }
 
     private static func readText(_ path: String) -> String? {
         guard let d = FileManager.default.contents(atPath: path) else { return nil }
@@ -45,26 +65,35 @@ enum ToolchainScanner {
         var out: [Version] = []
         let h = ctx.home
         // nvm
-        let nvm = ctx.env.variable("NVM_DIR").map(ctx.env.expand) ?? h + "/.nvm"
+        let nvmRoot = root(ctx, ["NVM_DIR"], default: h + "/.nvm")
+        let nvm = nvmRoot.path
         let nvmVersions = nvm + "/versions/node"
-        let installed = versionDirs(nvmVersions)
+        let installed = versionDirs(nvmVersions).filter { accepts(nvmRoot, nvmVersions + "/" + $0, markers: ["bin/node"], ctx: ctx) }
         if !installed.isEmpty {
             let keep = nvmDefault(nvmDir: nvm, installed: installed)
-            for v in installed where v != keep { out.append(Version(path: nvmVersions + "/" + v, label: "Node \(stripV(v)) (nvm)")) }
+            for v in installed where v != keep {
+                out.append(Version(path: nvmVersions + "/" + v, label: "Node \(stripV(v)) (nvm)", variable: nvmRoot.variable))
+            }
         }
         // fnm: the `default` alias is a symlink into node-versions/<v>/installation
-        for fnm in [ctx.env.variable("FNM_DIR").map(ctx.env.expand), h + "/Library/Application Support/fnm", h + "/.local/share/fnm", h + "/.fnm"].compactMap({ $0 }) {
+        var fnmRoots = [h + "/Library/Application Support/fnm", h + "/.local/share/fnm", h + "/.fnm"].map { Root(path: $0, variable: nil) }
+        if let o = EnvOverride.directory(["FNM_DIR"], env: ctx.env), !fnmRoots.contains(where: { $0.path == o.path }) {
+            fnmRoots.insert(Root(path: o.path, variable: o.variable), at: 0)
+        }
+        for fnmRoot in fnmRoots {
+            let fnm = fnmRoot.path
             let versions = fnm + "/node-versions"
             var keep: String?
             if let dest = try? FileManager.default.destinationOfSymbolicLink(atPath: fnm + "/aliases/default") {
                 keep = dest.components(separatedBy: "/node-versions/").last?.components(separatedBy: "/").first
             }
-            for v in versionDirs(versions) where v != keep {
-                out.append(Version(path: versions + "/" + v, label: "Node \(stripV(v)) (fnm)"))
+            for v in versionDirs(versions) where v != keep && accepts(fnmRoot, versions + "/" + v, markers: ["installation/bin/node"], ctx: ctx) {
+                out.append(Version(path: versions + "/" + v, label: "Node \(stripV(v)) (fnm)", variable: fnmRoot.variable))
             }
         }
         // Volta: platform.json names the default runtime and package managers
-        let volta = ctx.env.variable("VOLTA_HOME").map(ctx.env.expand) ?? h + "/.volta"
+        let voltaRoot = root(ctx, ["VOLTA_HOME"], default: h + "/.volta")
+        let volta = voltaRoot.path
         var kept = Set<String>()
         if let data = FileManager.default.contents(atPath: volta + "/tools/user/platform.json"),
            let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
@@ -75,8 +104,10 @@ enum ToolchainScanner {
             for tool in ["yarn", "pnpm"] { if let v = obj[tool] as? String { kept.insert("\(tool)/\(v)") } }
         }
         for tool in ["node", "npm", "yarn", "pnpm"] {
-            for v in versionDirs(volta + "/tools/image/" + tool) where !kept.contains("\(tool)/\(v)") {
-                out.append(Version(path: volta + "/tools/image/\(tool)/\(v)", label: "\(tool == "node" ? "Node" : tool) \(v) (Volta)"))
+            for v in versionDirs(volta + "/tools/image/" + tool) where !kept.contains("\(tool)/\(v)")
+                && accepts(voltaRoot, volta + "/tools/image/\(tool)/\(v)", markers: ["bin/node", "bin", "package.json"], ctx: ctx) {
+                out.append(Version(path: volta + "/tools/image/\(tool)/\(v)", label: "\(tool == "node" ? "Node" : tool) \(v) (Volta)",
+                                   variable: voltaRoot.variable))
             }
         }
         return out
@@ -100,42 +131,46 @@ enum ToolchainScanner {
     }
 
     static func rustToolchains(_ ctx: ScanContext) -> [Version] {
-        let home = ctx.env.variable("RUSTUP_HOME").map(ctx.env.expand) ?? ctx.home + "/.rustup"
-        let installed = versionDirs(home + "/toolchains")
+        let rustup = root(ctx, ["RUSTUP_HOME"], default: ctx.home + "/.rustup")
+        let home = rustup.path
+        let installed = versionDirs(home + "/toolchains").filter { accepts(rustup, home + "/toolchains/" + $0, markers: ["bin/rustc", "lib/rustlib"], ctx: ctx) }
         guard !installed.isEmpty else { return [] }
         let settings = readText(home + "/settings.toml")
         // Without a readable settings file nothing is known to be the default: offer nothing.
         guard let settings else { return [] }
         let kept = rustKept(settings: settings, installed: installed)
-        return installed.filter { !kept.contains($0) }.map { Version(path: home + "/toolchains/" + $0, label: "Rust \($0)") }
+        return installed.filter { !kept.contains($0) }.map { Version(path: home + "/toolchains/" + $0, label: "Rust \($0)", variable: rustup.variable) }
     }
 
     // MARK: Python / Ruby
 
     static func pyenvVersions(_ ctx: ScanContext) -> [Version] {
-        let root = ctx.env.variable("PYENV_ROOT").map(ctx.env.expand) ?? ctx.home + "/.pyenv"
-        let installed = versionDirs(root + "/versions")
+        let pyenv = self.root(ctx, ["PYENV_ROOT"], default: ctx.home + "/.pyenv")
+        let root = pyenv.path
+        let installed = versionDirs(root + "/versions").filter { accepts(pyenv, root + "/versions/" + $0, markers: ["bin/python", "bin/python3"], ctx: ctx) }
         let requested = (readText(root + "/version") ?? "").split(whereSeparator: { $0 == ":" || $0.isNewline }).map(String.init)
         return installed.filter { name in !requested.contains { matches(name, requested: $0) } }
-            .map { Version(path: root + "/versions/" + $0, label: "Python \($0) (pyenv)") }
+            .map { Version(path: root + "/versions/" + $0, label: "Python \($0) (pyenv)", variable: pyenv.variable) }
     }
 
     static func rbenvVersions(_ ctx: ScanContext) -> [Version] {
-        let root = ctx.env.variable("RBENV_ROOT").map(ctx.env.expand) ?? ctx.home + "/.rbenv"
-        let installed = versionDirs(root + "/versions")
+        let rbenv = self.root(ctx, ["RBENV_ROOT"], default: ctx.home + "/.rbenv")
+        let root = rbenv.path
+        let installed = versionDirs(root + "/versions").filter { accepts(rbenv, root + "/versions/" + $0, markers: ["bin/ruby"], ctx: ctx) }
         let requested = (readText(root + "/version") ?? "").split(whereSeparator: { $0 == ":" || $0.isNewline }).map(String.init)
         return installed.filter { name in !requested.contains { matches(name, requested: $0) } }
-            .map { Version(path: root + "/versions/" + $0, label: "Ruby \($0) (rbenv)") }
+            .map { Version(path: root + "/versions/" + $0, label: "Ruby \($0) (rbenv)", variable: rbenv.variable) }
     }
 
     /// uv-managed interpreters: "cpython-3.12.1-macos-aarch64-none" -> "Python 3.12.1 (uv)".
     static func uvPythons(_ ctx: ScanContext) -> [Version] {
-        let dir = ctx.env.variable("UV_PYTHON_INSTALL_DIR").map(ctx.env.expand) ?? ctx.home + "/.local/share/uv/python"
-        return versionDirs(dir).map { name in
+        let uv = root(ctx, ["UV_PYTHON_INSTALL_DIR"], default: ctx.home + "/.local/share/uv/python")
+        let dir = uv.path
+        return versionDirs(dir).filter { accepts(uv, dir + "/" + $0, markers: ["bin/python", "bin/python3"], ctx: ctx) }.map { name in
             let parts = name.split(separator: "-").map(String.init)
             let impl = parts.first == "cpython" ? "Python" : (parts.first ?? name).capitalized
             let version = parts.count > 1 ? parts[1] : name
-            return Version(path: dir + "/" + name, label: "\(impl) \(version) (uv)")
+            return Version(path: dir + "/" + name, label: "\(impl) \(version) (uv)", variable: uv.variable)
         }
     }
 
@@ -163,7 +198,10 @@ enum ToolchainScanner {
         let h = ctx.home
         var out: [Version] = []
         let pins = pinnedVersions(files: [h + "/.tool-versions", h + "/.config/mise/config.toml", h + "/.mise.toml"])
-        func collect(_ installs: String, label: String) {
+        func collect(_ base: Root, label: String) {
+            // Custom locations: the folder must be laid out like the manager's data directory.
+            if base.variable != nil && !(ctx.env.isDirectory(base.path + "/plugins") || ctx.env.isDirectory(base.path + "/shims")) { return }
+            let installs = base.path + "/installs"
             for tool in versionDirs(installs) {
                 let toolDir = installs + "/" + tool
                 // mise keeps symlinks like "22" or "latest" pointing at real version folders: those targets are in use.
@@ -175,35 +213,46 @@ enum ToolchainScanner {
                 }
                 let requested = (pins[tool] ?? []) + (tool == "nodejs" ? pins["node"] ?? [] : [])
                 for v in versionDirs(toolDir) where !linked.contains(v) && !requested.contains(where: { $0 == "latest" || matches(v, requested: $0) }) {
-                    out.append(Version(path: toolDir + "/" + v, label: "\(tool) \(v) (\(label))"))
+                    if base.variable != nil && v.first?.isNumber != true { continue }
+                    out.append(Version(path: toolDir + "/" + v, label: "\(tool) \(v) (\(label))", variable: base.variable))
                 }
             }
         }
-        collect(ctx.env.variable("ASDF_DATA_DIR").map(ctx.env.expand).map { $0 + "/installs" } ?? h + "/.asdf/installs", label: "asdf")
-        collect(ctx.env.variable("MISE_DATA_DIR").map(ctx.env.expand).map { $0 + "/installs" } ?? h + "/.local/share/mise/installs", label: "mise")
+        collect(root(ctx, ["ASDF_DATA_DIR"], default: h + "/.asdf"), label: "asdf")
+        collect(root(ctx, ["MISE_DATA_DIR"], default: h + "/.local/share/mise"), label: "mise")
         return out
     }
 
     // MARK: Flutter / Android
 
     static func fvmVersions(_ ctx: ScanContext) -> [Version] {
-        let dir = ctx.env.variable("FVM_CACHE_PATH").map(ctx.env.expand).map { $0 + "/versions" } ?? ctx.home + "/fvm/versions"
-        return versionDirs(dir).map { Version(path: dir + "/" + $0, label: "Flutter \($0) (FVM)") }
+        let fvm = root(ctx, ["FVM_CACHE_PATH"], default: ctx.home + "/fvm")
+        let dir = fvm.path + "/versions"
+        return versionDirs(dir).filter { accepts(fvm, dir + "/" + $0, markers: ["bin/flutter"], ctx: ctx) }
+            .map { Version(path: dir + "/" + $0, label: "Flutter \($0) (FVM)", variable: fvm.variable) }
     }
 
     static func androidSDK(_ ctx: ScanContext) -> [Version] {
-        let sdk = (ctx.env.variable("ANDROID_HOME") ?? ctx.env.variable("ANDROID_SDK_ROOT")).map(ctx.env.expand)
-            ?? ctx.home + "/Library/Android/sdk"
+        let sdkRoot = root(ctx, ["ANDROID_HOME", "ANDROID_SDK_ROOT"], default: ctx.home + "/Library/Android/sdk")
+        let sdk = sdkRoot.path
+        // Every SDK package carries a source.properties file.
+        func ok(_ path: String) -> Bool { accepts(sdkRoot, path, markers: ["source.properties"], ctx: ctx) }
         var out: [Version] = []
-        for v in versionDirs(sdk + "/ndk") { out.append(Version(path: sdk + "/ndk/" + v, label: "Android NDK \(v)")) }
+        for v in versionDirs(sdk + "/ndk") where ok(sdk + "/ndk/" + v) {
+            out.append(Version(path: sdk + "/ndk/" + v, label: "Android NDK \(v)", variable: sdkRoot.variable))
+        }
         // Keep the newest build-tools; older ones are rarely needed.
-        let tools = versionDirs(sdk + "/build-tools").sorted { $0.compare($1, options: .numeric) == .orderedDescending }
-        for v in tools.dropFirst() { out.append(Version(path: sdk + "/build-tools/" + v, label: "Android build-tools \(v)")) }
+        let tools = versionDirs(sdk + "/build-tools").filter { ok(sdk + "/build-tools/" + $0) }
+            .sorted { $0.compare($1, options: .numeric) == .orderedDescending }
+        for v in tools.dropFirst() {
+            out.append(Version(path: sdk + "/build-tools/" + v, label: "Android build-tools \(v)", variable: sdkRoot.variable))
+        }
         for api in versionDirs(sdk + "/system-images") {
             for tag in versionDirs(sdk + "/system-images/" + api) {
-                for abi in versionDirs(sdk + "/system-images/\(api)/\(tag)") {
+                for abi in versionDirs(sdk + "/system-images/\(api)/\(tag)") where ok(sdk + "/system-images/\(api)/\(tag)/\(abi)") {
                     let level = api.replacingOccurrences(of: "android-", with: "")
-                    out.append(Version(path: sdk + "/system-images/\(api)/\(tag)/\(abi)", label: "Android \(level) emulator image (\(tag), \(abi))"))
+                    out.append(Version(path: sdk + "/system-images/\(api)/\(tag)/\(abi)", label: "Android \(level) emulator image (\(tag), \(abi))",
+                                       variable: sdkRoot.variable))
                 }
             }
         }
@@ -211,10 +260,11 @@ enum ToolchainScanner {
     }
 
     static func androidAVDs(_ ctx: ScanContext) -> [Version] {
-        let dir = ctx.env.variable("ANDROID_AVD_HOME").map(ctx.env.expand) ?? ctx.home + "/.android/avd"
-        return (readDir(dir) ?? []).filter { $0.isDir && !$0.isLink && $0.name.hasSuffix(".avd") }.map {
-            Version(path: dir + "/" + $0.name, label: "Emulator " + String($0.name.dropLast(4)))
-        }
+        let avd = root(ctx, ["ANDROID_AVD_HOME"], default: ctx.home + "/.android/avd")
+        let dir = avd.path
+        return (readDir(dir) ?? []).filter { $0.isDir && !$0.isLink && $0.name.hasSuffix(".avd") }
+            .filter { accepts(avd, dir + "/" + $0.name, markers: ["config.ini"], ctx: ctx) }
+            .map { Version(path: dir + "/" + $0.name, label: "Emulator " + String($0.name.dropLast(4)), variable: avd.variable) }
     }
 
     // MARK: Scan
@@ -239,7 +289,12 @@ enum ToolchainScanner {
             let visible = g.versions.filter { ctx.visible($0.path) }
             let labels = Dictionary(visible.map { ($0.path, $0.label) }, uniquingKeysWith: { a, _ in a })
             let items = await ctx.items(visible.map(\.path), labels: labels)
-            if let c = ctx.category(id: g.id, name: g.name, detail: g.detail, level: .caution, symbol: "wrench.and.screwdriver",
+            var detail = g.detail
+            let variables = Set(visible.compactMap(\.variable)).sorted()
+            if !variables.isEmpty {
+                detail += ". Some locations were set by the environment variable\(variables.count == 1 ? "" : "s") \(variables.joined(separator: ", ")); only folders that contain a real installation are listed"
+            }
+            if let c = ctx.category(id: g.id, name: g.name, detail: detail, level: .caution, symbol: "wrench.and.screwdriver",
                                     group: .toolchains, items: items, selectable: true) { out.append(c) }
         }
         return out

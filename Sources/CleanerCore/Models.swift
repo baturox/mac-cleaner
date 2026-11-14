@@ -1,5 +1,5 @@
 // CONTRACT between the engine (CleanerCore), the app (MacCleaner) and the CLI.
-// Agents implementing either side must not change this file.
+// A change here must be made in all three targets and the mock engine at the same time.
 import Foundation
 
 // MARK: - Disk
@@ -120,29 +120,69 @@ public struct RepoClone: Identifiable, Hashable, Sendable, Codable {
     /// Linked worktree (`git worktree add`). Its commits live in the main clone, so removing it loses
     /// only uncommitted work.
     public var isLinkedWorktree: Bool
-    public var uncommittedCount: Int    // modified + staged + untracked (not ignored) files
-    /// Commits on local branches that are on no remote. For a linked worktree: commits on ITS branch only.
-    /// nil = the repo has no remote at all (nothing is backed up).
+    /// Modified + staged + untracked (not ignored) files, plus one for every submodule that holds work of
+    /// its own (changes, unpushed commits) or could not be inspected.
+    public var uncommittedCount: Int
+    /// Commits reachable from HEAD, a local branch or a tag that no remote-tracking ref of a NETWORK remote
+    /// contains. For a linked worktree: commits reachable from ITS HEAD only.
+    /// nil = there is no network remote (a remote that is a local path or a file:// URL is not a backup),
+    /// or git could not answer.
     public var unpushedCount: Int?
     public var hasStash: Bool           // always false for linked worktrees (stashes belong to the main clone)
     public var lastCommit: Date?
     public var idleDays: Int
     public var sizeBytes: Int64         // whole folder
     public var artifactBytes: Int64     // the rebuildable part (node_modules, target, …)
+    /// Files and folders that git ignores and that are not known rebuildable output (`.env`, local
+    /// databases, editor settings…). They exist only in this folder, so they are lost with it. An ignored
+    /// folder counts once. Known build folders and OS/compiler droppings (.DS_Store, *.pyc…) are not counted.
+    public var ignoredFileCount: Int
+    /// nil for a working copy the engine inspected. Otherwise the repository's own git configuration contains
+    /// settings that could make git run a program (names only, e.g. "core.fsmonitor", "filter.*.clean"), so
+    /// git was NOT run in it: branch, counts and dates are unknown, it is never `isFullyBackedUp`, and
+    /// `removeClones` refuses it even with `force`.
+    public var untrustedConfigKeys: [String]?
+
+    /// False when git was not run here because of the repository's own configuration.
+    public var wasInspected: Bool { untrustedConfigKeys == nil }
 
     /// Nothing would be lost by deleting the whole folder.
     public var isFullyBackedUp: Bool {
-        if uncommittedCount > 0 { return false }
-        if isLinkedWorktree { return true }
+        if !wasInspected { return false }
+        if uncommittedCount > 0 || ignoredFileCount > 0 { return false }
+        if isLinkedWorktree {
+            // On a branch, the commits stay in the main clone. A detached worktree is the only thing holding
+            // its commits unless a remote has them.
+            return branch != nil || unpushedCount == 0
+        }
         return unpushedCount == 0 && !hasStash
     }
 
     public init(url: URL, branch: String?, isLinkedWorktree: Bool, uncommittedCount: Int, unpushedCount: Int?,
-                hasStash: Bool, lastCommit: Date?, idleDays: Int, sizeBytes: Int64, artifactBytes: Int64) {
+                hasStash: Bool, lastCommit: Date?, idleDays: Int, sizeBytes: Int64, artifactBytes: Int64,
+                ignoredFileCount: Int = 0, untrustedConfigKeys: [String]? = nil) {
         self.url = url; self.branch = branch; self.isLinkedWorktree = isLinkedWorktree
         self.uncommittedCount = uncommittedCount; self.unpushedCount = unpushedCount; self.hasStash = hasStash
         self.lastCommit = lastCommit; self.idleDays = idleDays
         self.sizeBytes = sizeBytes; self.artifactBytes = artifactBytes
+        self.ignoredFileCount = ignoredFileCount; self.untrustedConfigKeys = untrustedConfigKeys
+    }
+}
+
+/// How a front end must split a removal request: `force` in `removeClones` covers every clone of that call,
+/// so it may only ever be passed for the clones whose loss the user explicitly acknowledged.
+public struct RepoRemovalPlan: Sendable {
+    /// Removed with `force: false`; the engine re-checks each one and refuses any that holds unsaved work.
+    public var unforced: [RepoClone]
+    /// Not fully backed up at scan time AND acknowledged by the user: removed with `force: true`.
+    public var forced: [RepoClone]
+
+    /// `acknowledged` holds the ids of the clones the user confirmed losing work in.
+    /// Clones that were not inspected are never forced (the engine refuses them anyway).
+    public init(clones: [RepoClone], acknowledged: Set<String>) {
+        forced = clones.filter { !$0.isFullyBackedUp && $0.wasInspected && acknowledged.contains($0.id) }
+        let forcedIDs = Set(forced.map(\.id))
+        unforced = clones.filter { !forcedIDs.contains($0.id) }
     }
 }
 
@@ -278,7 +318,11 @@ public protocol CleanerEngine: Sendable {
     /// Remove whole working copies. Linked worktrees are removed with `git worktree remove --force`
     /// (then `git worktree prune` in the main clone); normal clones are deleted as folders.
     /// The engine re-checks each clone right before removal and REFUSES any that is not
-    /// `isFullyBackedUp` unless `force` is true.
+    /// `isFullyBackedUp` unless `force` is true. `force` applies to EVERY clone passed in one call, so
+    /// callers must pass only the clones the user explicitly acknowledged when forcing, and make a
+    /// separate unforced call for the rest.
+    /// A working copy with untrusted git configuration (`RepoClone.untrustedConfigKeys`) is refused even
+    /// with `force`: the engine will not run git in it and cannot tell what it holds.
     func removeClones(_ clones: [RepoClone], force: Bool, mode: DeleteMode, progress: @escaping ProgressHandler) async -> CleanResult
 
     /// Save the current scan as a snapshot and return what changed since the previous snapshot that is

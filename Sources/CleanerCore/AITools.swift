@@ -117,7 +117,7 @@ enum IDEScanner {
         let plan = await onBackground { () -> Plan in
             var p = Plan()
             for ed in editors {
-                for o in orphanedWorkspaces(storageDir: ed.support + "/User/workspaceStorage") where ctx.visible(o.path) {
+                for o in orphanedWorkspaces(storageDir: ed.support + "/User/workspaceStorage", home: ctx.home) where ctx.visible(o.path) {
                     p.workspaces.append(o.path)
                     p.workspaceLabels[o.path] = "\(ed.name) · \(o.folderName ?? (o.path as NSString).lastPathComponent)"
                 }
@@ -156,8 +156,8 @@ enum IDEScanner {
         let (wsItems, caItems, hiItems, exItems) = await (ws, ca, hi, ex)
         return [
             ctx.category(id: "ide-stale-workspaces", name: "Editor data of deleted projects",
-                         detail: "Per-workspace state (open tabs, chat history) of folders that no longer exist",
-                         level: .safe, symbol: "chevron.left.forwardslash.chevron.right", group: .aiTools, items: wsItems, selectable: true),
+                         detail: "Per-workspace state of folders that no longer exist on this disk. Includes the editor's AI chat history for those projects, which cannot be recreated",
+                         level: .caution, symbol: "chevron.left.forwardslash.chevron.right", group: .aiTools, items: wsItems, selectable: true),
             ctx.category(id: "ide-caches", name: "Editor caches & logs (Cursor, VS Code, Windsurf, JetBrains…)",
                          detail: "Web caches, downloaded extension packages, index caches and logs; rebuilt automatically",
                          level: .safe, symbol: "chevron.left.forwardslash.chevron.right", group: .aiTools, items: caItems, selectable: true),
@@ -175,8 +175,8 @@ enum IDEScanner {
     struct Orphan: Equatable { var path: String; var folderName: String? }
 
     /// workspaceStorage entries whose `workspace.json` points at a local folder or `.code-workspace` file that
-    /// no longer exists. Remote workspaces and paths on volumes that are not mounted are never reported.
-    static func orphanedWorkspaces(storageDir: String) -> [Orphan] {
+    /// no longer exists. Remote workspaces and paths on other volumes (mounted or not) are never reported.
+    static func orphanedWorkspaces(storageDir: String, home: String) -> [Orphan] {
         guard let entries = readDir(storageDir) else { return [] }
         var out: [Orphan] = []
         for e in entries where e.isDir && !e.isLink {
@@ -185,16 +185,33 @@ enum IDEScanner {
                   let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
             guard let uri = (obj["folder"] as? String) ?? (obj["workspace"] as? String),
                   let url = URL(string: uri), url.scheme == "file" else { continue }
-            let path = url.path
-            if path.isEmpty || path == "/" { continue }
-            if path.hasPrefix("/Volumes/") {
-                let volume = path.split(separator: "/").prefix(2).joined(separator: "/")
-                if !FileManager.default.fileExists(atPath: "/" + volume) { continue }
-            }
-            if FileManager.default.fileExists(atPath: path) { continue }
+            let path = (url.path as NSString).standardizingPath
+            if path.isEmpty || path == "/" || !path.hasPrefix("/") { continue }
+            if let host = url.host, !host.isEmpty, host != "localhost" { continue }
+            guard isMissingOnLocalDisk(path, home: home) else { continue }
             out.append(Orphan(path: dir, folderName: (path as NSString).lastPathComponent))
         }
         return out
+    }
+
+    /// True only when `path` does not exist AND the place it would be in is on the boot volume or the volume
+    /// of the home folder. A folder on an external or network volume that is merely not mounted right now is
+    /// indistinguishable from a deleted one, so nothing under /Volumes or on another device ever qualifies.
+    static func isMissingOnLocalDisk(_ path: String, home: String) -> Bool {
+        var st = stat()
+        if lstat(path, &st) == 0 { return false }
+        guard errno == ENOENT else { return false }
+        if path == "/Volumes" || path.hasPrefix("/Volumes/") || path.hasPrefix("/Network/") || path.hasPrefix("/net/") { return false }
+        var local = Set<dev_t>()
+        for p in ["/", "/System/Volumes/Data", home] where stat(p, &st) == 0 { local.insert(st.st_dev) }
+        // The nearest folder that still exists tells which volume the missing one was on.
+        var dir = (path as NSString).deletingLastPathComponent
+        while dir.count > 1 {
+            if stat(dir, &st) == 0 { return local.contains(st.st_dev) }
+            if errno != ENOENT { return false }
+            dir = (dir as NSString).deletingLastPathComponent
+        }
+        return stat("/", &st) == 0 && local.contains(st.st_dev)
     }
 
     // MARK: Old extension versions
@@ -247,23 +264,26 @@ enum IDEScanner {
 // MARK: - Playwright / Puppeteer browser builds
 
 enum BrowserDownloadsScanner {
+    /// "chromium-1200", "chromium_headless_shell-1200", "firefox-1490", "webkit-2182", "ffmpeg-1011"…
+    static let playwrightEntry = "^(chromium|firefox|webkit|ffmpeg|winldd|android|bidi)[a-z_-]*-[0-9]+$"
+    /// Puppeteer keeps `<browser>/<platform>-<build>`.
+    static let puppeteerBrowser = "^(chrome|chrome-headless-shell|chromedriver|chromium|firefox)$"
+    static let puppeteerBuild = "^(mac|mac_arm|linux|linux_arm|win32|win64)-[0-9A-Za-z._-]+$"
+
+    /// The tools' default locations only. PLAYWRIGHT_BROWSERS_PATH and PUPPETEER_CACHE_DIR are handled by
+    /// `OverrideScanner`, which validates the folder and never calls its content "safe".
     static func scan(_ ctx: ScanContext) async -> [CleanCategory] {
         ctx.progress("Measuring browser downloads…")
         var paths: [String] = []
         var labels: [String: String] = [:]
-        var playwright = ctx.home + "/Library/Caches/ms-playwright"
-        if let custom = ctx.env.variable("PLAYWRIGHT_BROWSERS_PATH") {
-            if custom == "0" { playwright = "" } else { playwright = ctx.env.expand(custom) }
+        let playwright = ctx.home + "/Library/Caches/ms-playwright"
+        for e in readDir(playwright) ?? [] where !e.name.hasPrefix(".") && !e.isLink {
+            let p = playwright + "/" + e.name
+            paths.append(p); labels[p] = "Playwright · \(e.name)"
         }
-        if !playwright.isEmpty {
-            for e in readDir(playwright) ?? [] where !e.name.hasPrefix(".") {
-                let p = playwright + "/" + e.name
-                paths.append(p); labels[p] = "Playwright · \(e.name)"
-            }
-        }
-        let puppeteer = ctx.env.variable("PUPPETEER_CACHE_DIR").map(ctx.env.expand) ?? ctx.home + "/.cache/puppeteer"
+        let puppeteer = ctx.home + "/.cache/puppeteer"
         for browser in readDir(puppeteer) ?? [] where browser.isDir && !browser.isLink {
-            for build in readDir(puppeteer + "/" + browser.name) ?? [] where !build.name.hasPrefix(".") {
+            for build in readDir(puppeteer + "/" + browser.name) ?? [] where !build.name.hasPrefix(".") && !build.isLink {
                 let p = puppeteer + "/" + browser.name + "/" + build.name
                 paths.append(p); labels[p] = "Puppeteer · \(browser.name) \(build.name)"
             }

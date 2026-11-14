@@ -68,7 +68,7 @@ public struct LiveEngine: CleanerEngine {
         scanners += [
             { await ClaudeScanner.scan($0) }, { await IDEScanner.scan($0) }, { await BrowserDownloadsScanner.scan($0) },
             { await ModelsScanner.scan($0) }, { await ToolchainScanner.scan($0) }, { await XcodeScanner.scan($0) },
-            { await ContainerScanner.scan($0) }, { await PersonalScanner.scan($0) },
+            { await ContainerScanner.scan($0) }, { await PersonalScanner.scan($0) }, { await OverrideScanner.scan($0) },
         ]
         let found = await withTaskGroup(of: [CleanCategory].self) { group -> [CleanCategory] in
             var pending = scanners.makeIterator()
@@ -91,7 +91,8 @@ public struct LiveEngine: CleanerEngine {
     // MARK: Folder listing
 
     public func listFolder(_ url: URL) async -> [FolderEntry] {
-        let base = url.path
+        // Entries are reported under the folder's real path, which is the form the deleter accepts.
+        let base = realPath(url.path) ?? url.path
         guard let children = readDir(base) else { return [] }
         struct Child: Sendable { var name: String; var path: String; var isDir: Bool; var fileBytes: Int64 }
         var kids: [Child] = []
@@ -145,7 +146,7 @@ public struct LiveEngine: CleanerEngine {
                 }
             }
             if cat.id == "snapshots" {
-                let r = await GenericScanner.snapshotCleanup(progress: progress)
+                let r = await GenericScanner.snapshotCleanup(env: env, progress: progress)
                 failed += r.failed
                 messages += r.messages
             }
@@ -176,12 +177,12 @@ public struct LiveEngine: CleanerEngine {
         return await finish(before: before, failed: r.failed, messages: r.messages)
     }
 
-    /// Runs a command only if the allowlist accepts it (see `CommandPolicy`).
+    /// Runs a command only if its whole argv has an allowed shape (see `CommandPolicy`).
     func runAllowed(_ argv: [String], timeout: TimeInterval) async -> ProcResult {
         guard CommandPolicy.isAllowed(argv) else {
             return ProcResult(status: 126, stdout: "", stderr: "refused: command is not on the allowlist", timedOut: false, launched: false)
         }
-        return await runCommand(argv, timeout: timeout)
+        return await env.run(argv, timeout: timeout)
     }
 
     private static func failureText(_ cmd: [String], _ r: ProcResult) -> String {

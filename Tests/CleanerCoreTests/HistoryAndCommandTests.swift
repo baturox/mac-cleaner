@@ -129,20 +129,40 @@ final class HistoryTests: EngineTestCase {
 }
 
 final class CommandTests: EngineTestCase {
-    func testAllowlistAcceptsOnlyGeneratedShapes() {
+    func testAllowlistAcceptsOnlyExactArgvShapes() {
+        let uuid = "0B9D0AA4-1C2D-4E5F-8A9B-0C1D2E3F4A5B"
+        let sock = "unix:///Users/me/.docker/run/docker.sock"
         let ok: [[String]] = [
-            ["xcrun", "simctl", "runtime", "delete", "ABC"], ["xcrun", "simctl", "delete", "unavailable"], ["ollama", "rm", "llama3:latest"],
-            ["docker", "system", "prune", "-af"], ["docker", "builder", "prune", "-af"], ["docker", "volume", "prune", "-af"],
+            ["xcrun", "simctl", "runtime", "delete", uuid], ["xcrun", "simctl", "delete", "unavailable"], ["xcrun", "simctl", "delete", uuid],
+            ["ollama", "rm", "llama3:latest"], ["ollama", "rm", "hf.co/org/model-GGUF:Q4_K_M"], ["ollama", "rm", "someone/custom"],
+            ["docker", "--host", sock, "image", "prune", "-af"], ["docker", "--host", sock, "builder", "prune", "-af"],
+            ["docker", "--host", sock, "volume", "prune", "-af"], ["docker", "--host", "unix:///var/run/docker.sock", "container", "prune", "-f"],
             ["brew", "cleanup", "-s", "--prune=all"], ["pnpm", "store", "prune"], ["go", "clean", "-modcache"],
             ["uv", "cache", "prune"], ["tmutil", "deletelocalsnapshots", "2026-01-01-000000"],
-            ["git", "worktree", "remove", "--force", "/x"], ["git", "-C", "/repo", "worktree", "prune"],
         ]
         for c in ok { XCTAssertTrue(CommandPolicy.isAllowed(c), c.joined(separator: " ")) }
         let bad: [[String]] = [
-            [], ["rm", "-rf", "/"], ["sh", "-c", "echo hi"], ["/bin/rm", "-rf", "x"], ["/usr/bin/git", "worktree", "prune"],
-            ["xcrun"], ["xcrun", "swiftc", "x"], ["ollama", "run", "x"], ["docker", "run", "--rm", "alpine"], ["docker"],
-            ["git", "clean", "-fdx"], ["git", "-C", "/repo", "clean", "-fdx"], ["git", "-C", "/repo"], ["brew", "install", "x"],
-            ["go", "run", "x.go"], ["tmutil", "disable"], ["osascript", "-e", "x"], ["curl", "https://example.com"],
+            // The three shapes from the security review:
+            ["xcrun", "simctl", "erase", "all"], ["docker", "system", "prune", "-af", "--volumes"], ["ollama", "rm", "--help"],
+            // Identifiers that are not identifiers:
+            ["xcrun", "simctl", "delete", "all"], ["xcrun", "simctl", "delete", "booted"], ["xcrun", "simctl", "delete", "-h"],
+            ["xcrun", "simctl", "delete", uuid, "all"], ["xcrun", "simctl", "runtime", "delete", "all"],
+            ["xcrun", "simctl", "runtime", "delete", "ABC"], ["ollama", "rm", "-f"], ["ollama", "rm", "a b"], ["ollama", "rm", "a;b"],
+            ["ollama", "rm", "llama3", "extra"], ["ollama", "rm"], ["tmutil", "deletelocalsnapshots", "/"],
+            ["tmutil", "deletelocalsnapshots", "2026-01-01-000000", "x"],
+            // Docker: no endpoint, a remote endpoint, another sub-command, extra flags:
+            ["docker", "image", "prune", "-af"], ["docker", "system", "prune", "-af"], ["docker"],
+            ["docker", "--host", "tcp://10.0.0.5:2375", "image", "prune", "-af"], ["docker", "--host", "ssh://root@prod", "volume", "prune", "-af"],
+            ["docker", "--host", sock, "system", "prune", "-af", "--volumes"], ["docker", "--host", sock, "run", "--rm", "alpine"],
+            ["docker", "--host", sock, "volume", "prune", "-af", "--all"], ["docker", "--host", "unix:///a/../b.sock", "image", "prune", "-af"],
+            // Fixed commands with anything added, removed or changed:
+            ["brew", "cleanup"], ["brew", "cleanup", "-s", "--prune=all", "x"], ["brew", "install", "x"], ["pnpm", "store", "path"],
+            ["go", "clean", "-modcache", "-x"], ["go", "run", "x.go"], ["uv", "cache", "clean"], ["uv", "cache", "prune", "--cache-dir", "/x"],
+            // Tools that are not in the table at all (git is run by the engine itself, never from a category):
+            [], ["rm", "-rf", "/"], ["sh", "-c", "echo hi"], ["/bin/rm", "-rf", "x"], ["/usr/bin/xcrun", "simctl", "delete", "unavailable"],
+            ["git", "worktree", "prune"], ["git", "-C", "/repo", "worktree", "remove", "--force", "/y"], ["git", "clean", "-fdx"],
+            ["npm", "cache", "clean", "--force"], ["xcrun"], ["xcrun", "swiftc", "x"], ["ollama", "run", "x"], ["tmutil", "disable"],
+            ["osascript", "-e", "x"], ["curl", "https://example.com"],
         ]
         for c in bad { XCTAssertFalse(CommandPolicy.isAllowed(c), c.joined(separator: " ")) }
     }
@@ -160,23 +180,51 @@ final class CommandTests: EngineTestCase {
         XCTAssertTrue(r.messages.allSatisfy { $0.contains("refused") }, r.messages.joined(separator: "; "))
     }
 
+    // The next tests run commands through a fake tool box: no test starts a real third-party program
+    // with a mutating sub-command.
+
     func testDeleteCommandFailureCountsAndReportsOutputTail() async throws {
-        let f = try Fixture()
-        let item = CleanItem(url: URL(fileURLWithPath: f.path(".ollama/models/manifests/x")), sizeBytes: 10, label: "ghost:latest",
-                             deleteCommand: ["xcrun", "simctl", "runtime", "delete", "00000000-0000-0000-0000-000000000000"])
+        let tools = FakeTools(installed: ["xcrun"]) { _ in FakeTools.fail("An error was encountered\nNo runtime disk images matched", status: 72) }
+        let f = try Fixture(tools: tools.box)
+        let id = "00000000-0000-0000-0000-000000000000"
+        let item = CleanItem(url: URL(fileURLWithPath: f.path("Library/x")), sizeBytes: 10, label: "ghost runtime",
+                             deleteCommand: ["xcrun", "simctl", "runtime", "delete", id])
         let cat = CleanCategory(id: "t", name: "T", detail: "", level: .caution, symbol: "x", items: [item], sizeBytes: 10)
         let r = await f.engine().clean(categories: [cat], progress: { _ in })
         XCTAssertEqual(r.failedCount, 1)
-        XCTAssertTrue(r.messages.first?.hasPrefix("ghost:latest:") ?? false, r.messages.joined())
+        XCTAssertTrue(r.messages.first?.hasPrefix("ghost runtime: failed (exit 72)") ?? false, r.messages.joined())
+        XCTAssertTrue(r.messages.first?.contains("No runtime disk images matched") ?? false)
+        XCTAssertEqual(tools.calls, [["xcrun", "simctl", "runtime", "delete", id]])
     }
 
     func testDeleteCommandItemsDoNotDeleteTheirURL() async throws {
-        let f = try Fixture()
+        let tools = FakeTools(installed: ["ollama"])
+        let f = try Fixture(tools: tools.box)
         let data = try f.file(".ollama/models/blobs/sha256-keep", bytes: 4096)
-        let item = CleanItem(url: URL(fileURLWithPath: data), sizeBytes: 4096, deleteCommand: ["ollama", "rm", "definitely-not-a-model-\(UUID().uuidString)"])
+        let item = CleanItem(url: URL(fileURLWithPath: data), sizeBytes: 4096, deleteCommand: ["ollama", "rm", "tiny:latest"])
         let cat = CleanCategory(id: "t", name: "T", detail: "", level: .caution, symbol: "x", items: [item], sizeBytes: 4096)
-        _ = await f.engine().clean(categories: [cat], mode: .permanent, progress: { _ in })
+        let r = await f.engine().clean(categories: [cat], mode: .permanent, progress: { _ in })
+        XCTAssertEqual(r.failedCount, 0)
+        XCTAssertEqual(tools.calls, [["ollama", "rm", "tiny:latest"]])
         XCTAssertTrue(FileManager.default.fileExists(atPath: data), "blobs are shared; only the command may remove a model")
+    }
+
+    func testChildProcessesGetAConstructedEnvironment() async throws {
+        setenv("DYLD_INSERT_LIBRARIES", "/tmp/evil.dylib", 1); setenv("DOCKER_HOST", "tcp://10.0.0.5:2375", 1)
+        setenv("GIT_SSH_COMMAND", "/tmp/evil", 1); setenv("HTTPS_PROXY", "http://evil", 1)
+        defer { for v in ["DYLD_INSERT_LIBRARIES", "DOCKER_HOST", "GIT_SSH_COMMAND", "HTTPS_PROXY"] { unsetenv(v) } }
+        let tools = FakeTools(installed: ["pnpm"])
+        let f = try Fixture(tools: tools.box)
+        let cat = CleanCategory(id: "pnpm", name: "pnpm", detail: "", level: .safe, symbol: "x", items: [], commands: [["pnpm", "store", "prune"]], sizeBytes: 0)
+        _ = await f.engine().clean(categories: [cat], progress: { _ in })
+        let env = try XCTUnwrap(tools.environments.first)
+        XCTAssertEqual(Set(env.keys), ["PATH", "HOME", "USER", "LOGNAME", "TMPDIR", "LANG", "LC_ALL"])
+        XCTAssertEqual(env["HOME"], f.home)
+        XCTAssertEqual(env["LC_ALL"], "C")
+        XCTAssertEqual(env["PATH"], "/usr/bin:/bin:/usr/sbin:/sbin", "a fixed PATH; nothing is inherited or appended")
+        // The live environment obeys the same rule.
+        let live = EngineEnvironment.live.toolEnvironment()
+        XCTAssertNil(live["DYLD_INSERT_LIBRARIES"]); XCTAssertNil(live["DOCKER_HOST"]); XCTAssertNil(live["GIT_SSH_COMMAND"])
     }
 
     func testCleanDeletesItemsInBothModesAndSkipsProtected() async throws {

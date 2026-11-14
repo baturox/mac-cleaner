@@ -32,25 +32,42 @@ enum ModelsScanner {
         return nil
     }
 
-    static func huggingFaceHub(_ env: EngineEnvironment) -> String {
-        if let hub = env.variable("HF_HUB_CACHE") ?? env.variable("HUGGINGFACE_HUB_CACHE") { return env.expand(hub) }
-        let home = env.variable("HF_HOME").map(env.expand) ?? env.home + "/.cache/huggingface"
-        return home + "/hub"
+    struct Location: Equatable { var path: String; var variable: String? }
+
+    private static func looksLikeHub(_ dir: String) -> Bool {
+        (readDir(dir) ?? []).contains { $0.isDir && !$0.isLink && huggingFaceLabel($0.name) != nil }
+    }
+
+    /// The hub folder. HF_HUB_CACHE / HF_HOME are honored only when the folder they name really contains
+    /// hub entries (`models--…`, `datasets--…`, `spaces--…`); otherwise the default location is used.
+    static func huggingFaceHub(_ env: EngineEnvironment) -> Location {
+        if let o = EnvOverride.directory(["HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE"], env: env), looksLikeHub(o.path) {
+            return Location(path: o.path, variable: o.variable)
+        }
+        if let o = EnvOverride.directory(["HF_HOME"], env: env, subpath: "/hub"), looksLikeHub(o.path) {
+            return Location(path: o.path, variable: o.variable)
+        }
+        return Location(path: env.home + "/.cache/huggingface/hub", variable: nil)
     }
 
     private static func huggingFace(_ ctx: ScanContext) async -> CleanCategory? {
         let hub = huggingFaceHub(ctx.env)
         var paths: [String] = [], labels: [String: String] = [:], dates: [String: Date] = [:]
-        for e in readDir(hub) ?? [] where e.isDir && !e.isLink {
+        // Only entries with the hub's naming become items, wherever the folder is.
+        for e in readDir(hub.path) ?? [] where e.isDir && !e.isLink {
             guard let label = huggingFaceLabel(e.name) else { continue }
-            let p = hub + "/" + e.name
+            let p = hub.path + "/" + e.name
             paths.append(p); labels[p] = label
             dates[p] = modificationDate(p + "/snapshots") ?? modificationDate(p)
         }
-        let xet = (ctx.env.variable("HF_HOME").map(ctx.env.expand) ?? ctx.home + "/.cache/huggingface") + "/xet"
-        if ctx.env.isDirectory(xet) { paths.append(xet); labels[xet] = "Xet download cache" }
-        return make(ctx, id: "hf-models", name: "Hugging Face models & datasets",
-                    detail: "Large files downloaded by transformers/diffusers; downloaded again when a script needs them",
+        // The Xet cache sits next to the hub folder (HF_HOME/xet).
+        let xet = (hub.path as NSString).deletingLastPathComponent + "/xet"
+        if (hub.path as NSString).lastPathComponent == "hub", ctx.env.isDirectory(xet), !ctx.env.isSymlink(xet) {
+            paths.append(xet); labels[xet] = "Xet download cache"
+        }
+        var detail = "Large files downloaded by transformers/diffusers; downloaded again when a script needs them"
+        if let v = hub.variable { detail += ". " + EnvOverride.note(v, hub.path, home: ctx.home) }
+        return make(ctx, id: "hf-models", name: "Hugging Face models & datasets", detail: detail,
                     items: await ctx.items(paths, labels: labels, dates: dates))
     }
 
@@ -83,7 +100,11 @@ enum ModelsScanner {
                 var label = name
                 if host != "registry.ollama.ai" { label = host + "/" + namespace + "/" + name }
                 else if namespace != "library" { label = namespace + "/" + name }
-                out.append(OllamaModel(label: label + ":" + e.name, manifest: dir + "/" + e.name,
+                label += ":" + e.name
+                // The label becomes an argument of `ollama rm`. Folder names are data: anything that is not
+                // a plain model reference (a leading "-", spaces, shell characters) is skipped.
+                guard CommandPolicy.isOllamaName(label) else { continue }
+                out.append(OllamaModel(label: label, manifest: dir + "/" + e.name,
                                        bytes: digests.values.reduce(0, +)))
             }
         }
@@ -92,14 +113,28 @@ enum ModelsScanner {
     }
 
     private static func ollama(_ ctx: ScanContext) async -> CleanCategory? {
-        let base = ctx.env.variable("OLLAMA_MODELS").map(ctx.env.expand) ?? ctx.home + "/.ollama/models"
+        // OLLAMA_MODELS is honored only when the folder has Ollama's layout (manifests + blobs).
+        var base = ctx.home + "/.ollama/models"
+        var variable: String?
+        if let o = EnvOverride.directory(["OLLAMA_MODELS"], env: ctx.env),
+           ctx.env.isDirectory(o.path + "/manifests"), ctx.env.isDirectory(o.path + "/blobs") {
+            base = o.path; variable = o.variable
+        }
         guard ctx.env.isDirectory(base) else { return nil }
-        let detail = "Language models pulled with Ollama; pull them again when needed. Models sharing layers free less than shown"
-        if ToolPaths.which("ollama") == nil {
-            let items = await ctx.items([base], labels: [base: "Ollama models (ollama is not installed)"])
+        var detail = "Language models pulled with Ollama; pull them again when needed. Models sharing layers free less than shown"
+        if let variable { detail += ". " + EnvOverride.note(variable, base, home: ctx.home) }
+        if ctx.env.which("ollama") == nil {
+            // Without the tool the files are offered directly: the whole default folder, but for a custom
+            // location only the two sub-folders that are Ollama's.
+            let paths = variable == nil ? [base] : [base + "/manifests", base + "/blobs"]
+            let labels = Dictionary(uniqueKeysWithValues: paths.map {
+                ($0, variable == nil ? "Ollama models (ollama is not installed)" : "Ollama \(($0 as NSString).lastPathComponent) (ollama is not installed)")
+            })
+            let items = await ctx.items(paths, labels: labels)
             return make(ctx, id: "ollama-models", name: "Ollama models", detail: detail, items: items)
         }
-        let models = await onBackground { ollamaModels(base: base) }
+        let modelsDir = base
+        let models = await onBackground { ollamaModels(base: modelsDir) }
         var items: [CleanItem] = []
         for m in models where m.bytes > 0 && ctx.visible(m.manifest) {
             items.append(CleanItem(url: URL(fileURLWithPath: m.manifest), sizeBytes: m.bytes, label: m.label,

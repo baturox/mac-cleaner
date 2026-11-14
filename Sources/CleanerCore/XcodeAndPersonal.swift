@@ -67,10 +67,15 @@ enum XcodeScanner {
             let dir = devicesDir + "/" + e.name
             guard let data = FileManager.default.contents(atPath: dir + "/device.plist"),
                   let plist = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any] else { continue }
+            // The UDID becomes an argument of `xcrun simctl delete`, and `device.plist` is just a file: it is
+            // used only when it is a UUID AND names the very folder it sits in. ("all", "booted" or another
+            // device's identifier would make simctl delete something else.)
+            guard let udid = plist["UDID"] as? String, CommandPolicy.isUDID(udid),
+                  udid.caseInsensitiveCompare(e.name) == .orderedSame else { continue }
             let name = plist["name"] as? String ?? e.name
             let runtime = (plist["runtime"] as? String).map(runtimeName)
             let state = (plist["state"] as? Int) ?? 0
-            out.append(Device(udid: (plist["UDID"] as? String) ?? e.name, path: dir,
+            out.append(Device(udid: udid, path: dir,
                               label: runtime.map { "\(name) — \($0)" } ?? name, state: state))
         }
         return out
@@ -93,10 +98,11 @@ enum XcodeScanner {
     }
 
     private static func runtimeCategory(_ ctx: ScanContext) async -> CleanCategory? {
-        guard ToolPaths.which("xcrun") != nil else { return nil }
-        let r = await runCommand(["xcrun", "simctl", "runtime", "list", "-j"], timeout: 30)
+        guard ctx.env.which("xcrun") != nil else { return nil }
+        let r = await ctx.env.run(["xcrun", "simctl", "runtime", "list", "-j"], timeout: 30)
         guard r.ok else { return nil }
-        let items = parseRuntimes(Data(r.stdout.utf8)).filter { $0.bytes > 0 }.map {
+        // Only identifiers of the expected form may become a command argument.
+        let items = parseRuntimes(Data(r.stdout.utf8)).filter { $0.bytes > 0 && CommandPolicy.isRuntimeID($0.identifier) }.map {
             CleanItem(url: URL(fileURLWithPath: $0.path), sizeBytes: $0.bytes, label: $0.label, lastUsed: $0.lastUsed,
                       deleteCommand: ["xcrun", "simctl", "runtime", "delete", $0.identifier])
         }
@@ -106,7 +112,7 @@ enum XcodeScanner {
     }
 
     private static func deviceCategory(_ ctx: ScanContext) async -> CleanCategory? {
-        guard ToolPaths.which("xcrun") != nil else { return nil }
+        guard ctx.env.which("xcrun") != nil else { return nil }
         let dir = ctx.home + "/Library/Developer/CoreSimulator/Devices"
         let devices = await onBackground { simulatorDevices(devicesDir: dir) }.filter { $0.state == 1 && ctx.visible($0.path) }
         let sizes = await ctx.sizes(devices.map(\.path))
@@ -218,33 +224,59 @@ enum ContainerScanner {
         }
     }
 
+    /// Parses the output of `docker context inspect --format '{{json .Endpoints.docker.Host}}'` and returns
+    /// the endpoint only when it is a socket on this machine ("unix:///…"). tcp://, ssh://, npipe:// and
+    /// anything unparsable return nil: pruning would then act on some other machine's Docker.
+    static func parseLocalEndpoint(_ output: String) -> String? {
+        let line = output.split(whereSeparator: \.isNewline).first.map(String.init)?.trimmingCharacters(in: .whitespaces) ?? ""
+        guard !line.isEmpty else { return nil }
+        var host = line
+        if line.hasPrefix("\"") {
+            guard let decoded = try? JSONSerialization.jsonObject(with: Data(line.utf8), options: [.fragmentsAllowed]) as? String else { return nil }
+            host = decoded
+        }
+        return CommandPolicy.isLocalDockerEndpoint(host) ? host : nil
+    }
+
+    /// The selected Docker endpoint, if it is local. The child environment carries no DOCKER_HOST or
+    /// DOCKER_CONTEXT, so this is the current context from Docker's own configuration.
+    static func localEndpoint(_ env: EngineEnvironment) async -> String? {
+        let r = await env.run(["docker", "context", "inspect", "--format", "{{json .Endpoints.docker.Host}}"], timeout: 15)
+        guard r.ok else { return nil }
+        return parseLocalEndpoint(r.stdout)
+    }
+
     static func scan(_ ctx: ScanContext) async -> [CleanCategory] {
-        guard ToolPaths.which("docker") != nil else { return [] }
+        guard ctx.env.which("docker") != nil else { return [] }
         ctx.progress("Asking Docker what is reclaimable…")
-        let r = await runCommand(["docker", "system", "df", "--format", "{{json .}}"], timeout: 25)
+        // Docker categories exist only for a daemon on this Mac, and every command names that endpoint
+        // explicitly, so a context switched between scan and clean cannot redirect a prune.
+        guard let endpoint = await localEndpoint(ctx.env) else { return [] }
+        let r = await ctx.env.run(["docker", "--host", endpoint, "system", "df", "--format", "{{json .}}"], timeout: 25)
         guard r.ok else { return [] }
+        let where_ = " Daemon: \(endpoint)"
         var out: [CleanCategory] = []
         for row in parseDf(r.stdout) where row.reclaimable >= oneMB {
             let spec: (id: String, name: String, detail: String, level: SafetyLevel, cmd: [String], upper: Bool)?
             switch row.type {
             case "Images":
-                spec = ("docker-images", "Docker unused images", "Images no container uses; pulled or rebuilt when needed. Shared layers may free less",
-                        .caution, ["docker", "image", "prune", "-af"], true)
+                spec = ("docker-images", "Docker unused images", "Images no container uses; pulled or rebuilt when needed. Shared layers may free less.",
+                        .caution, ["image", "prune", "-af"], true)
             case "Build Cache":
-                spec = ("docker-build-cache", "Docker build cache", "Layer cache of image builds; the next build is slower once",
-                        .safe, ["docker", "builder", "prune", "-af"], false)
+                spec = ("docker-build-cache", "Docker build cache", "Layer cache of image builds; the next build is slower once.",
+                        .safe, ["builder", "prune", "-af"], false)
             case "Containers":
-                spec = ("docker-containers", "Docker stopped containers", "Stopped containers and anything written inside them",
-                        .caution, ["docker", "container", "prune", "-f"], false)
+                spec = ("docker-containers", "Docker stopped containers", "Stopped containers and anything written inside them.",
+                        .caution, ["container", "prune", "-f"], false)
             case "Local Volumes":
-                spec = ("docker-volumes", "Docker unused volumes", "Volumes no container uses; databases and uploads live here, so this deletes data",
-                        .caution, ["docker", "volume", "prune", "-af"], false)
+                spec = ("docker-volumes", "Docker unused volumes", "Volumes no container uses; databases and uploads live here, so this deletes data.",
+                        .caution, ["volume", "prune", "-af"], false)
             default: spec = nil
             }
             guard let s = spec else { continue }
-            out.append(CleanCategory(id: s.id, name: s.name, detail: s.detail, level: s.level, symbol: "shippingbox.circle",
-                                     items: [], commands: [s.cmd], sizeBytes: row.reclaimable, sizeIsUpperBound: s.upper,
-                                     group: .containers, itemsSelectable: false))
+            out.append(CleanCategory(id: s.id, name: s.name, detail: s.detail + where_, level: s.level, symbol: "shippingbox.circle",
+                                     items: [], commands: [["docker", "--host", endpoint] + s.cmd], sizeBytes: row.reclaimable,
+                                     sizeIsUpperBound: s.upper, group: .containers, itemsSelectable: false))
         }
         return out
     }

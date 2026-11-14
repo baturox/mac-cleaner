@@ -54,10 +54,13 @@ func makeCategoryDefs(env: EngineEnvironment) -> [CatDef] {
     var tempGlobs = [env.tmp + "/*", env.privateTmp + "/*"]
     if let v = env.varFolders { tempGlobs.append(v + "/C/*") }
 
-    let uvCache = env.variable("UV_CACHE_DIR") ?? "~/.cache/uv"
-    let composer = env.variable("COMPOSER_HOME").map { $0 + "/cache" } ?? "~/.composer/cache"
-    let terraform = env.variable("TF_PLUGIN_CACHE_DIR") ?? "~/.terraform.d/plugin-cache"
-    let ccache = env.variable("CCACHE_DIR").map { [$0] } ?? ["~/.ccache", "~/Library/Caches/ccache", "~/.cache/ccache"]
+    // Only the tools' DEFAULT locations are listed here. A location taken from an environment variable
+    // (UV_CACHE_DIR, COMPOSER_HOME, TF_PLUGIN_CACHE_DIR, CCACHE_DIR, …) could point anywhere, so those are
+    // handled by `OverrideScanner`, which checks what the folder contains and never labels it "safe".
+    let uvCache = "~/.cache/uv"
+    let composer = "~/.composer/cache"
+    let terraform = "~/.terraform.d/plugin-cache"
+    let ccache = ["~/.ccache", "~/Library/Caches/ccache", "~/.cache/ccache"]
     let conda = ["~/.conda/pkgs", "~/miniconda3/pkgs", "~/anaconda3/pkgs", "~/miniforge3/pkgs", "~/mambaforge/pkgs",
                  "~/micromamba/pkgs", "~/.local/share/mamba/pkgs", "~/opt/anaconda3/pkgs", "/opt/homebrew/Caskroom/miniconda/base/pkgs"]
     let bazel = env.bazelRoot.map { [$0] } ?? []
@@ -68,8 +71,8 @@ func makeCategoryDefs(env: EngineEnvironment) -> [CatDef] {
                level: .safe, symbol: "folder", globs: ["~/Library/Caches/*"], exclude: carvedLibraryCaches),
         CatDef(id: "logs", name: "User logs & crash reports", detail: "Old log and crash report files; apps write new ones",
                level: .safe, symbol: "doc.text", globs: ["~/Library/Logs/*", "\(appSupport)/CrashReporter/*"]),
-        CatDef(id: "temp", name: "Temp files older than 7 days", detail: "Leftovers in temporary folders that nothing has touched for a week",
-               level: .safe, symbol: "clock", minAgeDays: 7, globs: tempGlobs, exclude: ["claude-*"]),
+        CatDef(id: "temp", name: "Temp files older than 7 days", detail: "Leftovers in temporary folders where nothing, at any depth, has changed for a week; sockets and other users' files are never touched",
+               level: .safe, symbol: "clock", minAgeDays: 7, deepAge: true, globs: tempGlobs, exclude: ["claude-*"]),
         CatDef(id: "app-caches", name: "App caches (Slack, Chrome, Electron…)", detail: "Web and shader caches inside app data; quit the apps first for a clean result",
                level: .safe, symbol: "app.dashed", globs: appCacheGlobs,
                excludePaths: dedicatedAppSupportDirs.map { h + "/Library/Application Support/" + $0 }),
@@ -94,15 +97,19 @@ func makeCategoryDefs(env: EngineEnvironment) -> [CatDef] {
         CatDef(id: "gradle", name: "Gradle caches", detail: "Re-downloaded on the next build",
                level: .safe, symbol: "gearshape", group: .packageManagers,
                globs: ["~/.gradle/caches", "~/.gradle/daemon", "~/.gradle/wrapper/dists"]),
-        CatDef(id: "maven", name: "Maven local repository", detail: "Re-downloaded on the next build, which can be slow on large projects",
-               level: .safe, symbol: "shippingbox", group: .packageManagers, globs: ["~/.m2/repository"]),
+        CatDef(id: "maven", name: "Maven local repository", detail: "Downloaded dependencies come back on the next build, but artifacts you installed yourself (`mvn install`) do not",
+               level: .caution, symbol: "shippingbox", group: .packageManagers, globs: ["~/.m2/repository"]),
         CatDef(id: "uv", name: "uv cache", detail: "Runs `uv cache prune`, which removes only entries uv no longer needs; size shown is the whole cache",
                level: .safe, symbol: "bolt.horizontal", group: .packageManagers, cmds: [["uv", "cache", "prune"]], needs: "uv",
                measure: [uvCache], fallbackGlobs: [uvCache + "/*"]),
         CatDef(id: "pip", name: "pip cache", detail: "Re-downloaded on the next install",
                level: .safe, symbol: "shippingbox", group: .packageManagers, globs: ["~/Library/Caches/pip", "~/.cache/pip"]),
-        CatDef(id: "poetry", name: "Poetry cache", detail: "Re-downloaded on the next install",
-               level: .safe, symbol: "shippingbox", group: .packageManagers, globs: ["~/Library/Caches/pypoetry"]),
+        CatDef(id: "poetry", name: "Poetry cache", detail: "Downloaded packages and built wheels; re-downloaded on the next install",
+               level: .safe, symbol: "shippingbox", group: .packageManagers,
+               globs: ["~/Library/Caches/pypoetry/cache", "~/Library/Caches/pypoetry/artifacts"]),
+        CatDef(id: "poetry-venvs", name: "Poetry virtual environments", detail: "Environments Poetry created for your projects; each has to be rebuilt with `poetry install`",
+               level: .caution, symbol: "shippingbox", group: .packageManagers, selectable: true,
+               globs: ["~/Library/Caches/pypoetry/virtualenvs/*"]),
         CatDef(id: "conda", name: "Conda / Mamba package cache", detail: "Downloaded packages; environments keep their own hard links",
                level: .safe, symbol: "shippingbox", group: .packageManagers, globs: conda),
         CatDef(id: "cocoapods", name: "CocoaPods cache & specs", detail: "Re-downloaded by `pod install`",

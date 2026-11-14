@@ -16,10 +16,10 @@ final class ProjectTests: EngineTestCase {
         let positives: [(marker: String, folder: String)] = [
             ("package.json", ".next"), ("package.json", ".nuxt"), ("package.json", ".turbo"), ("package.json", ".svelte-kit"),
             ("package.json", ".output"), ("package.json", ".vite"), ("package.json", ".angular"), ("package.json", ".astro"),
-            ("package.json", ".wrangler"), ("package.json", ".vercel"), ("package.json", ".open-next"),
+            ("package.json", ".vercel"), ("package.json", ".open-next"),
             ("package.json", "storybook-static"), ("package.json", ".expo"),
             ("Cargo.toml", "target"), ("pom.xml", "target"), ("Podfile", "Pods"), ("Package.swift", ".build"),
-            ("App.xcodeproj", "DerivedData"), ("main.tf", ".terraform"), ("build.zig", "zig-cache"), ("build.zig", ".zig-cache"),
+            ("App.xcodeproj", "DerivedData"), ("build.zig", "zig-cache"), ("build.zig", ".zig-cache"),
             ("build.zig", "zig-out"), ("mix.exs", "_build"), ("build.gradle", ".cxx"), ("CMakeLists.txt", "cmake-build-debug"),
             ("stack.yaml", ".stack-work"), ("pubspec.yaml", ".dart_tool"), ("settings.gradle.kts", ".gradle"),
             ("Cartfile", "Carthage"), ("tox.ini", ".tox"),
@@ -29,7 +29,7 @@ final class ProjectTests: EngineTestCase {
             try f.file("pos/\(i)-\(p.folder)/\(p.folder)/blob", bytes: 5000)
         }
         // Not reported: same folder names without their marker
-        for (i, folder) in [".next", "target", "Pods", ".build", ".terraform", "_build", ".dart_tool", ".tox", "cmake-build-debug"].enumerated() {
+        for (i, folder) in [".next", "target", "Pods", ".build", "_build", ".dart_tool", ".tox", "cmake-build-debug"].enumerated() {
             try f.file("neg/\(i)-\(folder)/README.md", "m")
             try f.file("neg/\(i)-\(folder)/\(folder)/blob", bytes: 5000)
         }
@@ -136,6 +136,20 @@ final class ProjectTests: EngineTestCase {
                                "ruby/vendor/bundle", "elixir/deps", "elixir/_build"])
     }
 
+    func testWranglerStateAndUnignoredTerraformAreNeverOffered() async throws {
+        let f = try Fixture()
+        // `.wrangler/state` is the local development database: `.wrangler` is not an artifact at all.
+        try f.repo("worker", files: ["package.json": "{}", ".gitignore": ".wrangler/\n"])
+        try f.file("worker/.wrangler/state/v3/d1/db.sqlite", bytes: 5000)
+        try f.file("plain-worker/package.json", "{}"); try f.file("plain-worker/.wrangler/state/x", bytes: 5000)
+        // `.terraform` holds the workspace selection: only when git ignores it.
+        try f.file("nogit-infra/main.tf", "m"); try f.file("nogit-infra/.terraform/providers/x", bytes: 5000)
+        try f.repo("infra-unignored", files: ["main.tf": "m"]); try f.file("infra-unignored/.terraform/providers/x", bytes: 5000)
+        try f.repo("infra", files: ["main.tf": "m", ".gitignore": ".terraform/\n"]); try f.file("infra/.terraform/providers/x", bytes: 5000)
+        let found = try await scan(f)
+        XCTAssertEqual(found, ["infra/.terraform"])
+    }
+
     func testNestedRepoUsesItsOwnGitRoot() async throws {
         let f = try Fixture()
         try f.repo("outer", files: ["package.json": "{}", ".gitignore": ""])
@@ -161,6 +175,8 @@ final class ProjectTests: EngineTestCase {
         XCTAssertNil(ArtifactRules.match(name: "dist", parent: "/nowhere", siblings: ["README.md"]))
         XCTAssertEqual(ArtifactRules.match(name: "dist", parent: "/nowhere", siblings: ["package.json"])?.risky, true)
         XCTAssertEqual(ArtifactRules.match(name: ".next", parent: "/nowhere", siblings: ["package.json"])?.risky, false)
+        XCTAssertNil(ArtifactRules.match(name: ".wrangler", parent: "/nowhere", siblings: ["package.json"]))
+        XCTAssertEqual(ArtifactRules.match(name: ".terraform", parent: "/nowhere", siblings: ["main.tf"])?.risky, true)
         XCTAssertNil(ArtifactRules.match(name: "DerivedData", parent: "/nowhere", siblings: ["x.xcodeproj.bak"]))
         XCTAssertNotNil(ArtifactRules.match(name: "DerivedData", parent: "/nowhere", siblings: ["Foo.xcworkspace"]))
         XCTAssertNil(ArtifactRules.match(name: "obj", parent: "/nowhere", siblings: [".csproj"]), "a bare '.csproj' is not a project file")

@@ -35,52 +35,7 @@ func boundedMap<T: Sendable, R: Sendable>(_ inputs: [T], limit: Int,
     }
 }
 
-// MARK: - Tool lookup
-
-enum ToolPaths {
-    static let dirs: [String] = {
-        let home = NSHomeDirectory()
-        var d = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin",
-                 home + "/.cargo/bin", home + "/.bun/bin", home + "/go/bin", "/usr/local/go/bin",
-                 "/Applications/Docker.app/Contents/Resources/bin"]
-        let nvm = home + "/.nvm/versions/node"
-        if let versions = try? FileManager.default.contentsOfDirectory(atPath: nvm) {
-            let sorted = versions.sorted { $0.compare($1, options: .numeric) == .orderedDescending }
-            d += sorted.map { nvm + "/" + $0 + "/bin" }
-        }
-        d += [home + "/.volta/bin", home + "/Library/pnpm"]
-        return d
-    }()
-
-    static let pathString: String = {
-        var parts = dirs
-        if let existing = ProcessInfo.processInfo.environment["PATH"] {
-            parts += existing.split(separator: ":").map(String.init).filter { !parts.contains($0) }
-        }
-        return parts.joined(separator: ":")
-    }()
-
-    static func which(_ name: String) -> String? {
-        if name.contains("/") {
-            return FileManager.default.isExecutableFile(atPath: name) ? name : nil
-        }
-        for dir in dirs {
-            let p = dir + "/" + name
-            var isDir: ObjCBool = false
-            if FileManager.default.fileExists(atPath: p, isDirectory: &isDir), !isDir.boolValue,
-               FileManager.default.isExecutableFile(atPath: p) { return p }
-        }
-        return nil
-    }
-
-    static var environment: [String: String] {
-        var env = ProcessInfo.processInfo.environment
-        env["PATH"] = pathString
-        return env
-    }
-}
-
-// MARK: - Subprocess
+// MARK: - Subprocess (tool lookup and child environments live in Tools.swift)
 
 struct ProcResult: Sendable {
     var status: Int32
@@ -126,11 +81,13 @@ private final class ProcessHandle: @unchecked Sendable {
     }
 }
 
-private func runBlocking(_ exe: String, _ args: [String], timeout: TimeInterval, handle: ProcessHandle) -> ProcResult {
+private func runBlocking(_ exe: String, _ args: [String], timeout: TimeInterval, environment: [String: String],
+                         directory: String?, handle: ProcessHandle) -> ProcResult {
     let p = Process()
     p.executableURL = URL(fileURLWithPath: exe)
     p.arguments = args
-    p.environment = ToolPaths.environment
+    p.environment = environment
+    if let directory { p.currentDirectoryURL = URL(fileURLWithPath: directory, isDirectory: true) }
     p.standardInput = FileHandle.nullDevice
     let outPipe = Pipe(), errPipe = Pipe()
     p.standardOutput = outPipe
@@ -161,24 +118,19 @@ private func runBlocking(_ exe: String, _ args: [String], timeout: TimeInterval,
                       timedOut: handle.timedOut, launched: true)
 }
 
-/// Runs an executable (absolute path) with a timeout; terminates the child if the Swift task is cancelled.
-func runProcess(_ exe: String, _ args: [String], timeout: TimeInterval = 120) async -> ProcResult {
+/// Runs an executable (absolute path) with a timeout and exactly the given environment (nothing is
+/// inherited); terminates the child if the Swift task is cancelled.
+func runProcess(_ exe: String, _ args: [String], timeout: TimeInterval = 120,
+                environment: [String: String] = ChildEnvironment.system, directory: String? = nil) async -> ProcResult {
     let handle = ProcessHandle()
     return await withTaskCancellationHandler {
         await withCheckedContinuation { (cont: CheckedContinuation<ProcResult, Never>) in
             DispatchQueue.global(qos: .utility).async {
-                cont.resume(returning: runBlocking(exe, args, timeout: timeout, handle: handle))
+                cont.resume(returning: runBlocking(exe, args, timeout: timeout, environment: environment,
+                                                   directory: directory, handle: handle))
             }
         }
     } onCancel: { handle.cancel() }
-}
-
-/// Resolve argv[0] through ToolPaths and run.
-func runCommand(_ argv: [String], timeout: TimeInterval = 120) async -> ProcResult {
-    guard let first = argv.first, let exe = ToolPaths.which(first) else {
-        return ProcResult(status: 127, stdout: "", stderr: "command not found", timedOut: false, launched: false)
-    }
-    return await runProcess(exe, Array(argv.dropFirst()), timeout: timeout)
 }
 
 // MARK: - du
@@ -255,34 +207,79 @@ func globPaths(_ pattern: String) -> [String] {
     return (0..<Int(g.gl_pathc)).compactMap { g.gl_pathv[$0].map { String(cString: $0) } }
 }
 
-/// Glob that expands "~" and includes dotfiles for a trailing "/*".
-func expandPattern(_ pattern: String, home: String = NSHomeDirectory()) -> [String] {
-    var p = pattern
-    if p.hasPrefix("~/") { p = home + p.dropFirst(1) }
-    if p.hasSuffix("/*") {
-        var out: [String] = []
-        for parent in globPaths(String(p.dropLast(2))) {
-            if let names = readDir(parent) { out += names.map { parent + "/" + $0.name } }
-        }
-        return out
-    }
-    return globPaths(p)
-}
-
 func realPath(_ path: String) -> String? {
     guard let r = realpath(path, nil) else { return nil }
     defer { free(r) }
     return String(cString: r)
 }
 
-// MARK: - git
+// MARK: - Symlink-free, ownership-aware glob expansion
 
-/// Runs git against one working copy: no optional locks, no prompts, bounded time.
-func runGit(_ repo: String, _ args: [String], timeout: TimeInterval = 30) async -> ProcResult {
-    guard let exe = ToolPaths.which("git") else {
-        return ProcResult(status: 127, stdout: "", stderr: "git not found", timedOut: false, launched: false)
+enum SafeGlob {
+    /// True when `dir` is a real directory and no component on the way to it (from "/") is a symlink.
+    /// Below `sharedRoot` (a world-writable temp area) every component must also belong to `uid`, because
+    /// other accounts can create entries there.
+    static func isPlainDirectory(_ dir: String, sharedRoot: String?, uid: uid_t) -> Bool {
+        guard dir.hasPrefix("/") else { return false }
+        var current = ""
+        for comp in dir.split(separator: "/", omittingEmptySubsequences: true) {
+            if comp == "." || comp == ".." { return false }
+            current += "/" + comp
+            var st = stat()
+            guard lstat(current, &st) == 0, (st.st_mode & S_IFMT) == S_IFDIR else { return false }
+            if let root = sharedRoot, current.hasPrefix(root + "/"), st.st_uid != uid { return false }
+        }
+        return true
     }
-    return await runProcess(exe, ["--no-optional-locks", "-C", repo] + args, timeout: timeout)
+
+    /// The fixed directory a pattern is anchored at: everything before the first component with a wildcard,
+    /// or the parent when the pattern has none.
+    static func root(of pattern: String) -> String {
+        let comps = pattern.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
+        var fixed: [String] = []
+        for c in comps.dropLast() {
+            if c.contains(where: { "*?[".contains($0) }) { break }
+            fixed.append(c)
+        }
+        return "/" + fixed.joined(separator: "/")
+    }
+
+    /// Expands "~" and wildcards (a trailing "/*" also lists dotfiles) and returns only matches that
+    ///  * are reached without passing through any symlink,
+    ///  * resolve inside the directory the pattern itself is anchored at, and
+    ///  * in shared temp areas, belong to the current user together with every folder on the way.
+    /// The match itself may be a symlink: it is an item that would be unlinked, never followed.
+    static func expand(_ pattern: String, env: EngineEnvironment) -> [String] {
+        let p = env.expand(pattern)
+        guard p.hasPrefix("/") else { return [] }
+        let anchor = root(of: p)
+        guard let realAnchor = realPath(anchor) else { return [] }
+        var candidates: [String] = []
+        if p.hasSuffix("/*") {
+            for parent in globPaths(String(p.dropLast(2))) {
+                guard isPlainDirectory(parent, sharedRoot: env.sharedRoot(containing: parent), uid: env.uid),
+                      let names = readDir(parent) else { continue }
+                candidates += names.map { parent + "/" + $0.name }
+            }
+        } else {
+            candidates = globPaths(p)
+        }
+        return candidates.filter { accepts($0, realAnchor: realAnchor, env: env) }
+    }
+
+    /// The checks every listed item must pass (also used for paths that do not come from a glob).
+    static func accepts(_ path: String, realAnchor: String, env: EngineEnvironment) -> Bool {
+        let parent = (path as NSString).deletingLastPathComponent
+        let shared = env.sharedRoot(containing: path)
+        guard isPlainDirectory(parent, sharedRoot: shared, uid: env.uid),
+              let realParent = realPath(parent),
+              realParent == realAnchor || realParent.hasPrefix(realAnchor == "/" ? "/" : realAnchor + "/") else { return false }
+        if shared != nil {
+            var st = stat()
+            guard lstat(path, &st) == 0, st.st_uid == env.uid else { return false }
+        }
+        return true
+    }
 }
 
 /// Modification time of a path without following symlinks.
@@ -292,21 +289,27 @@ func modificationDate(_ path: String) -> Date? {
     return Date(timeIntervalSince1970: TimeInterval(st.st_mtimespec.tv_sec) + TimeInterval(st.st_mtimespec.tv_nsec) / 1e9)
 }
 
-/// True if anything at or below `path` (to a bounded number of entries, symlinks not followed) changed
-/// after `cutoff`. Used so that a folder that looks old by its own timestamp but is still being written to
-/// further down is not treated as idle.
+/// True if anything at or below `path` (symlinks not followed) changed after `cutoff`, so that a folder
+/// that looks old by its own timestamp but is still being written to further down is not treated as idle.
+/// Fails CLOSED: when the walk hits its entry cap or cannot read something, the answer is "active".
+/// Sockets, FIFOs and device nodes also count as activity: they belong to something that may be running.
 func hasActivity(since cutoff: Date, at path: String, maxEntries: Int = 50_000) -> Bool {
     var stack = [path]
     var seen = 0
     while let p = stack.popLast() {
         var st = stat()
-        guard lstat(p, &st) == 0 else { continue }
+        guard lstat(p, &st) == 0 else { return true }
         let m = Date(timeIntervalSince1970: TimeInterval(st.st_mtimespec.tv_sec))
         if m > cutoff { return true }
-        guard (st.st_mode & S_IFMT) == S_IFDIR, let kids = readDir(p) else { continue }
+        switch st.st_mode & S_IFMT {
+        case S_IFSOCK, S_IFIFO, S_IFCHR, S_IFBLK: return true
+        case S_IFDIR: break
+        default: continue
+        }
+        guard let kids = readDir(p) else { return true }
         for k in kids {
             seen += 1
-            if seen > maxEntries { return false }
+            if seen > maxEntries { return true }
             stack.append(p + "/" + k.name)
         }
     }

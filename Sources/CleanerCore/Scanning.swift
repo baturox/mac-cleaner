@@ -60,21 +60,25 @@ struct ScanContext: Sendable {
 // MARK: - Generic (glob based) categories
 
 enum GenericScanner {
-    private static func snapshotDates() async -> [String] {
-        let r = await runCommand(["tmutil", "listlocalsnapshotdates", "/"])
+    /// Dates of the local snapshots, in the exact form `tmutil deletelocalsnapshots` takes.
+    private static func snapshotDates(_ env: EngineEnvironment) async -> [String] {
+        let r = await env.run(["tmutil", "listlocalsnapshotdates", "/"])
         return r.stdout.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { $0.first?.isNumber == true && $0.count > 1 && $0.dropFirst().first?.isNumber == true }
+            .filter(CommandPolicy.isSnapshotDate)
     }
 
-    private static func isAvailable(_ def: CatDef) async -> Bool {
+    private static func isAvailable(_ def: CatDef, env: EngineEnvironment) async -> Bool {
         if def.id == "snapshots" {
-            guard ToolPaths.which("tmutil") != nil else { return false }
-            return !(await snapshotDates()).isEmpty
+            guard env.which("tmutil") != nil else { return false }
+            return !(await snapshotDates(env)).isEmpty
         }
         return true
     }
 
     /// Paths matched by the definition's globs, after exclusions, protection and age filters.
+    /// Expansion never passes through a symlink, stays inside the folder each pattern is anchored at and,
+    /// in shared temp areas, lists only what the user owns (see `SafeGlob`). Sockets, FIFOs and device nodes
+    /// are never items: they belong to a running program.
     static func itemPaths(of def: CatDef, globs: [String], ctx: ScanContext) -> [String] {
         var minAge = Double(def.minAgeDays) * 86400
         if def.useRetention { minAge = max(minAge, Double(max(0, ctx.settings.sessionRetentionDays)) * 86400) }
@@ -86,9 +90,13 @@ enum GenericScanner {
                 if def.exclude.contains(where: { fnmatch($0, name, 0) == 0 }) { continue }
                 if def.excludePaths.contains(where: { p == $0 || p.hasPrefix($0 + "/") }) { continue }
                 if !ctx.visible(p) { continue }
+                var st = stat()
+                guard lstat(p, &st) == 0 else { continue }
+                switch st.st_mode & S_IFMT {
+                case S_IFSOCK, S_IFIFO, S_IFCHR, S_IFBLK: continue
+                default: break
+                }
                 if minAge > 0 {
-                    var st = stat()
-                    guard lstat(p, &st) == 0 else { continue }
                     if Double(st.st_mtimespec.tv_sec) > cutoff { continue }
                     if def.deepAge && hasActivity(since: Date(timeIntervalSince1970: cutoff), at: p) { continue }
                 }
@@ -100,8 +108,8 @@ enum GenericScanner {
 
     static func measure(_ def: CatDef, ctx: ScanContext) async -> CleanCategory? {
         if Task.isCancelled { return nil }
-        guard await isAvailable(def) else { return nil }
-        let missingTool = !def.needs.isEmpty && ToolPaths.which(def.needs) == nil
+        guard await isAvailable(def, env: ctx.env) else { return nil }
+        let missingTool = !def.needs.isEmpty && ctx.env.which(def.needs) == nil
         if missingTool && def.fallbackGlobs.isEmpty { return nil }
         let globs = missingTool ? def.fallbackGlobs : def.globs
         let commands = missingTool ? [] : def.cmds
@@ -127,14 +135,14 @@ enum GenericScanner {
         if def.measure.isEmpty { return make(items: [], size: 0, upper: true) }   // snapshots
         let shown = await onBackground { def.measure.flatMap { ctx.env.expandPattern($0) }.filter(ctx.visible) }
         var total = shown.isEmpty ? 0 : (await duSizes(shown)).values.reduce(0, +)
-        if def.id == "brew", let estimate = await brewEstimate() { total = max(total, estimate) }
+        if def.id == "brew", let estimate = await brewEstimate(ctx.env) { total = max(total, estimate) }
         if total < oneMB { return nil }
         return make(items: [], size: total, upper: true)
     }
 
     /// `brew cleanup -n` reports "This operation would free approximately 1.2GB of disk space."
-    static func brewEstimate() async -> Int64? {
-        let r = await runCommand(["brew", "cleanup", "-n", "-s", "--prune=all"], timeout: 60)
+    static func brewEstimate(_ env: EngineEnvironment) async -> Int64? {
+        let r = await env.run(["brew", "cleanup", "-n", "-s", "--prune=all"], timeout: 60)
         guard r.ok, let range = (r.stdout + r.stderr).range(of: #"approximately ([0-9.]+) ?([KMGT]?B)"#, options: .regularExpression)
         else { return nil }
         let parts = (r.stdout + r.stderr)[range].split(separator: " ").dropFirst()   // ["1.2GB"] or ["1.2", "GB"]
@@ -147,12 +155,12 @@ enum GenericScanner {
         return Int64(value * mult)
     }
 
-    static func snapshotCleanup(progress: ProgressHandler) async -> (failed: Int, messages: [String]) {
+    static func snapshotCleanup(env: EngineEnvironment, progress: ProgressHandler) async -> (failed: Int, messages: [String]) {
         var failed = 0
         var messages: [String] = []
-        for date in await snapshotDates() {
+        for date in await snapshotDates(env) {
             progress("Deleting snapshot \(date)…")
-            let r = await runCommand(["tmutil", "deletelocalsnapshots", date])
+            let r = await env.run(["tmutil", "deletelocalsnapshots", date])
             if !r.ok {
                 failed += 1
                 messages.append("Could not delete snapshot \(date) — try: sudo tmutil deletelocalsnapshots \(date)")

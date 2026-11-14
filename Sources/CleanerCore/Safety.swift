@@ -27,12 +27,39 @@ func canonicalPath(_ path: String) -> String {
     return (realParent == "/" ? "" : realParent) + "/" + last
 }
 
+/// Identity of a file system object, independent of the name (and the letter case) used to reach it.
+struct FileID: Hashable, Sendable {
+    var dev: dev_t
+    var ino: ino_t
+    init(_ st: stat) { dev = st.st_dev; ino = st.st_ino }
+
+    /// Identity of the entry itself (a symlink is not followed).
+    static func of(_ path: String) -> FileID? {
+        var st = stat()
+        return lstat(path, &st) == 0 ? FileID(st) : nil
+    }
+}
+
+/// Folds a path for comparison on a case-insensitive, normalization-insensitive volume (the APFS default):
+/// "~/Library/keychains" and "~/Library/Keychains" are the same folder there. On a case-sensitive volume
+/// this protects a little more than necessary, never less.
+func foldedPath(_ path: String) -> String {
+    path.precomposedStringWithCanonicalMapping.lowercased()
+}
+
 /// What the engine must never list or delete. Built from the built-in list plus the user's `protectedPaths`.
+/// A path is matched two ways: by folded name (which also covers protected paths that do not exist yet) and
+/// by file identity (device + inode of each protected root that exists), so a differently-cased or
+/// otherwise aliased spelling of a protected location is still recognized.
 struct PathGuard: Sendable {
     /// The path itself and everything below it is protected.
     private(set) var subtrees: [String] = []
     /// Only the path itself is protected (its contents stay deletable through an explicit selection).
     private(set) var exact: [String] = []
+    private var foldedSubtrees: [String] = []
+    private var foldedExact: Set<String> = []
+    private(set) var subtreeIDs: Set<FileID> = []
+    private(set) var exactIDs: Set<FileID> = []
 
     /// Locations that no code path may delete: credentials, tool configuration and the user's own folders.
     static func builtInSubtrees(home: String) -> [String] {
@@ -60,7 +87,8 @@ struct PathGuard: Sendable {
         ]
     }
 
-    /// The user's own top-level folders: never deletable themselves.
+    /// The user's own top-level folders: never deletable themselves. (The deleter's depth rule refuses them
+    /// too; listing them here also hides them from every scanner and makes the identity check cover them.)
     static func builtInExact(home: String) -> [String] {
         ["Documents", "Desktop", "Downloads", "Pictures", "Movies", "Music", "Library", "Applications", "Public"]
             .map { home + "/" + $0 }
@@ -70,7 +98,7 @@ struct PathGuard: Sendable {
         var roots: [String] = []
         for pattern in Self.builtInSubtrees(home: env.home) {
             if pattern.contains("*") {
-                roots += expandPattern(pattern, home: env.home).map(canonicalPath)
+                roots += globPaths(pattern).map(canonicalPath)
             } else {
                 roots.append(canonicalPath(pattern))
             }
@@ -86,21 +114,51 @@ struct PathGuard: Sendable {
         }
         subtrees = Array(Set(roots)).filter { $0 != "/" }
         exact = Self.builtInExact(home: env.home).map(canonicalPath)
+        foldedSubtrees = Array(Set(subtrees.map(foldedPath)))
+        foldedExact = Set(exact.map(foldedPath))
+        // Identity of the roots that exist, both of the entry itself and of what it points at when it is a link.
+        func ids(_ paths: [String]) -> Set<FileID> {
+            var out = Set<FileID>()
+            for p in paths {
+                var st = stat()
+                if lstat(p, &st) == 0 { out.insert(FileID(st)) }
+                if stat(p, &st) == 0 { out.insert(FileID(st)) }
+            }
+            return out
+        }
+        subtreeIDs = ids(subtrees)
+        exactIDs = ids(exact)
     }
 
-    /// The path is protected, or lies below a protected path.
-    func isProtected(_ path: String) -> Bool {
+    /// The object with this identity is a protected root (used while walking a tree by descriptor).
+    func isProtectedID(_ id: FileID) -> Bool { subtreeIDs.contains(id) || exactIDs.contains(id) }
+
+    /// The path is protected, or lies below a protected path. With `checkAncestors` false only the entry's
+    /// own identity is looked up: for walkers that come down from a folder they have already checked.
+    func isProtected(_ path: String, checkAncestors: Bool = true) -> Bool {
         let p = canonicalPath(path)
-        if exact.contains(p) { return true }
-        for root in subtrees where p == root || p.hasPrefix(root + "/") { return true }
+        let folded = foldedPath(p)
+        if foldedExact.contains(folded) { return true }
+        for root in foldedSubtrees where folded == root || folded.hasPrefix(root + "/") { return true }
+        // Same object under another name?
+        if let id = FileID.of(p) {
+            if exactIDs.contains(id) || subtreeIDs.contains(id) { return true }
+        }
+        if checkAncestors, !subtreeIDs.isEmpty {
+            var dir = (p as NSString).deletingLastPathComponent
+            while dir.count > 1 {
+                if let id = FileID.of(dir), subtreeIDs.contains(id) { return true }
+                dir = (dir as NSString).deletingLastPathComponent
+            }
+        }
         return false
     }
 
     /// The path is a parent of a protected path, so removing it would remove protected data.
     func containsProtected(_ path: String) -> Bool {
-        let p = canonicalPath(path)
+        let p = foldedPath(canonicalPath(path))
         let prefix = p == "/" ? "/" : p + "/"
-        for root in subtrees where root.hasPrefix(prefix) { return true }
+        for root in foldedSubtrees where root.hasPrefix(prefix) { return true }
         return false
     }
 
@@ -108,39 +166,71 @@ struct PathGuard: Sendable {
     func blocks(_ path: String) -> Bool { isProtected(path) || containsProtected(path) }
 }
 
+/// The locations no code path may delete, for front ends that want to show them (`mac-cleaner doctor`).
+public enum ProtectedLocations {
+    /// Built-in protected paths with the home folder written as "~". Entries with "*" are patterns.
+    public static func builtIn() -> [String] {
+        PathGuard.builtInSubtrees(home: "~").sorted()
+    }
+}
+
 // MARK: - Command allowlist
 
-/// Commands the engine itself generates. A `CleanCategory` arriving from outside must not be able to
-/// make the engine run arbitrary programs, so argv[0] must be a bare tool name from this table and, where
-/// the table lists sub-commands, argv[1] must be one of them.
+/// Commands the engine itself generates. A `CleanCategory` arriving from outside must not be able to make
+/// the engine run arbitrary programs or arbitrary sub-commands of an allowed program, so a command is
+/// accepted only when its WHOLE argv has one of the shapes below: fixed words, plus at most one variable
+/// argument that must match a strict pattern. Everything else is refused, including extra arguments.
+/// (git is not here: `removeClones` runs it through `Git.run`, never through a category.)
 enum CommandPolicy {
-    /// tool -> allowed first arguments (nil = any).
-    static let allowed: [String: Set<String>?] = [
-        "xcrun": ["simctl"],
-        "ollama": ["rm"],
-        "docker": ["system", "builder", "image", "container", "volume", "buildx"],
-        "brew": ["cleanup"],
-        "pnpm": ["store"],
-        "npm": ["cache"],
-        "yarn": ["cache"],
-        "go": ["clean"],
-        "uv": ["cache"],
-        "pip": ["cache"],
-        "pip3": ["cache"],
-        "conda": ["clean"],
-        "mamba": ["clean"],
-        "poetry": ["cache"],
-        "tmutil": ["deletelocalsnapshots"],
-        "git": ["worktree", "-C"],
+    private static func matches(_ pattern: String, _ s: String) -> Bool {
+        s.range(of: pattern, options: .regularExpression) != nil
+    }
+
+    static let uuidPattern = "^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"
+    /// Simulator device identifier: a UUID.
+    static func isUDID(_ s: String) -> Bool { matches(uuidPattern, s) }
+    /// Simulator runtime identifier as printed by `simctl runtime list -j`: a UUID.
+    static func isRuntimeID(_ s: String) -> Bool { matches(uuidPattern, s) }
+    /// Ollama model reference: "name", "namespace/name" or "host/namespace/name", optionally ":tag".
+    /// Must start with a letter or digit, so it can never be read as an option.
+    static func isOllamaName(_ s: String) -> Bool {
+        s.count <= 255 && matches("^[A-Za-z0-9][A-Za-z0-9._/-]*(:[A-Za-z0-9._-]+)?$", s)
+    }
+    /// Local snapshot date as printed by `tmutil listlocalsnapshotdates`.
+    static func isSnapshotDate(_ s: String) -> Bool { matches("^[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{6}$", s) }
+    /// A local Docker endpoint: "unix://" followed by an absolute socket path.
+    static func isLocalDockerEndpoint(_ s: String) -> Bool {
+        s.count <= 300 && matches("^unix:///[A-Za-z0-9._ /-]+$", s) && !s.contains("/../") && !s.hasSuffix("/..")
+    }
+
+    private static let fixed: Set<[String]> = [
+        ["xcrun", "simctl", "delete", "unavailable"],
+        ["brew", "cleanup", "-s", "--prune=all"],
+        ["pnpm", "store", "prune"],
+        ["go", "clean", "-modcache"],
+        ["uv", "cache", "prune"],
+    ]
+
+    /// Docker prune commands, always preceded by `--host <local unix socket>` (see `ContainerScanner`).
+    private static let dockerTails: Set<[String]> = [
+        ["image", "prune", "-af"], ["builder", "prune", "-af"], ["container", "prune", "-f"], ["volume", "prune", "-af"],
     ]
 
     static func isAllowed(_ argv: [String]) -> Bool {
-        guard let tool = argv.first, !tool.contains("/"), let subs = allowed[tool] else { return false }
-        if let subs {
-            guard argv.count >= 2, subs.contains(argv[1]) else { return false }
-            // `git -C <dir> worktree …` is the only other git shape.
-            if tool == "git" && argv[1] == "-C" { return argv.count >= 4 && argv[3] == "worktree" }
+        if fixed.contains(argv) { return true }
+        switch argv.count {
+        case 3 where argv[0] == "ollama" && argv[1] == "rm":
+            return isOllamaName(argv[2])
+        case 3 where argv[0] == "tmutil" && argv[1] == "deletelocalsnapshots":
+            return isSnapshotDate(argv[2])
+        case 4 where Array(argv[0..<3]) == ["xcrun", "simctl", "delete"]:
+            return isUDID(argv[3])
+        case 5 where Array(argv[0..<4]) == ["xcrun", "simctl", "runtime", "delete"]:
+            return isRuntimeID(argv[4])
+        case 5...6 where argv[0] == "docker" && argv[1] == "--host":
+            return isLocalDockerEndpoint(argv[2]) && dockerTails.contains(Array(argv[3...]))
+        default:
+            return false
         }
-        return true
     }
 }

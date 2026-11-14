@@ -6,15 +6,17 @@ import XCTest
 /// Layout: <root>/home, <root>/tmp, <root>/private-tmp, <root>/history, <root>/trashbin.
 final class Fixture: @unchecked Sendable {
     let root: String
-    let env: EngineEnvironment
+    /// Mutable so a test can adjust it (for example `env.uid`, to simulate files owned by someone else).
+    var env: EngineEnvironment
     var home: String { env.home }
-    init(vars: [String: String] = [:]) throws {
+    /// `tools` defaults to "nothing installed": no test starts a real third-party program.
+    init(vars: [String: String] = [:], tools: ToolBox = .none) throws {
         let base = (NSTemporaryDirectory() as NSString).appendingPathComponent("MacCleanerTests-" + UUID().uuidString)
         try FileManager.default.createDirectory(atPath: base, withIntermediateDirectories: true)
         let real = realPath(base) ?? base
         root = real
         let box = TrashBox()
-        env = EngineEnvironment.fixture(root: real, vars: vars) { url in
+        env = EngineEnvironment.fixture(root: real, vars: vars, tools: tools) { url in
             try box.take(url, into: real + "/trashbin")
         }
         trashBox = box
@@ -28,7 +30,18 @@ final class Fixture: @unchecked Sendable {
     var trashedPaths: [String] { trashBox.paths }
 
     deinit {
-        if FileManager.default.fileExists(atPath: root) { try? FileManager.default.removeItem(atPath: root) }
+        guard FileManager.default.fileExists(atPath: root) else { return }
+        // Tests lock things down (read-only folders, immutable files); undo that so the tree can go.
+        if let all = FileManager.default.enumerator(atPath: root) {
+            for case let rel as String in all {
+                let p = root + "/" + rel
+                var st = stat()
+                guard lstat(p, &st) == 0, (st.st_mode & S_IFMT) != S_IFLNK else { continue }
+                if st.st_flags != 0 { chflags(p, 0) }
+                if (st.st_mode & S_IFMT) == S_IFDIR, st.st_mode & 0o700 != 0o700 { chmod(p, 0o700) }
+            }
+        }
+        try? FileManager.default.removeItem(atPath: root)
     }
 
     func engine(settings: EngineSettings = EngineSettings()) -> LiveEngine {
@@ -90,12 +103,13 @@ final class Fixture: @unchecked Sendable {
 
     func runGitSync(_ cwd: String, _ args: [String]) throws -> String {
         let p = Process()
-        p.executableURL = URL(fileURLWithPath: ToolPaths.which("git") ?? "/usr/bin/git")
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/git")
         p.currentDirectoryURL = URL(fileURLWithPath: cwd)
         p.arguments = ["-c", "user.name=Test", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false",
                        "-c", "init.defaultBranch=main", "-c", "protocol.file.allow=always"] + args
-        var env = ProcessInfo.processInfo.environment
-        env["GIT_CONFIG_GLOBAL"] = "/dev/null"; env["GIT_CONFIG_SYSTEM"] = "/dev/null"; env["GIT_TERMINAL_PROMPT"] = "0"
+        // The developer's own git configuration and environment never reach fixture repositories.
+        var env = ChildEnvironment.base(home: home, tmp: self.env.tmp)
+        env["GIT_CONFIG_GLOBAL"] = "/dev/null"; env["GIT_CONFIG_NOSYSTEM"] = "1"; env["GIT_TERMINAL_PROMPT"] = "0"
         p.environment = env
         let out = Pipe(), err = Pipe()
         p.standardOutput = out; p.standardError = err
@@ -115,6 +129,8 @@ final class Fixture: @unchecked Sendable {
     func repo(_ rel: String, files: [String: String] = ["README.md": "hello"]) throws -> String {
         let p = try dir(rel)
         try git(rel, "init", "-q")
+        // Identity is set in the repository itself (these keys are on the engine's harmless-key allowlist).
+        try git(rel, "config", "user.name", "Test"); try git(rel, "config", "user.email", "test@example.com")
         for (name, text) in files { try file(rel + "/" + name, text) }
         try git(rel, "add", "-A")
         try git(rel, "commit", "-q", "-m", "initial")
@@ -142,12 +158,45 @@ final class TrashBox: @unchecked Sendable {
     }
 }
 
-class EngineTestCase: XCTestCase {
-    override class func setUp() {
-        super.setUp()
-        // Keep git (run by the engine under test) independent of the developer's own git configuration.
-        setenv("GIT_CONFIG_GLOBAL", "/dev/null", 1)
-        setenv("GIT_CONFIG_SYSTEM", "/dev/null", 1)
-        setenv("GIT_TERMINAL_PROMPT", "0", 1)
+/// The engine builds git's environment itself (no global or system configuration, nothing inherited), so
+/// tests need no process-wide setup.
+class EngineTestCase: XCTestCase {}
+
+/// Stands in for installed programs: records every invocation and answers from a closure.
+final class FakeTools: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _calls: [[String]] = []
+    private var _environments: [[String: String]] = []
+    let installed: Set<String>
+    let respond: @Sendable ([String]) -> ProcResult
+
+    init(installed: Set<String>, respond: @escaping @Sendable ([String]) -> ProcResult = { _ in
+        ProcResult(status: 0, stdout: "", stderr: "", timedOut: false, launched: true)
+    }) {
+        self.installed = installed
+        self.respond = respond
+    }
+
+    /// argv of every call, with the tool's bare name first.
+    var calls: [[String]] { lock.lock(); defer { lock.unlock() }; return _calls }
+    var environments: [[String: String]] { lock.lock(); defer { lock.unlock() }; return _environments }
+
+    var box: ToolBox {
+        ToolBox(which: { [installed] name in installed.contains(name) ? "/fake/bin/" + name : nil },
+                exec: { [self] exe, args, environment, _ in
+                    let argv = [(exe as NSString).lastPathComponent] + args
+                    record(argv, environment)
+                    return respond(argv)
+                })
+    }
+
+    private func record(_ argv: [String], _ environment: [String: String]) {
+        lock.lock(); defer { lock.unlock() }
+        _calls.append(argv); _environments.append(environment)
+    }
+
+    static func ok(_ stdout: String = "") -> ProcResult { ProcResult(status: 0, stdout: stdout, stderr: "", timedOut: false, launched: true) }
+    static func fail(_ stderr: String, status: Int32 = 1) -> ProcResult {
+        ProcResult(status: status, stdout: "", stderr: stderr, timedOut: false, launched: true)
     }
 }

@@ -12,14 +12,19 @@ final class RepoTests: EngineTestCase {
         allClones(groups).first { $0.url.path == f.path(rel) }
     }
 
-    /// A repo cloned from a local bare remote, so push state is real.
-    private func cloneWithRemote(_ f: Fixture, remote: String, to rel: String) throws {
+    /// A repo cloned from a bare repository (so the remote-tracking refs are real) whose `origin` is then
+    /// pointed at a network URL: only a network remote counts as a backup.
+    private func cloneWithRemote(_ f: Fixture, remote: String, to rel: String, network: Bool = true) throws {
         let seed = "seed-" + rel.replacingOccurrences(of: "/", with: "-")
         try f.bareRemote(remote)
-        try f.repo(seed)
+        try f.repo(seed, files: ["README.md": "hello", ".gitignore": ".env\n"])
         try f.git(seed, "remote", "add", "origin", f.path(remote))
         try f.git(seed, "push", "-q", "origin", "main")
         _ = try f.runGitSync(f.home, ["clone", "-q", f.path(remote), f.path(rel)])
+        if network {
+            let name = (remote as NSString).lastPathComponent
+            try f.git(rel, "remote", "set-url", "origin", "https://example.invalid/acme/" + name)
+        }
         try FileManager.default.removeItem(atPath: f.path(seed))
     }
 
@@ -84,6 +89,164 @@ final class RepoTests: EngineTestCase {
         XCTAssertTrue(stashed.hasStash)
         XCTAssertEqual(stashed.uncommittedCount, 0)
         XCTAssertFalse(stashed.isFullyBackedUp)
+    }
+
+    // MARK: "Fully backed up" must mean nothing exists only here (finding 4)
+
+    func testDetachedHeadWithLocalOnlyCommitIsNotBackedUp() async throws {
+        let f = try Fixture()
+        try cloneWithRemote(f, remote: "remotes/d.git", to: "code/detached")
+        try f.git("code/detached", "checkout", "-q", "--detach")
+        try f.file("code/detached/work.txt", "work")
+        try f.git("code/detached", "add", "-A"); try f.git("code/detached", "commit", "-q", "-m", "detached work")
+        let scanned1 = await scan(f, root: f.path("code"))
+        let c = try XCTUnwrap(clone(scanned1, "code/detached", f))
+        XCTAssertNil(c.branch)
+        XCTAssertEqual(c.unpushedCount, 1, "a commit reachable only from a detached HEAD is on no branch and no remote")
+        XCTAssertFalse(c.isFullyBackedUp)
+        let r = await f.engine().removeClones([c], force: false, mode: .permanent, progress: { _ in })
+        XCTAssertEqual(r.failedCount, 1)
+        XCTAssertTrue(f.exists("code/detached/work.txt"))
+    }
+
+    func testDetachedLinkedWorktreeWithItsOwnCommitIsNotBackedUp() async throws {
+        let f = try Fixture()
+        try cloneWithRemote(f, remote: "remotes/w.git", to: "code/main")
+        try f.git("code/main", "worktree", "add", "-q", "--detach", f.path("code/wt-detached"))
+        try f.git("code/main", "worktree", "add", "-q", "--detach", f.path("code/wt-at-remote"))
+        try f.file("code/wt-detached/w.txt", "w")
+        try f.git("code/wt-detached", "add", "-A"); try f.git("code/wt-detached", "commit", "-q", "-m", "worktree-only commit")
+        let groups = await scan(f, root: f.path("code"))
+        let wt = try XCTUnwrap(clone(groups, "code/wt-detached", f))
+        XCTAssertTrue(wt.isLinkedWorktree)
+        XCTAssertNil(wt.branch)
+        XCTAssertEqual(wt.unpushedCount, 1)
+        XCTAssertFalse(wt.isFullyBackedUp, "removing it would leave the commit unreachable")
+        let atRemote = try XCTUnwrap(clone(groups, "code/wt-at-remote", f))
+        XCTAssertEqual(atRemote.unpushedCount, 0)
+        XCTAssertTrue(atRemote.isFullyBackedUp, "detached at a commit the remote has")
+        let r = await f.engine().removeClones([wt, atRemote], force: false, mode: .permanent, progress: { _ in })
+        XCTAssertEqual(r.failedCount, 1, r.messages.joined(separator: "; "))
+        XCTAssertTrue(r.messages.joined().contains("detached HEAD"))
+        XCTAssertTrue(f.exists("code/wt-detached/w.txt"))
+        XCTAssertFalse(f.exists("code/wt-at-remote"))
+    }
+
+    func testDetachedWorktreeWithoutNetworkRemoteIsNotBackedUp() async throws {
+        let f = try Fixture()
+        try f.repo("code/main")
+        try f.git("code/main", "worktree", "add", "-q", "--detach", f.path("code/wt"))
+        let scanned2 = await scan(f, root: f.path("code"))
+        let wt = try XCTUnwrap(clone(scanned2, "code/wt", f))
+        XCTAssertNil(wt.unpushedCount)
+        XCTAssertFalse(wt.isFullyBackedUp)
+    }
+
+    func testIgnoredFilesThatExistOnlyHereBlockBackedUp() async throws {
+        let f = try Fixture()
+        try cloneWithRemote(f, remote: "remotes/i.git", to: "code/app")            // .gitignore has ".env"
+        try f.file("code/app/.git/info/exclude", "node_modules/\nbuild/\n.venv/\nsecrets/\n*.log\n.DS_Store\n__pycache__/\n")
+        // Rebuildable or droppings: do not count.
+        try f.file("code/app/node_modules/dep/index.js", "x")
+        try f.file("code/app/build/out.o", "x")
+        try f.file("code/app/.venv/pyvenv.cfg", "home = /usr/bin")
+        try f.file("code/app/debug.log", "x")
+        try f.file("code/app/.DS_Store", "x")
+        try f.file("code/app/pkg/__pycache__/m.pyc", "x")
+        let scanned3 = await scan(f, root: f.path("code"))
+        var c = try XCTUnwrap(clone(scanned3, "code/app", f))
+        XCTAssertEqual(c.uncommittedCount, 0)
+        XCTAssertEqual(c.ignoredFileCount, 0, "build output and OS droppings are not unique data")
+        XCTAssertTrue(c.isFullyBackedUp)
+        // The only copy of a secrets file, and an ignored folder of data.
+        try f.file("code/app/.env", "API_KEY=only-copy")
+        try f.file("code/app/secrets/prod.pem", "x"); try f.file("code/app/secrets/staging.pem", "x")
+        let scanned4 = await scan(f, root: f.path("code"))
+        c = try XCTUnwrap(clone(scanned4, "code/app", f))
+        XCTAssertEqual(c.uncommittedCount, 0, "git status alone still calls it clean")
+        XCTAssertEqual(c.ignoredFileCount, 2, ".env and the secrets folder (a folder counts once)")
+        XCTAssertFalse(c.isFullyBackedUp)
+        let r = await f.engine().removeClones([c], force: false, mode: .permanent, progress: { _ in })
+        XCTAssertEqual(r.failedCount, 1)
+        XCTAssertTrue(r.messages.joined().contains("ignored"), r.messages.joined())
+        XCTAssertTrue(f.exists("code/app/.env"))
+    }
+
+    func testIgnoredEntryClassification() {
+        let repo = "/nowhere"
+        for e in ["node_modules/", "dist/", "build/", ".next/", "target/", "sub/dir/node_modules/", "__pycache__/", "a/b/.DS_Store",
+                  "x.pyc", "npm-debug.log", "xcuserdata/", "App.xcodeproj/xcuserdata/", "coverage/", ".build/", "cmake-build-debug/",
+                  "node_modules", "packages/web/node_modules", "test-results/", "playwright-report/"] {
+            XCTAssertTrue(RepoInspector.isRebuildable(ignored: e, repo: repo), e)
+        }
+        for e in [".env", ".env.local", "config/local.yml", "data/", "db.sqlite3", ".idea/", "notes.txt", "secrets/", "env/", ".venv/",
+                  ".wrangler/", "terraform.tfstate"] {
+            XCTAssertFalse(RepoInspector.isRebuildable(ignored: e, repo: repo), e)
+        }
+    }
+
+    func testRemoteThatIsALocalPathIsNotABackup() async throws {
+        let f = try Fixture()
+        try cloneWithRemote(f, remote: "remotes/local.git", to: "code/second-copy", network: false)
+        try cloneWithRemote(f, remote: "remotes/fileurl.git", to: "code/file-url", network: false)
+        try f.git("code/file-url", "remote", "set-url", "origin", "file://" + f.path("remotes/fileurl.git"))
+        try cloneWithRemote(f, remote: "remotes/rel.git", to: "code/relative", network: false)
+        try f.git("code/relative", "remote", "set-url", "origin", "../../remotes/rel.git")
+        let groups = await scan(f, root: f.path("code"))
+        for rel in ["code/second-copy", "code/file-url", "code/relative"] {
+            let c = try XCTUnwrap(clone(groups, rel, f))
+            XCTAssertNil(c.unpushedCount, "\(rel): a folder on this disk is not a remote")
+            XCTAssertFalse(c.isFullyBackedUp, rel)
+        }
+        XCTAssertTrue(groups.allSatisfy { $0.remote == nil })
+        // A network remote next to a local one still counts, and only its refs do.
+        try f.git("code/second-copy", "remote", "add", "backup", "git@github.com:acme/widget.git")
+        let scanned5 = await scan(f, root: f.path("code"))
+        let again = try XCTUnwrap(clone(scanned5, "code/second-copy", f))
+        XCTAssertNotNil(again.unpushedCount)
+        XCTAssertGreaterThan(again.unpushedCount ?? 0, 0, "nothing was ever pushed to the network remote; origin's refs are local-only")
+    }
+
+    func testUnpushedTagsAreCounted() async throws {
+        let f = try Fixture()
+        try cloneWithRemote(f, remote: "remotes/t.git", to: "code/tagged")
+        try f.file("code/tagged/release.txt", "x")
+        try f.git("code/tagged", "add", "-A"); try f.git("code/tagged", "commit", "-q", "-m", "release")
+        try f.git("code/tagged", "tag", "v1.0.0")
+        try f.git("code/tagged", "reset", "-q", "--hard", "HEAD~1")       // the commit is now reachable only from the tag
+        let scanned6 = await scan(f, root: f.path("code"))
+        let c = try XCTUnwrap(clone(scanned6, "code/tagged", f))
+        XCTAssertEqual(c.uncommittedCount, 0)
+        XCTAssertEqual(c.unpushedCount, 1)
+        XCTAssertFalse(c.isFullyBackedUp)
+    }
+
+    func testForceIsLimitedToAcknowledgedClones() async throws {
+        let f = try Fixture()
+        try cloneWithRemote(f, remote: "remotes/a.git", to: "code/acknowledged")
+        try f.file("code/acknowledged/unsaved.txt", "the user saw the warning for this one")
+        try cloneWithRemote(f, remote: "remotes/b.git", to: "code/clean-at-scan")
+        try cloneWithRemote(f, remote: "remotes/c.git", to: "code/clean")
+        let groups = await scan(f, root: f.path("code"))
+        let ack = try XCTUnwrap(clone(groups, "code/acknowledged", f))
+        let stale = try XCTUnwrap(clone(groups, "code/clean-at-scan", f)), clean = try XCTUnwrap(clone(groups, "code/clean", f))
+        XCTAssertTrue(stale.isFullyBackedUp)
+        try f.file("code/clean-at-scan/late.txt", "work done after the scan; nobody acknowledged losing it")
+
+        let plan = RepoRemovalPlan(clones: [ack, stale, clean], acknowledged: [ack.id])
+        XCTAssertEqual(plan.forced.map(\.id), [ack.id])
+        XCTAssertEqual(Set(plan.unforced.map(\.id)), [stale.id, clean.id], "force never covers a clone the user did not acknowledge")
+        XCTAssertEqual(RepoRemovalPlan(clones: [ack, clean], acknowledged: []).forced, [], "an unacknowledged risky clone is not forced")
+        XCTAssertEqual(RepoRemovalPlan(clones: [clean], acknowledged: [clean.id]).forced, [], "a backed-up clone never needs force")
+
+        let engine = f.engine()
+        let unforced = await engine.removeClones(plan.unforced, force: false, mode: .permanent, progress: { _ in })
+        let forced = await engine.removeClones(plan.forced, force: true, mode: .permanent, progress: { _ in })
+        XCTAssertEqual(unforced.failedCount, 1, "the engine's re-check still protects the one that changed")
+        XCTAssertEqual(forced.failedCount, 0)
+        XCTAssertTrue(f.exists("code/clean-at-scan/late.txt"))
+        XCTAssertFalse(f.exists("code/clean"))
+        XCTAssertFalse(f.exists("code/acknowledged"))
     }
 
     func testRepoWithoutRemoteIsNotBackedUp() async throws {
@@ -270,15 +433,16 @@ final class RepoTests: EngineTestCase {
     func testNestedUnsavedRepoBlocksRemovalOfParent() async throws {
         let f = try Fixture()
         try cloneWithRemote(f, remote: "remotes/p.git", to: "code/parent")
-        try f.file("code/parent/.git/info/exclude", "tools/\n")      // keep the parent itself clean
-        try f.repo("code/parent/tools/inner")
-        try f.file("code/parent/tools/inner/unsaved.txt", "x")
+        // An ignored build folder keeps the parent itself clean; the nested clone inside it is still found.
+        try f.file("code/parent/.git/info/exclude", "build/\n")
+        try f.repo("code/parent/build/inner")
+        try f.file("code/parent/build/inner/unsaved.txt", "x")
         let groups = await scan(f, root: f.path("code"))
         let parent = try XCTUnwrap(clone(groups, "code/parent", f))
         let r = await f.engine().removeClones([parent], force: false, mode: .permanent, progress: { _ in })
         XCTAssertEqual(r.failedCount, 1)
         XCTAssertTrue(r.messages.joined().contains("nested repository inner"), r.messages.joined())
-        XCTAssertTrue(f.exists("code/parent/tools/inner/unsaved.txt"))
+        XCTAssertTrue(f.exists("code/parent/build/inner/unsaved.txt"))
     }
 
     func testRemoveRefusesNonReposProtectedAndOutOfAreaPaths() async throws {
