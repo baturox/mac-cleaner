@@ -8,11 +8,12 @@ struct SizeBar: View {
     var fraction: Double
     var tint: Color = .accentColor
     var height: CGFloat = 4
+    @Environment(\.colorSchemeContrast) private var contrast
 
     var body: some View {
         GeometryReader { g in
             ZStack(alignment: .leading) {
-                Capsule().fill(.quaternary)
+                Capsule().fill(contrast == .increased ? AnyShapeStyle(Color.primary.opacity(0.25)) : AnyShapeStyle(.quaternary))
                 Capsule().fill(tint)
                     .frame(width: fraction > 0 ? max(3, g.size.width * CGFloat(min(1, fraction))) : 0)
             }
@@ -48,6 +49,8 @@ struct StackedBar: View {
         .frame(height: height)
         .background(.quaternary.opacity(0.5))
         .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(segments.prefix(6).map { "\($0.label) \(Fmt.bytes(Int64($0.value)))" }.joined(separator: ", "))
     }
 }
 
@@ -89,6 +92,8 @@ struct DiskGauge: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(.bar)
         .help("Free now: \(Fmt.bytes(disk.freeBytes)). Available including purgeable: \(Fmt.bytes(disk.availableWithPurgeableBytes)).")
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Disk space: \(Fmt.bytes(disk.freeBytes)) free of \(Fmt.bytes(disk.totalBytes))")
     }
 }
 
@@ -117,11 +122,13 @@ struct EmptyStateView: View {
 
 struct KindBadge: View {
     var kind: String
+    @Environment(\.colorSchemeContrast) private var contrast
     var body: some View {
         Text(kind)
             .font(.caption.monospaced())
             .padding(.horizontal, 6).padding(.vertical, 2)
             .background(.quaternary, in: RoundedRectangle(cornerRadius: 4))
+            .overlay(RoundedRectangle(cornerRadius: 4).strokeBorder(Color.primary.opacity(contrast == .increased ? 0.5 : 0)))
             .lineLimit(1)
     }
 }

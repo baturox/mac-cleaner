@@ -21,6 +21,10 @@ struct OverviewView: View {
             list.append(Bucket(id: "projects", name: "Project build folders", symbol: "hammer",
                                bytes: model.projectBytes, target: .projects))
         }
+        if model.extraCopyBytes > 0 {
+            list.append(Bucket(id: "repos", name: "Extra repo copies", symbol: "square.on.square.dashed",
+                               bytes: model.extraCopyBytes, target: .repos))
+        }
         list.sort { $0.bytes > $1.bytes }
         return list.enumerated().map { i, b in
             var b = b; b.color = bucketPalette[i % bucketPalette.count]; return b
@@ -32,6 +36,7 @@ struct OverviewView: View {
             VStack(alignment: .leading, spacing: 18) {
                 header
                 capacityCard
+                GrowthCard(model: model)
                 reclaimCard
             }
             .padding(24)
@@ -48,12 +53,15 @@ struct OverviewView: View {
             VStack(alignment: .leading, spacing: 3) {
                 Text("Disk space").font(.largeTitle.weight(.semibold))
                 Group {
-                    if model.isScanningCategories || model.isScanningProjects {
+                    if model.isScanning {
                         VStack(alignment: .leading, spacing: 1) {
                             if model.isScanningCategories { Text("Caches: \(model.categoryProgress)") }
                             if model.isScanningProjects { Text("Projects: \(model.projectProgress)") }
+                            if model.isScanningRepos { Text("Repos: \(model.repoProgress)") }
                         }
-                    } else if model.hasScannedCategories || model.hasScannedProjects {
+                    } else if !model.stoppedSections.isEmpty {
+                        Text("Scan stopped. Results from the previous scan are kept.")
+                    } else if model.hasAnyScan {
                         Text("Scan complete")
                     } else {
                         Text("Nothing scanned yet")
@@ -63,17 +71,18 @@ struct OverviewView: View {
             }
             Spacer()
             Button {
-                model.scanAll()
+                if model.isScanning { model.stopScanning() } else { model.scanAll() }
             } label: {
                 HStack(spacing: 6) {
                     if model.isScanning { ProgressView().controlSize(.small) } else { Image(systemName: "magnifyingglass") }
-                    Text(model.isScanning ? "Scanning…" : "Scan")
+                    Text(model.isScanning ? "Stop" : "Scan")
                 }
                 .frame(minWidth: 80)
             }
             .controlSize(.large)
             .buttonStyle(.bordered)
-            .disabled(model.isScanning || model.isBusy)
+            .disabled(model.isBusy)
+            .help(model.isScanning ? "Stop scanning (⌘.)" : "Scan everything (⌘R)")
         }
     }
 
@@ -103,7 +112,7 @@ struct OverviewView: View {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("Free now").font(.callout).foregroundStyle(.secondary)
                         Text(Fmt.bytes(d.freeBytes))
-                            .font(.system(size: 26, weight: .semibold)).monospacedDigit()
+                            .font(.title.weight(.semibold)).monospacedDigit()
                             .foregroundStyle(freeColor(d))
                         Text(Fmt.percent(Double(d.freeBytes) / Double(d.totalBytes)) + " of the disk")
                             .font(.caption).foregroundStyle(.secondary)
@@ -111,7 +120,7 @@ struct OverviewView: View {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("Available incl. purgeable").font(.callout).foregroundStyle(.secondary)
                         Text(Fmt.bytes(d.availableWithPurgeableBytes))
-                            .font(.system(size: 26, weight: .semibold)).monospacedDigit()
+                            .font(.title.weight(.semibold)).monospacedDigit()
                         Text(" ").font(.caption)
                     }
                 }
@@ -136,7 +145,7 @@ struct OverviewView: View {
     private var reclaimCard: some View {
         let list = buckets
         return Card(title: "What you can reclaim") {
-            if !model.hasScannedCategories && !model.hasScannedProjects {
+            if !model.hasAnyScan {
                 if model.isScanning {
                     HStack(spacing: 8) { ProgressView().controlSize(.small); Text("Scanning…").foregroundStyle(.secondary) }
                 } else {
@@ -153,8 +162,7 @@ struct OverviewView: View {
                 }
                 VStack(spacing: 0) {
                     ForEach(list.prefix(8)) { b in
-                        Button { model.section = b.target } label: {
-                            HStack(spacing: 10) {
+                        Button { model.section = b.target } label: {                            HStack(spacing: 10) {
                                 RoundedRectangle(cornerRadius: 2).fill(b.color).frame(width: 10, height: 10)
                                 Image(systemName: b.symbol).foregroundStyle(.secondary).frame(width: 20)
                                 Text(b.name).lineLimit(1)
@@ -165,6 +173,8 @@ struct OverviewView: View {
                             .padding(.vertical, 6).contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
+                        .accessibilityLabel("\(b.name), \(Fmt.bytes(b.bytes))")
+                        .accessibilityHint("Opens \(b.target.title)")
                         Divider()
                     }
                 }
@@ -172,6 +182,7 @@ struct OverviewView: View {
                     total("Safe", model.safeBytes, .green)
                     total("Needs review", model.cautionBytes, .orange)
                     total("Project build folders", model.projectBytes, .blue)
+                    if model.extraCopyBytes > 0 { total("Extra repo copies", model.extraCopyBytes, .purple) }
                 }
                 HStack {
                     Spacer()

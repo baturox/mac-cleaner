@@ -24,6 +24,26 @@ enum Fmt {
         return "\(days / 365) y"
     }
 
+    /// "today", "12 d ago", "3 mo ago", "2 y ago".
+    static func ago(_ date: Date?, now: Date = Date()) -> String {
+        guard let date else { return "—" }
+        let days = Int(now.timeIntervalSince(date) / 86_400)
+        if days <= 0 { return "today" }
+        return idle(days) + " ago"
+    }
+
+    static func ageDays(_ date: Date?, now: Date = Date()) -> Int? {
+        guard let date else { return nil }
+        return max(0, Int(now.timeIntervalSince(date) / 86_400))
+    }
+
+    /// "2 days ago" style text for longer sentences.
+    static func relative(_ date: Date, now: Date = Date()) -> String {
+        let f = RelativeDateTimeFormatter()
+        f.unitsStyle = .full
+        return f.localizedString(for: date, relativeTo: now)
+    }
+
     /// Replaces the home folder prefix with `~`.
     static func abbreviate(_ path: String) -> String {
         if path == homePath { return "~" }
@@ -40,6 +60,11 @@ extension URL {
 enum FinderActions {
     static func reveal(_ url: URL) {
         NSWorkspace.shared.activateFileViewerSelecting([url])
+    }
+    static func openInTerminal(_ url: URL) {
+        let terminal = URL(fileURLWithPath: "/System/Applications/Utilities/Terminal.app")
+        let dir = FileManager.default.fileExists(atPath: url.path) ? url : url.deletingLastPathComponent()
+        NSWorkspace.shared.open([dir], withApplicationAt: terminal, configuration: NSWorkspace.OpenConfiguration())
     }
     static func copyPath(_ url: URL) {
         NSPasteboard.general.clearContents()

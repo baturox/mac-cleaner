@@ -19,7 +19,7 @@ struct ExploreView: View {
     private var pathBar: some View {
         HStack(spacing: 8) {
             Button { explore.goBack() } label: { Image(systemName: "chevron.backward") }
-                .disabled(!explore.canGoBack).help("Back")
+                .disabled(!explore.canGoBack).help("Back").accessibilityLabel("Back")
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 4) {
                     ForEach(Array(explore.breadcrumbs.enumerated()), id: \.element.path) { i, url in
@@ -39,7 +39,7 @@ struct ExploreView: View {
             }
             if explore.isLoading { ProgressView().controlSize(.small) }
             Button { explore.reload() } label: { Image(systemName: "arrow.clockwise") }
-                .help("Re-measure this folder").disabled(explore.isLoading)
+                .help("Re-measure this folder").accessibilityLabel("Re-measure this folder").disabled(explore.isLoading)
         }
         .padding(.horizontal, 16).padding(.vertical, 8)
     }
@@ -67,7 +67,7 @@ struct ExploreView: View {
                     Text(Fmt.bytes(e.sizeBytes)).monospacedDigit().frame(width: 84, alignment: .trailing)
                     Button { explore.open(e.url) } label: { Image(systemName: "chevron.right") }
                         .buttonStyle(.borderless).opacity(e.isDirectory ? 1 : 0).disabled(!e.isDirectory)
-                        .help("Open folder")
+                        .help("Open folder").accessibilityLabel("Open \(e.name)")
                 }
                 .padding(.vertical, 2)
                 .tag(e.id)
