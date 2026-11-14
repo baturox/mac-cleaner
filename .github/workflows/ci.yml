@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    name: Build, test and package
+    # Apple-silicon runner with a current Xcode. Checked against the runner-images README for macos-26.
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0   # build number = commit count
+
+      - name: Toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+
+      - name: Cache SwiftPM build
+        uses: actions/cache@v6
+        with:
+          path: .build
+          key: spm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Package.swift') }}-${{ github.sha }}
+          restore-keys: |
+            spm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Package.swift') }}-
+            spm-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Build
+        run: swift build
+
+      - name: Test
+        run: swift test
+
+      - name: Build the app bundle
+        run: scripts/build-app.sh
+
+      - name: Verify the bundle
+        run: |
+          codesign --verify --deep --strict "dist/Mac Cleaner.app"
+          plutil -lint "dist/Mac Cleaner.app/Contents/Info.plist"
+          "dist/Mac Cleaner.app/Contents/Resources/bin/mac-cleaner" --version
+
+      - name: Package
+        run: scripts/package.sh
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: mac-cleaner-${{ github.sha }}
+          path: |
+            dist/*.dmg
+            dist/*.zip
+            dist/*.tar.gz
+            dist/SHA256SUMS
+          retention-days: 7
+          if-no-files-found: error

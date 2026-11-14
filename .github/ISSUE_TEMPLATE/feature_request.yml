@@ -1,0 +1,35 @@
+name: Feature request
+description: Suggest an improvement to the app or the CLI.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+      description: Describe the situation, not the solution. "I keep running out of disk because ..." is ideal.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would you like Mac Cleaner to do?
+    validations:
+      required: true
+  - type: dropdown
+    id: where
+    attributes:
+      label: Where would it live?
+      options:
+        - App
+        - CLI
+        - Both
+        - Not sure
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+  - type: markdown
+    attributes:
+      value: To add a new tool or folder to the cleanup list, please use the "New cleanup target" template instead.

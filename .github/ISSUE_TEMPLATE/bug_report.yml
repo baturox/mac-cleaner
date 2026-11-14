@@ -1,0 +1,45 @@
+name: Bug report
+description: Something does not work, shows a wrong size, or deleted (or failed to delete) the wrong thing.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. If Mac Cleaner **deleted something it should not have**, please say so clearly at the top; that is the most important kind of bug.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, what happened instead?
+    validations:
+      required: true
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version
+      placeholder: "macOS 15.1 (Apple silicon)"
+    validations:
+      required: true
+  - type: input
+    id: app-version
+    attributes:
+      label: Mac Cleaner version
+      description: App > About, or `mac-cleaner --version`. Say whether it is the app, the CLI, or a source build.
+      placeholder: "0.1.0 (app, DMG download)"
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: "`mac-cleaner doctor --json` output"
+      description: |
+        Run `mac-cleaner doctor --json` in Terminal and paste the result (the CLI is inside the app at
+        `/Applications/Mac Cleaner.app/Contents/Resources/bin/mac-cleaner`). It contains disk numbers, tools found and macOS version; it does not contain file names. Look it over before posting.
+      render: json
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Output or screenshots
+      description: Command output (`--no-color`) or a screenshot. Please blank out any paths you do not want to share.

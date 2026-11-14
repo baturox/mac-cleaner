@@ -1,0 +1,54 @@
+name: New cleanup target
+description: Suggest a tool's cache, build output or data folder that Mac Cleaner should offer to remove.
+labels: [cleanup-target]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Mac Cleaner only deletes things that are safe to lose or that the user explicitly picks. Please read
+        "How to add a cleanup category safely" in CONTRIBUTING.md first. Never include credentials, tokens or settings.
+  - type: input
+    id: tool
+    attributes:
+      label: Tool name and version
+      placeholder: "ExampleTool 3.2"
+    validations:
+      required: true
+  - type: textarea
+    id: paths
+    attributes:
+      label: Paths on macOS
+      description: Exact folders (use `~` for the home folder). Link the tool's documentation that names them.
+      placeholder: |
+        ~/Library/Caches/ExampleTool
+        ~/.cache/exampletool
+    validations:
+      required: true
+  - type: textarea
+    id: regenerated
+    attributes:
+      label: How is the data regenerated?
+      description: What happens after deletion? Re-downloaded on next use, rebuilt, or lost for good?
+    validations:
+      required: true
+  - type: dropdown
+    id: level
+    attributes:
+      label: Safe or caution?
+      description: "Safe = rebuilt or re-downloaded automatically with nothing lost. Caution = real data a user may want (models, archives, history)."
+      options:
+        - Safe
+        - Caution
+        - Not sure
+    validations:
+      required: true
+  - type: textarea
+    id: size
+    attributes:
+      label: Typical size and how to check it
+      description: For example "2-20 GB on a machine used daily", plus the `du -sh` command you ran.
+  - type: textarea
+    id: danger
+    attributes:
+      label: Anything that must not be deleted nearby?
+      description: Config files, credentials, databases or state in the same folder.
