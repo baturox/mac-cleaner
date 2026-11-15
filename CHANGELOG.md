@@ -6,6 +6,13 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- An **Apps** screen (sidebar item after Repos, shortcut ⌘5; Explore and History move to ⌘6 and ⌘7) listing installed apps with bundle size, the data they keep in your Library, last opened (Spotlight), and running / App Store / Homebrew / system badges. Sortable, with filters (not opened in 90+ days, 1 GB+, text). The detail panel lists exact-match data by class (cache, settings, data), "possibly related" folders (never ticked) and shared group containers (never removed), with *Clear Caches…* and *Remove App…*. The scan runs at launch with the others and is part of the remembered last scan.
+- *Remove App* moves the bundle to the Trash whatever the delete mode (leftovers follow it). It refuses a running app, Apple apps, Mac Cleaner itself, apps in protected folders, root-owned apps (remove them in Finder) and Homebrew apps (use `brew uninstall --cask`). Identity and bundle id are checked again right before the move. This is the only way anything in `/Applications` is ever moved; the general deleter still refuses it.
+- `mac-cleaner apps` (list with `--json`, `--unused`, `--sort`; `apps <bundle-id>`, `--clear-caches`, `--remove [--with-data]`, `-n`, `-y`, `--trash`) and the read-only MCP tool `list_apps`. No MCP tool removes an app.
+- Audit records of kind `removeApp` and `clearAppCaches`; the log stays readable by this version, older versions cannot decode these two records. The remembered scan file gained an optional `apps` part.
+
 ### Changed
 
 - The app scans everything at launch: caches, Projects and Repos start together and share one folder walk, instead of Projects and Repos waiting until their screen is opened. A section you stopped is not restarted by itself, and nothing starts while a clean is running.
