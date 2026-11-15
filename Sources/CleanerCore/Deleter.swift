@@ -54,6 +54,11 @@ final class DeleteTally: @unchecked Sendable {
         if nlink > 1 { return links.insert(key).inserted }
         return links.isEmpty || !links.contains(key)
     }
+    /// Undoes `countsBytes` for a name whose unlink failed, so its size is not lost.
+    func forgetLink(dev: dev_t, ino: UInt64) {
+        let key = LinkKey(dev: Int32(truncatingIfNeeded: dev), ino: ino)
+        lock.lock(); links.remove(key); lock.unlock()
+    }
     var snapshot: Snapshot {
         lock.lock(); defer { lock.unlock() }
         return Snapshot(entries: entries, bytes: bytes, itemsDone: itemsDone, current: current)
@@ -251,8 +256,9 @@ struct Deleter: Sendable {
                     tally: DeleteTally? = nil, workers: Int = Deleter.defaultWorkers) -> [PathResult] {
         let tally = tally ?? DeleteTally()
         let pool = workers > 1 ? WorkerPool(workers: workers) : nil
-        // Moving to the Trash is a rename per item and stays one at a time, in order.
-        guard let pool, mode == .permanent, paths.count > 1 else {
+        // Moving to the Trash is a rename per item and stays one at a time, in order. Items that contain one another
+        // are also taken one at a time (each may still use several threads inside), so no folder is walked twice at once.
+        guard let pool, mode == .permanent, paths.count > 1, !Self.overlaps(paths) else {
             return paths.map { removeOne($0, mode: mode, flag: flag, tally: tally, pool: pool) }
         }
         let slots = ResultSlots(count: paths.count)
@@ -260,6 +266,22 @@ struct Deleter: Sendable {
             slots.set(i, removeOne(paths[i], mode: mode, flag: flag, tally: tally, pool: pool))
         }, finish: { _ in })
         return slots.all
+    }
+
+    /// True when one path equals or contains another (ignoring letter case, to be safe on case-insensitive volumes).
+    /// Two threads walking the same folder could see each other's temporary mode changes and restore the wrong one.
+    static func overlaps(_ paths: [String]) -> Bool {
+        let norm = paths.map { "/" + $0.lowercased().split(separator: "/", omittingEmptySubsequences: true).joined(separator: "/") }
+        var seen = Set<String>()
+        for p in norm where !seen.insert(p).inserted { return true }
+        for p in norm {
+            var comps = p.split(separator: "/")
+            while comps.count > 1 {
+                comps.removeLast()
+                if seen.contains("/" + comps.joined(separator: "/")) { return true }
+            }
+        }
+        return false
     }
 
     private final class ResultSlots: @unchecked Sendable {
@@ -419,9 +441,13 @@ struct Deleter: Sendable {
             if guardian.isProtectedID(FileID(st)) { failed += 1; skippedProtected += 1; return -1 }
             guard (st.st_mode & S_IFMT) == S_IFDIR else {
                 // Files, symlinks, sockets…: unlinked, never opened or followed.
-                let weigh = (st.st_mode & S_IFMT) != S_IFREG || tally.countsBytes(dev: st.st_dev, ino: UInt64(st.st_ino), nlink: st.st_nlink)
+                let isFile = (st.st_mode & S_IFMT) == S_IFREG
+                let weigh = !isFile || tally.countsBytes(dev: st.st_dev, ino: UInt64(st.st_ino), nlink: st.st_nlink)
                 if unlinkat(dir, name, 0) == 0 { counted(st, countBytes: weigh); return 0 }
-                return errno == ENOENT ? 0 : errno
+                let e = errno
+                // Not removed by this try: the retry (or the file's other name) must still be able to count it.
+                if isFile && weigh && st.st_nlink > 1 { tally.forgetLink(dev: st.st_dev, ino: UInt64(st.st_ino)) }
+                return e == ENOENT ? 0 : e
             }
             if st.st_dev != rootDev { failed += 1; return -1 }            // never descend into another volume
             if let owner = requiredOwner, env.owner(st) != owner { failed += 1; skippedForeign += 1; return -1 }
