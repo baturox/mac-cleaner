@@ -64,10 +64,15 @@ public struct AuditItem: Codable, Sendable, Equatable {
     public var branch: String?
     public var fullyBackedUp: Bool?
     public var forced: Bool?
+    /// Only in "finished" records of 0.1.4 and later: entries (files, links, folders) really removed, counted while
+    /// deleting. `sizeBytes` is then the allocated size counted the same way, not a figure measured beforehand.
+    public var entriesRemoved: Int?
 
     public init(path: String?, name: String, categoryID: String? = nil, artifactKind: String? = nil, sizeBytes: Int64,
                 action: AuditAction, command: [String]? = nil, outcome: AuditOutcome, reason: String? = nil,
-                remote: String? = nil, branch: String? = nil, fullyBackedUp: Bool? = nil, forced: Bool? = nil) {
+                remote: String? = nil, branch: String? = nil, fullyBackedUp: Bool? = nil, forced: Bool? = nil,
+                entriesRemoved: Int? = nil) {
+        self.entriesRemoved = entriesRemoved
         self.path = path; self.name = name; self.categoryID = categoryID; self.artifactKind = artifactKind
         self.sizeBytes = sizeBytes; self.action = action; self.command = command; self.outcome = outcome
         self.reason = reason; self.remote = remote; self.branch = branch; self.fullyBackedUp = fullyBackedUp
@@ -101,6 +106,12 @@ public struct AuditRecord: Codable, Sendable, Equatable, Identifiable {
     public var omittedBytes: Int64
     /// nil in records written before the two-record format (they are complete records).
     public var phase: AuditPhase?
+    /// Optional, written by 0.1.4 and later in "finished" records. True: the operation was stopped before it
+    /// was done (what was removed stays removed; the items not reached are listed as failed, "cancelled").
+    public var cancelled: Bool?
+    /// Optional: totals counted while deleting (all items, including the ones beyond `AuditLimits.maxItems`).
+    public var entriesRemoved: Int?
+    public var bytesRemoved: Int64?
 
     /// True for an operation that has a "started" record but no "finished" one: its process was interrupted
     /// (or is still running). Its items are what it INTENDED to remove; the outcome is unknown.
@@ -109,7 +120,9 @@ public struct AuditRecord: Codable, Sendable, Equatable, Identifiable {
     public init(id: String = UUID().uuidString, version: Int = 1, startedAt: Date, endedAt: Date, client: AuditClient,
                 appVersion: String, kind: AuditOperationKind, mode: DeleteMode, planID: String? = nil,
                 freeBytesBefore: Int64, freeBytesAfter: Int64, freedBytes: Int64, itemCount: Int, failedItemCount: Int,
-                items: [AuditItem], omittedItemCount: Int = 0, omittedBytes: Int64 = 0, phase: AuditPhase? = nil) {
+                items: [AuditItem], omittedItemCount: Int = 0, omittedBytes: Int64 = 0, phase: AuditPhase? = nil,
+                cancelled: Bool? = nil, entriesRemoved: Int? = nil, bytesRemoved: Int64? = nil) {
+        self.cancelled = cancelled; self.entriesRemoved = entriesRemoved; self.bytesRemoved = bytesRemoved
         self.id = id; self.version = version; self.startedAt = startedAt; self.endedAt = endedAt; self.client = client
         self.appVersion = appVersion; self.kind = kind; self.mode = mode; self.planID = planID
         self.freeBytesBefore = freeBytesBefore; self.freeBytesAfter = freeBytesAfter; self.freedBytes = freedBytes
@@ -351,14 +364,22 @@ struct AuditDraft {
     mutating func add(_ item: AuditItem) { items.append(item) }
 
     private func make(_ list: [AuditItem], phase: AuditPhase, client: AuditClient, appVersion: String,
-                      freeBefore: Int64, freeAfter: Int64, ended: Date) -> AuditRecord {
+                      freeBefore: Int64, freeAfter: Int64, ended: Date, totals: Totals? = nil) -> AuditRecord {
         let listed = Array(list.prefix(AuditLimits.maxItems))
         let rest = list.dropFirst(AuditLimits.maxItems)
         return AuditRecord(id: id, version: 2, startedAt: started, endedAt: ended, client: client, appVersion: appVersion,
                            kind: kind, mode: mode, planID: planID, freeBytesBefore: freeBefore, freeBytesAfter: freeAfter,
                            freedBytes: max(freeAfter - freeBefore, 0), itemCount: list.count,
                            failedItemCount: list.filter { $0.outcome != .ok && $0.outcome != .pending }.count, items: listed,
-                           omittedItemCount: rest.count, omittedBytes: rest.reduce(0) { $0 + $1.sizeBytes }, phase: phase)
+                           omittedItemCount: rest.count, omittedBytes: rest.reduce(0) { $0 + $1.sizeBytes }, phase: phase,
+                           cancelled: (totals?.cancelled ?? false) ? true : nil, entriesRemoved: totals?.entries, bytesRemoved: totals?.bytes)
+    }
+
+    /// What the outcome record adds to the "started" one.
+    struct Totals {
+        var cancelled: Bool
+        var entries: Int
+        var bytes: Int64
     }
 
     /// The record written before anything is deleted: what the operation is about to do.
@@ -367,8 +388,9 @@ struct AuditDraft {
              appVersion: appVersion, freeBefore: freeBefore, freeAfter: freeBefore, ended: started)
     }
 
-    func record(client: AuditClient, appVersion: String, freeBefore: Int64, freeAfter: Int64) -> AuditRecord {
-        make(items, phase: .finished, client: client, appVersion: appVersion, freeBefore: freeBefore, freeAfter: freeAfter, ended: Date())
+    func record(client: AuditClient, appVersion: String, freeBefore: Int64, freeAfter: Int64, totals: Totals? = nil) -> AuditRecord {
+        make(items, phase: .finished, client: client, appVersion: appVersion, freeBefore: freeBefore, freeAfter: freeAfter,
+             ended: Date(), totals: totals)
     }
 }
 

@@ -275,11 +275,46 @@ public struct CleanResult: Sendable, Codable {
     /// True when the operation's outcome record was appended to the audit log. False when the log is turned
     /// off, could not be written, the operation was refused before it began, or the engine keeps no log.
     public var auditRecorded: Bool
-    public init(freedBytes: Int64, failedCount: Int, messages: [String], auditRecorded: Bool = false) {
+    /// The user (or Ctrl-C) stopped the operation. What was removed before that stays removed.
+    public var cancelled: Bool
+    /// Counted while deleting (not a second walk): entries removed and their allocated size. A file with several
+    /// hard links counts once; links outside the deleted folders are not considered, so this can exceed `freedBytes`.
+    public var entriesRemoved: Int
+    public var bytesRemoved: Int64
+    public init(freedBytes: Int64, failedCount: Int, messages: [String], auditRecorded: Bool = false,
+                cancelled: Bool = false, entriesRemoved: Int = 0, bytesRemoved: Int64 = 0) {
         self.freedBytes = freedBytes; self.failedCount = failedCount; self.messages = messages
-        self.auditRecorded = auditRecorded
+        self.auditRecorded = auditRecorded; self.cancelled = cancelled
+        self.entriesRemoved = entriesRemoved; self.bytesRemoved = bytesRemoved
     }
 }
+
+/// How far a deleting operation is. Reported about ten times a second while it runs.
+public struct DeleteProgress: Sendable, Equatable {
+    public var itemsDone: Int
+    public var itemsTotal: Int
+    /// Files, links and folders removed so far, and their allocated size.
+    public var entriesRemoved: Int
+    public var bytesFreed: Int64
+    /// Size the scan expected for the whole operation, when it is known (nil: use the items for a bar).
+    public var expectedBytes: Int64?
+    /// What is being deleted right now, relative to the home folder.
+    public var currentItem: String?
+    public init(itemsDone: Int, itemsTotal: Int, entriesRemoved: Int, bytesFreed: Int64, expectedBytes: Int64? = nil,
+                currentItem: String? = nil) {
+        self.itemsDone = itemsDone; self.itemsTotal = itemsTotal; self.entriesRemoved = entriesRemoved
+        self.bytesFreed = bytesFreed; self.expectedBytes = expectedBytes; self.currentItem = currentItem
+    }
+
+    /// 0...1: by bytes when the expected total is known, otherwise by items. Never reaches 1 before the end.
+    public var fraction: Double {
+        if let total = expectedBytes, total > 0 { return min(0.99, Double(bytesFreed) / Double(total)) }
+        guard itemsTotal > 0 else { return 0 }
+        return min(0.99, Double(itemsDone) / Double(itemsTotal))
+    }
+}
+
+public typealias DeleteProgressHandler = @Sendable (DeleteProgress) -> Void
 
 // MARK: - Settings
 
@@ -400,6 +435,21 @@ public protocol CleanerEngine: Sendable {
     /// scan reads the disk again. Front ends call it for an explicit rescan. Deleting and changing the
     /// protected folders drop it by themselves.
     func discardScanCache()
+
+    // ---- v6: numbers while deleting (default implementations below ignore the handler) ----
+
+    /// Like `clean(categories:mode:progress:)`; `deleteProgress` gets counts about ten times a second. Cancelling the
+    /// calling task stops the removal within about a second; the result then has `cancelled` set.
+    func clean(categories: [CleanCategory], mode: DeleteMode, progress: @escaping ProgressHandler,
+               deleteProgress: @escaping DeleteProgressHandler) async -> CleanResult
+
+    /// Like `delete(urls:mode:purpose:progress:)` with counts (see above).
+    func delete(urls: [URL], mode: DeleteMode, purpose: DeletePurpose, progress: @escaping ProgressHandler,
+                deleteProgress: @escaping DeleteProgressHandler) async -> CleanResult
+
+    /// Like `removeClones(_:force:mode:progress:)` with counts (see above).
+    func removeClones(_ clones: [RepoClone], force: Bool, mode: DeleteMode, progress: @escaping ProgressHandler,
+                      deleteProgress: @escaping DeleteProgressHandler) async -> CleanResult
 }
 
 /// The current state of one working copy (see `CleanerEngine.inspectClones`).
@@ -434,4 +484,16 @@ public extension CleanerEngine {
     func auditLogProblem() async -> String? { nil }
     func inspectClones(_ urls: [URL]) async -> [CloneInspection] { [] }
     func discardScanCache() {}
+    func clean(categories: [CleanCategory], mode: DeleteMode, progress: @escaping ProgressHandler,
+               deleteProgress: @escaping DeleteProgressHandler) async -> CleanResult {
+        await clean(categories: categories, mode: mode, progress: progress)
+    }
+    func delete(urls: [URL], mode: DeleteMode, purpose: DeletePurpose, progress: @escaping ProgressHandler,
+                deleteProgress: @escaping DeleteProgressHandler) async -> CleanResult {
+        await delete(urls: urls, mode: mode, purpose: purpose, progress: progress)
+    }
+    func removeClones(_ clones: [RepoClone], force: Bool, mode: DeleteMode, progress: @escaping ProgressHandler,
+                      deleteProgress: @escaping DeleteProgressHandler) async -> CleanResult {
+        await removeClones(clones, force: force, mode: mode, progress: progress)
+    }
 }

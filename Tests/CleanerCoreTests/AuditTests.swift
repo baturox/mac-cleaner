@@ -36,7 +36,9 @@ final class AuditTests: XCTestCase {
         XCTAssertEqual(rec.items.map(\.outcome), [.ok, .ok])
         XCTAssertEqual(rec.items[0].categoryID, "user-caches")
         XCTAssertEqual(rec.items[0].action, .deleted)
-        XCTAssertEqual(rec.items[0].sizeBytes, 100)
+        // The outcome record has the size counted while deleting (allocated bytes), not the scanned 100.
+        XCTAssertGreaterThan(rec.items[0].sizeBytes, 0)
+        XCTAssertEqual(rec.items.reduce(Int64(0)) { $0 + $1.sizeBytes }, r.bytesRemoved)
         XCTAssertFalse(f.exists("Library/Caches/app-one"))
         let stats = await e.auditStats(since: nil)
         XCTAssertEqual(stats.operations, 1)

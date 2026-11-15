@@ -44,7 +44,7 @@ final class ReviewFixTests: EngineTestCase {
         XCTAssertEqual(started.phase, .started)
         XCTAssertEqual(started.items.map(\.path), [target])
         XCTAssertEqual(started.items.map(\.outcome), [.pending])
-        XCTAssertGreaterThan(started.items[0].sizeBytes, 0)
+        XCTAssertEqual(started.items[0].sizeBytes, 0, "nothing is measured beforehand any more")
         // Afterwards: two lines with one id, read back as one finished operation.
         let lines = rawLines(f)
         XCTAssertEqual(lines.map(\.phase), [.started, .finished])

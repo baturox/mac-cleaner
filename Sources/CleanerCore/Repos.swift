@@ -396,14 +396,19 @@ extension LiveEngine {
 
     public func removeClones(_ clones: [RepoClone], force: Bool, mode: DeleteMode,
                              progress: @escaping ProgressHandler) async -> CleanResult {
+        await removeClones(clones, force: force, mode: mode, progress: progress, deleteProgress: { _ in })
+    }
+
+    public func removeClones(_ clones: [RepoClone], force: Bool, mode: DeleteMode, progress: @escaping ProgressHandler,
+                             deleteProgress: @escaping DeleteProgressHandler) async -> CleanResult {
         let flag = CancelFlag()
         return await withTaskCancellationHandler {
-            await removeClonesBody(clones, force: force, mode: mode, flag: flag, progress: progress)
+            await removeClonesBody(clones, force: force, mode: mode, flag: flag, progress: progress, deleteProgress: deleteProgress)
         } onCancel: { flag.set() }
     }
 
     private func removeClonesBody(_ clones: [RepoClone], force: Bool, mode: DeleteMode, flag: CancelFlag,
-                                  progress: @escaping ProgressHandler) async -> CleanResult {
+                                  progress: @escaping ProgressHandler, deleteProgress: @escaping DeleteProgressHandler) async -> CleanResult {
         let ctx = context()
         let deleter = Deleter(env: env, guardian: ctx.guardian)
         let intended = clones.map { c in
@@ -415,10 +420,18 @@ extension LiveEngine {
         case .refused(let result): return result
         case .started(let started): op = started
         }
+        // A clone counts as done when it was handled, kept or removed (the walk below must not count it too).
+        op.tally = DeleteTally(countsItems: false)
+        op.itemsTotal = clones.count
+        let ticker = startProgressTicker(op, deleteProgress)
+        defer { ticker.stop() }
+        let tally = op.tally
         var failed = 0
+        var cancelled = false
         var messages: [String] = []
         for clone in clones {
-            if Task.isCancelled { break }
+            if Task.isCancelled { cancelled = true; break }
+            defer { tally.itemFinished() }
             let path = clone.url.path
             let name = (path as NSString).lastPathComponent
             progress("Checking \(name)…")
@@ -466,15 +479,17 @@ extension LiveEngine {
             // guarantee that comes with it. git is not given a path to delete. Afterwards only the stale
             // registration in the main repository is pruned, and only when that repository may be written to.
             progress("Removing \(name)…")
-            let r = (await onBackground { deleter.removeEach([path], mode: mode, flag: flag) })[0]
+            let r = (await onBackground { deleter.removeEach([path], mode: mode, flag: flag, tally: tally) })[0]
             failed += r.failed; messages += r.messages
+            cancelled = cancelled || r.cancelled
             record(r.outcome, r.reason, state: state, backedUp: backedUp, action: r.trashed ? .movedToTrash : .deleted)
             guard case .linked(let main) = kind, r.failed == 0 else { continue }
             if let note = await pruneWorktrees(main: main, guardian: ctx.guardian) {
                 messages.append("Removed the worktree \(name). \(note)")
             }
         }
-        return await finish(op, failed: failed, messages: messages)
+        ticker.stop()
+        return await finish(op, failed: failed, messages: messages, cancelled: cancelled)
     }
 
     public func inspectClones(_ urls: [URL]) async -> [CloneInspection] {
