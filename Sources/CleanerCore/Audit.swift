@@ -25,6 +25,8 @@ public struct AuditClient: RawRepresentable, Codable, Sendable, Hashable {
 
 public enum AuditOperationKind: String, Codable, Sendable {
     case cleanup, projectArtifacts, explorerDelete, removeClones
+    /// Added later (additive): older versions of the app cannot decode a record that has one of these.
+    case removeApp, clearAppCaches
 }
 
 public enum AuditAction: String, Codable, Sendable {

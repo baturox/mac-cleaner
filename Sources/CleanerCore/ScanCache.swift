@@ -43,6 +43,9 @@ struct ScanCacheFile: Codable, Equatable, Sendable {
     var projects: [ProjectActivity] = []
     /// Whole working copies (the Repos screen). `folder` is the working copy, `project` its `.git` folder.
     var clones: [ArtifactMeasurement]? = nil
+    /// App bundles and the leftover folders found for them (the Apps screen). `folder` is the measured path, `project` a second
+    /// stamp (the bundle's Info.plist).
+    var apps: [ArtifactMeasurement]? = nil
 }
 
 struct MeasurementCache: Sendable {
@@ -57,6 +60,8 @@ struct MeasurementCache: Sendable {
     /// A working copy's total size is reused for a day at most: edits deep inside it do not show in the
     /// stamps of the two folders that are compared.
     static let cloneSizeLifetime: TimeInterval = 86400
+    /// App bundles and their data folders: a day, like working copies (a file deep inside does not move the folder's stamp).
+    static let appSizeLifetime: TimeInterval = 86400
 
     /// Saves from the app's two scans (and several engines in a test run) are serialized, and merged with what
     /// is on disk, so one scan does not drop the other's entries.
@@ -88,6 +93,9 @@ struct MeasurementCache: Sendable {
         var clones = Dictionary((merged.clones ?? []).map { ($0.path, $0) }, uniquingKeysWith: { a, _ in a })
         for c in file.clones ?? [] where (clones[c.path]?.measuredAt ?? 0) <= c.measuredAt { clones[c.path] = c }
         merged.clones = Array(clones.values.sorted { $0.measuredAt > $1.measuredAt }.prefix(Self.maxEntries))
+        var apps = Dictionary((merged.apps ?? []).map { ($0.path, $0) }, uniquingKeysWith: { a, _ in a })
+        for a in file.apps ?? [] where (apps[a.path]?.measuredAt ?? 0) <= a.measuredAt { apps[a.path] = a }
+        merged.apps = Array(apps.values.sorted { $0.measuredAt > $1.measuredAt }.prefix(Self.maxEntries))
         do {
             try DataFolder.prepare(fileURL.deletingLastPathComponent())
             try JSONEncoder().encode(merged).write(to: fileURL, options: [.atomic])
@@ -193,6 +201,42 @@ extension LiveEngine {
             }
         }
         if fresh.clones != nil { cache.save(fresh) }
+        return sizes
+    }
+
+    /// Sizes of app bundles and of the Library folders found for them, for display: remembered for up to a day while
+    /// the folder and its second stamp are unchanged, `du` (in batches, at low priority) for the rest.
+    /// `second` is the path whose stamp is checked next to the folder's own (the bundle's Info.plist, or the folder again).
+    func measureAppPaths(_ entries: [(path: String, second: String)], now: Date = Date()) async -> [String: Int64] {
+        let cache = measurementCache
+        let stored = Dictionary((cache.load().apps ?? []).map { ($0.path, $0) }, uniquingKeysWith: { a, _ in a })
+        let t = now.timeIntervalSince1970
+        var sizes: [String: Int64] = [:]
+        var misses: [(path: String, second: String)] = []
+        var before: [String: (FileStamp, FileStamp)] = [:]
+        var seen = Set<String>()
+        for entry in entries where seen.insert(entry.path).inserted {
+            let f = FileStamp.of(entry.path), s = FileStamp.of(entry.second)
+            if let e = stored[entry.path], let f, let s, t - e.measuredAt < MeasurementCache.appSizeLifetime, e.measuredAt <= t + 60,
+               f == e.folder, s == e.project {
+                sizes[entry.path] = e.sizeBytes
+            } else {
+                misses.append(entry)
+                if let f, let s { before[entry.path] = (f, s) }
+            }
+        }
+        if misses.isEmpty { return sizes }
+        let measured = await Self.measure(misses.map(\.path))
+        if Task.isCancelled { return sizes }
+        var fresh = ScanCacheFile()
+        for entry in misses {
+            guard let size = measured[entry.path] else { continue }
+            sizes[entry.path] = size
+            if let (f, s) = before[entry.path] {
+                fresh.apps = (fresh.apps ?? []) + [ArtifactMeasurement(path: entry.path, sizeBytes: size, folder: f, project: s, measuredAt: t)]
+            }
+        }
+        if fresh.apps != nil { cache.save(fresh) }
         return sizes
     }
 

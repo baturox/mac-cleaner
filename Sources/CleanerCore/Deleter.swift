@@ -568,3 +568,87 @@ struct Deleter: Sendable {
         }
     }
 }
+
+// MARK: - Moving an app bundle (the one narrow exception to the allowed areas)
+
+extension Deleter {
+    /// The bundle an app removal is about, as the scan saw it.
+    struct AppBundleTarget: Sendable {
+        var path: String
+        var device: Int64
+        var inode: UInt64
+        var bundleID: String
+    }
+
+    /// The ONLY way a path outside the home and temp areas is ever moved, and it moves a Trash-bound `.app` only.
+    /// `isAllowed` and `removeEach` stay as strict as before (they never accept /Applications); this entry point
+    /// accepts exactly one shape: `<applications folder>/<Name>.app`, or one subfolder below such a folder
+    /// (`AppCatalog.isDiscoverable`). In addition, at the moment of the move:
+    ///  * the path is canonical (no symlink in any parent) and the bundle itself is a real folder, not a link;
+    ///  * it is the very folder the scan saw (device and inode) and its Info.plist, read through the open folder
+    ///    descriptor, still names the same bundle id, which is not Apple's and not Mac Cleaner's;
+    ///  * it is not protected, the user may write the parent and own (or may write) the bundle: a root-owned app
+    ///    would need an administrator, and nothing here escalates;
+    ///  * nothing inside it is a protected identity or another volume (the same read-only walk as the Trash mode).
+    /// It never deletes: the move is the system's Trash call, so it can be undone.
+    func trashAppBundle(_ target: AppBundleTarget, tally: DeleteTally) -> PathResult {
+        var res = PathResult(path: target.path)
+        res.trashed = true
+        func fail(_ outcome: AuditOutcome, _ message: String) -> PathResult {
+            res.trashed = false
+            res.failed += 1; res.messages.append(message); res.outcome = outcome; res.reason = message
+            return res
+        }
+        let path = target.path
+        guard AppCatalog.isDiscoverable(path, env: env), let (parent, last) = splitPath(path) else {
+            return fail(.refused, "Refused (not an app directly in an applications folder): \(path)")
+        }
+        guard let realParent = realPath(parent), realParent == parent else {
+            return fail(.refused, "Refused (reached through a symlink): \(path)")
+        }
+        if guardian.blocks(path) { return fail(.refused, "Refused (protected): \(path)") }
+        guard let parentFD = openDirectory(parent) else { return fail(.refused, "Refused (its folder changed or is a symlink): \(path)") }
+        defer { close(parentFD) }
+        var st = stat()
+        guard fstatat(parentFD, last, &st, AT_SYMLINK_NOFOLLOW) == 0, (st.st_mode & S_IFMT) == S_IFDIR else {
+            return fail(.refused, "Refused (no longer a plain app folder): \(path)")
+        }
+        guard Int64(st.st_dev) == target.device, UInt64(st.st_ino) == target.inode else {
+            return fail(.refused, "Refused (the app was replaced since it was scanned): \(path)")
+        }
+        let appFD = openat(parentFD, last, Deleter.dirFlags)
+        guard appFD >= 0 else { return fail(.refused, "Refused (cannot open the app folder): \(path)") }
+        defer { close(appFD) }
+        var opened = stat()
+        guard fstat(appFD, &opened) == 0, opened.st_dev == st.st_dev, opened.st_ino == st.st_ino else {
+            return fail(.refused, "Refused (the app changed while it was being checked): \(path)")
+        }
+        guard let info = AppCatalog.readInfo(bundleFD: appFD), info.id == target.bundleID else {
+            return fail(.refused, "Refused (its bundle identifier changed since it was scanned): \(path)")
+        }
+        if info.id.hasPrefix("com.apple.") { return fail(.refused, "Refused (Apple-provided app): \(path)") }
+        if info.id == env.selfBundleID || path == env.selfBundlePath { return fail(.refused, "Refused (this is Mac Cleaner itself): \(path)") }
+        if guardian.isProtectedID(FileID(st)) { return fail(.refused, "Refused (protected): \(path)") }
+        let name = (path as NSString).lastPathComponent
+        guard faccessat(parentFD, ".", W_OK, 0) == 0,
+              env.owner(st) == env.uid || faccessat(parentFD, last, W_OK, AT_SYMLINK_NOFOLLOW) == 0 else {
+            return fail(.refused, "\(name) needs an administrator; remove it in Finder")
+        }
+        var walk = Walk(rootDev: st.st_dev, requiredOwner: nil, guardian: guardian, env: env, flag: nil, tally: tally, pool: nil)
+        if let why = walk.obstacle(parentFD, last) { return fail(.refused, "Refused to move \(name) to the Trash: \(why)") }
+        do { try env.trash(URL(fileURLWithPath: path, isDirectory: true)) } catch {
+            return fail(.failed, "Could not move \(name) to the Trash")
+        }
+        res.entries = 1
+        tally.add(entries: 1, bytes: 0)
+        walk.flush()
+        return res
+    }
+
+    private func splitPath(_ path: String) -> (parent: String, last: String)? {
+        guard path.hasPrefix("/") else { return nil }
+        let comps = path.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
+        guard let last = comps.last, !comps.contains(".."), !comps.contains(".") else { return nil }
+        return ("/" + comps.dropLast().joined(separator: "/"), last)
+    }
+}

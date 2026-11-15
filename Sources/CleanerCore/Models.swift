@@ -210,6 +210,112 @@ public struct RepoGroup: Identifiable, Sendable, Codable {
     }
 }
 
+// MARK: - Installed apps
+
+/// Why an app cannot be removed from Mac Cleaner.
+public enum AppRemovalBlock: String, Sendable, Codable, Hashable {
+    case apple          // bundle id starts with com.apple.
+    case notOwned       // belongs to another account and the user cannot write it: removing it needs an administrator
+    case macCleaner     // this very app
+    case protectedPath  // inside a folder the user (or the built-in list) protects
+
+    public var message: String {
+        switch self {
+        case .apple: return "Apple-provided app; it is part of macOS and is never removed from here"
+        case .notOwned: return "needs an administrator; remove it in Finder"
+        case .macCleaner: return "this is Mac Cleaner itself"
+        case .protectedPath: return "it is inside a protected folder"
+        }
+    }
+}
+
+/// What kind of data a leftover holds.
+public enum AppLeftoverKind: String, Sendable, Codable, Hashable {
+    case cache      // rebuilt by the app
+    case settings   // preferences, cookies, saved window state, scripts
+    case data       // documents and databases the user may care about
+}
+
+/// How sure the engine is that a leftover belongs to the app.
+public enum AppLeftoverMatch: String, Sendable, Codable, Hashable {
+    case exact      // named by the app's exact bundle identifier
+    case possible   // named like the app (never selected by default, never removed by the CLI)
+    case shared     // a group container the app names; shared with other apps, informational only, never removed
+}
+
+/// Data an app keeps in the user's Library.
+public struct AppLeftover: Identifiable, Hashable, Sendable, Codable {
+    public var id: String { url.path }
+    public var url: URL
+    /// Short name of the place, e.g. "Caches" or "Application Support".
+    public var label: String
+    public var kind: AppLeftoverKind
+    public var match: AppLeftoverMatch
+    public var sizeBytes: Int64
+    /// What a front end should tick at first. The engine decides; the user can change it.
+    public var selectedByDefault: Bool
+    public var note: String?
+    /// Set when the Cleanup screen already lists this very path (so a total must not add it twice).
+    public var cleanupCategoryID: String?
+
+    public init(url: URL, label: String, kind: AppLeftoverKind, match: AppLeftoverMatch, sizeBytes: Int64,
+                selectedByDefault: Bool, note: String? = nil, cleanupCategoryID: String? = nil) {
+        self.url = url; self.label = label; self.kind = kind; self.match = match; self.sizeBytes = sizeBytes
+        self.selectedByDefault = selectedByDefault; self.note = note; self.cleanupCategoryID = cleanupCategoryID
+    }
+
+    /// Data-class items bigger than this start unticked: they may hold documents.
+    public static let dataTickLimitBytes: Int64 = 50_000_000
+}
+
+/// One installed application (a `.app` bundle in an applications folder).
+public struct InstalledApp: Identifiable, Hashable, Sendable, Codable {
+    public var id: String { url.path }
+    public var url: URL
+    public var name: String
+    public var bundleID: String
+    public var version: String?
+    public var bundleBytes: Int64
+    /// From Spotlight (`kMDItemLastUsedDate`); nil when unknown. Never a file modification time.
+    public var lastOpened: Date?
+    /// Spotlight knows the bundle and has no launch record for it. False when it simply could not tell.
+    public var neverOpened: Bool
+    public var isRunning: Bool
+    public var isAppStore: Bool
+    /// Cask token when Homebrew installed it: removal is left to `brew uninstall --cask <token>`.
+    public var homebrewCask: String?
+    /// nil = the engine would remove it.
+    public var removalBlock: AppRemovalBlock?
+    /// Identity of the bundle folder when it was scanned; the engine checks it again before moving it.
+    public var device: Int64
+    public var inode: UInt64
+    /// Exact, possible and shared leftovers, each with its own class.
+    public var leftovers: [AppLeftover]
+    /// Why `leftovers` is empty or short (e.g. another copy of the same app is installed).
+    public var leftoverNote: String?
+
+    public var exactLeftovers: [AppLeftover] { leftovers.filter { $0.match == .exact } }
+    public var possibleLeftovers: [AppLeftover] { leftovers.filter { $0.match == .possible } }
+    public var sharedLeftovers: [AppLeftover] { leftovers.filter { $0.match == .shared } }
+    /// What the app keeps: its exact leftovers.
+    public var dataBytes: Int64 { exactLeftovers.reduce(0) { $0 + $1.sizeBytes } }
+    public var cacheBytes: Int64 { exactLeftovers.filter { $0.kind == .cache }.reduce(0) { $0 + $1.sizeBytes } }
+    public var totalBytes: Int64 { bundleBytes + dataBytes }
+    /// Bundle plus exact leftovers that the Cleanup screen does not already count.
+    public var reclaimBytes: Int64 { bundleBytes + exactLeftovers.filter { $0.cleanupCategoryID == nil }.reduce(0) { $0 + $1.sizeBytes } }
+    public var canRemove: Bool { removalBlock == nil && homebrewCask == nil }
+
+    public init(url: URL, name: String, bundleID: String, version: String?, bundleBytes: Int64, lastOpened: Date?,
+                neverOpened: Bool = false, isRunning: Bool = false, isAppStore: Bool = false, homebrewCask: String? = nil,
+                removalBlock: AppRemovalBlock? = nil, device: Int64 = 0, inode: UInt64 = 0, leftovers: [AppLeftover] = [],
+                leftoverNote: String? = nil) {
+        self.url = url; self.name = name; self.bundleID = bundleID; self.version = version; self.bundleBytes = bundleBytes
+        self.lastOpened = lastOpened; self.neverOpened = neverOpened; self.isRunning = isRunning; self.isAppStore = isAppStore
+        self.homebrewCask = homebrewCask; self.removalBlock = removalBlock; self.device = device; self.inode = inode
+        self.leftovers = leftovers; self.leftoverNote = leftoverNote
+    }
+}
+
 // MARK: - Explorer
 
 /// One child of a folder, for the disk explorer.
@@ -457,6 +563,23 @@ public protocol CleanerEngine: Sendable {
     /// copy with the groups known so far. Those are final answers for the copies in them, but the list is not
     /// complete until this call returns. A cancelled scan returns [].
     func scanRepos(root: URL, progress: @escaping ProgressHandler, partial: @escaping RepoScanHandler) async -> [RepoGroup]
+
+    // ---- v8: installed apps (default implementations below: an engine without them lists nothing and refuses) ----
+
+    /// Lists the `.app` bundles directly in the applications folders (and one level of subfolders), with sizes,
+    /// last-opened dates and the data each keeps in the user's Library. Sorted by total size, largest first.
+    func scanApps(progress: @escaping ProgressHandler) async -> [InstalledApp]
+
+    /// Moves the app bundle to the Trash (always, whatever the global mode) and removes the chosen `leftovers`
+    /// with `leftoverMode`. Everything is checked again on disk first: the bundle's identity and bundle id, that it
+    /// is not running, not protected, not Mac Cleaner, not Homebrew's; `leftovers` is cut down to paths the engine
+    /// itself still finds as this app's exact or possible matches. Group containers are never removed.
+    func removeApp(_ app: InstalledApp, leftovers: [AppLeftover], leftoverMode: DeleteMode, progress: @escaping ProgressHandler,
+                   deleteProgress: @escaping DeleteProgressHandler) async -> CleanResult
+
+    /// Removes only the cache-class exact leftovers of the app (found again on disk, not taken from `app`).
+    func clearAppCaches(_ app: InstalledApp, mode: DeleteMode, progress: @escaping ProgressHandler,
+                        deleteProgress: @escaping DeleteProgressHandler) async -> CleanResult
 }
 
 /// How far the repository scan has come, and what it knows so far.
@@ -516,5 +639,14 @@ public extension CleanerEngine {
     }
     func scanRepos(root: URL, progress: @escaping ProgressHandler, partial: @escaping RepoScanHandler) async -> [RepoGroup] {
         await scanRepos(root: root, progress: progress)
+    }
+    func scanApps(progress: @escaping ProgressHandler) async -> [InstalledApp] { [] }
+    func removeApp(_ app: InstalledApp, leftovers: [AppLeftover], leftoverMode: DeleteMode, progress: @escaping ProgressHandler,
+                   deleteProgress: @escaping DeleteProgressHandler) async -> CleanResult {
+        CleanResult(freedBytes: 0, failedCount: 1, messages: ["Removing apps is not supported by this engine."])
+    }
+    func clearAppCaches(_ app: InstalledApp, mode: DeleteMode, progress: @escaping ProgressHandler,
+                        deleteProgress: @escaping DeleteProgressHandler) async -> CleanResult {
+        CleanResult(freedBytes: 0, failedCount: 1, messages: ["Clearing app caches is not supported by this engine."])
     }
 }

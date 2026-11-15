@@ -45,6 +45,23 @@ struct EngineEnvironment: Sendable {
     /// Tests only: an upper bound for every git timeout, so a hanging stand-in does not stall the suite.
     var gitTimeoutCap: TimeInterval? = nil
 
+    // MARK: Installed apps (all injectable, so tests never look at the real /Applications)
+
+    /// The folders `.app` bundles are looked for in (directly inside, plus one level of subfolders). Also the only
+    /// parents `Deleter.trashAppBundle` accepts. Empty = no apps are found.
+    var appRoots: [String] = []
+    /// Where Homebrew keeps its casks (`<root>/<token>/<version>/<App>.app`).
+    var caskroomRoots: [String] = []
+    /// This app's own bundle identifier and, when it runs from a bundle, that bundle's path: never removable.
+    var selfBundleID = "io.github.baturox.mac-cleaner"
+    var selfBundlePath: String? = nil
+    /// Spotlight's last-used record of a bundle.
+    var lastUsed: @Sendable (String) -> LastUsedLookup = { _ in .unknown }
+    /// Executable paths of the running processes (for "is this app running").
+    var runningExecutables: @Sendable () -> [String] = { [] }
+    /// Application groups an app's entitlements name.
+    var appGroups: @Sendable (String) -> [String] = { _ in [] }
+
     static let live: EngineEnvironment = {
         // The home folder comes from the password database entry of the real user id. `HOME` and
         // `CFFIXED_USER_HOME` are ignored: settings (protected folders), the audit log, the built-in protected
@@ -67,6 +84,13 @@ struct EngineEnvironment: Sendable {
             trustedToolDirs: toolDirs
         ).withDerivedTempRoots()
         e.homeProblem = homeProblem(account: account, reported: reported)
+        e.appRoots = ["/Applications", "/Applications/Utilities", home + "/Applications"]
+        e.caskroomRoots = ["/opt/homebrew/Caskroom", "/usr/local/Caskroom"]
+        if let id = Bundle.main.bundleIdentifier { e.selfBundleID = id }
+        if Bundle.main.bundlePath.hasSuffix(".app") { e.selfBundlePath = realPath(Bundle.main.bundlePath) ?? Bundle.main.bundlePath }
+        e.lastUsed = { SystemApps.lastUsed($0) }
+        e.runningExecutables = { SystemApps.runningExecutables() }
+        e.appGroups = { SystemApps.applicationGroups($0) }
         return e
     }()
 
@@ -113,10 +137,13 @@ struct EngineEnvironment: Sendable {
     static func fixture(root: String, vars: [String: String] = [:], tools: ToolBox = .none,
                         trash: @escaping @Sendable (URL) throws -> Void) -> EngineEnvironment {
         let real = realPath(root) ?? root
-        return EngineEnvironment(home: real + "/home", tmp: real + "/tmp/T", varFolders: real + "/tmp",
-                                 privateTmp: real + "/private-tmp", bazelRoot: nil,
-                                 historyDir: URL(fileURLWithPath: real + "/history", isDirectory: true),
-                                 vars: vars, trash: trash, tools: tools)
+        var e = EngineEnvironment(home: real + "/home", tmp: real + "/tmp/T", varFolders: real + "/tmp",
+                                  privateTmp: real + "/private-tmp", bazelRoot: nil,
+                                  historyDir: URL(fileURLWithPath: real + "/history", isDirectory: true),
+                                  vars: vars, trash: trash, tools: tools)
+        e.appRoots = [real + "/Applications", real + "/Applications/Utilities", real + "/home/Applications"]
+        e.caskroomRoots = [real + "/Caskroom"]
+        return e
     }
 
     /// World-writable (or otherwise shared) temp areas. Below these, every directory on the way to an item
