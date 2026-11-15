@@ -370,6 +370,25 @@ final class AppLeftoverTests: EngineTestCase {
         for app in await fx.found() { XCTAssertTrue(app.leftovers.isEmpty, app.bundleID) }
     }
 
+    func testAOneWordIdentifierDoesNotClaimAVendorFolder() async throws {
+        // A bundle may claim any id; "Google" must not make Chrome's shared vendor folders its exact leftovers.
+        let fx = try Fixture()
+        try fx.app("Rogue", id: "Google")
+        try fx.app("Rogue2", id: "com.")
+        try fx.lib("Application Support/Google")
+        try fx.lib("Caches/Google")
+        try fx.lib("Caches/com.")
+        let apps = await fx.found()
+        XCTAssertEqual(apps.count, 2)
+        for app in apps {
+            XCTAssertTrue(app.leftovers.isEmpty, app.bundleID)
+            let r = await fx.engine().clearAppCaches(app, mode: .permanent, progress: { _ in }, deleteProgress: { _ in })
+            XCTAssertEqual(r.freedBytes, 0)
+        }
+        XCTAssertTrue(fx.exists("Library/Caches/Google"))
+        XCTAssertTrue(fx.exists("Library/Application Support/Google"))
+    }
+
     func testASymlinkedLeftoverOrLibraryFolderIsNotMatched() async throws {
         let fx = try Fixture()
         try fx.app("Acme", id: "com.acme.app")
@@ -483,6 +502,19 @@ final class AppRemovalTests: EngineTestCase {
         XCTAssertEqual(fx.trashedPaths, [])
         let log = await fx.engine().auditLog(limit: 5, before: nil)
         XCTAssertTrue(log.isEmpty, "refused before it began: no record")
+    }
+
+    func testAnUnreadableProcessListRefusesInsteadOfAssumingNothingRuns() async throws {
+        let fx = try Fixture()
+        let (app, bundle) = try await make(fx)
+        fx.env.runningExecutables = { nil }
+        let r = await remove(fx, app, app.exactLeftovers)
+        XCTAssertGreaterThan(r.failedCount, 0)
+        XCTAssertTrue(fx.exists(bundle))
+        XCTAssertEqual(fx.trashedPaths, [])
+        let c = await fx.engine().clearAppCaches(app, mode: .permanent, progress: { _ in }, deleteProgress: { _ in })
+        XCTAssertGreaterThan(c.failedCount, 0)
+        XCTAssertTrue(fx.exists("Library/Caches/com.acme.app"))
     }
 
     func testMacCleanerItselfAppleAppsAndProtectedAppsAreRefused() async throws {

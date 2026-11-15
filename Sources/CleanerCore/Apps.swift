@@ -15,7 +15,7 @@ extension LiveEngine {
         let candidates = await onBackground { AppCatalog.discover(env: env, guardian: guardian) }
         if Task.isCancelled || candidates.isEmpty { return [] }
         let setup = await onBackground { () -> (running: [String], casks: [String: String], index: AppCatalog.LibraryIndex) in
-            (env.runningExecutables(), AppCatalog.caskTokens(env: env), AppCatalog.LibraryIndex.build(env: env))
+            (env.runningExecutables() ?? [], AppCatalog.caskTokens(env: env), AppCatalog.LibraryIndex.build(env: env))
         }
 
         ctx.progress("Checking when \(candidates.count) apps were last opened…")

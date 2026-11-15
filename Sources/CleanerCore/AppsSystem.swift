@@ -24,15 +24,16 @@ enum SystemApps {
         return .unknown
     }
 
-    /// Paths of the executables of every process this user can see.
-    static func runningExecutables() -> [String] {
+    /// Paths of the executables of every process this user can see; nil when the process list cannot be read
+    /// (an empty answer would read as "nothing is running").
+    static func runningExecutables() -> [String]? {
         let count = proc_listallpids(nil, 0)
-        guard count > 0 else { return [] }
+        guard count > 0 else { return nil }
         var pids = [pid_t](repeating: 0, count: Int(count) + 64)
         let got = pids.withUnsafeMutableBufferPointer { buf -> Int32 in
             proc_listallpids(buf.baseAddress, Int32(buf.count * MemoryLayout<pid_t>.size))
         }
-        guard got > 0 else { return [] }
+        guard got > 0 else { return nil }
         var out: [String] = []
         var buffer = [CChar](repeating: 0, count: 4096)
         for pid in pids.prefix(Int(got)) where pid > 0 {

@@ -35,7 +35,10 @@ extension LiveEngine {
         guard now.bundleID == app.bundleID else {
             return .refused("The bundle identifier of \(app.name) changed since it was scanned (now \(now.bundleID)). Scan again.")
         }
-        if env.runningExecutables().contains(where: { $0.hasPrefix(path + "/Contents/") }) {
+        guard let running = env.runningExecutables() else {
+            return .refused("the list of running apps could not be read, so it is not known whether \(app.name) is running.")
+        }
+        if running.contains(where: { $0.hasPrefix(path + "/Contents/") }) {
             return .refused("\(app.name) is running. Quit it first; Mac Cleaner never quits an app for you.")
         }
         switch action {

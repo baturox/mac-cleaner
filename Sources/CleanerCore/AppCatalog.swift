@@ -230,6 +230,15 @@ enum AppCatalog {
         return id.unicodeScalars.allSatisfy { ($0.value < 128) && (CharacterSet.alphanumerics.contains($0) || $0 == "." || $0 == "-" || $0 == "_") }
     }
 
+    /// A bundle id that may name leftovers: safe characters AND reverse-DNS shape (two or more non-empty parts).
+    /// Any app can claim any id; a one-word id such as "Google" or "JetBrains" would make a vendor's shared
+    /// folder (`Application Support/Google`) an exact, pre-ticked leftover of whatever bundle claims it.
+    static func isMatchableIdentifier(_ id: String) -> Bool {
+        guard isSafeIdentifier(id) else { return false }
+        let parts = id.split(separator: ".", omittingEmptySubsequences: false)
+        return parts.count >= 2 && !parts.contains(where: { $0.isEmpty })
+    }
+
     private struct ExactSpec {
         var folder: String
         var suffix: String
@@ -286,8 +295,8 @@ enum AppCatalog {
     /// entitlements name. Exact matches come first, then shared group containers, then possible ones.
     static func pendingLeftovers(for app: AppCandidate, all: [AppCandidate], index: LibraryIndex, groups: [String],
                                  env: EngineEnvironment, guardian: PathGuard) -> (items: [PendingLeftover], note: String?) {
-        guard isSafeIdentifier(app.bundleID) else {
-            return ([], "The bundle identifier has unusual characters, so no data is matched to this app.")
+        guard isMatchableIdentifier(app.bundleID) else {
+            return ([], "The bundle identifier is unusual (odd characters, or not in the reverse-DNS form), so no data is matched to this app.")
         }
         if all.contains(where: { $0.bundleID == app.bundleID && $0.path != app.path }) {
             return ([], "Another copy of this app is installed; its data is shared, so none is listed.")

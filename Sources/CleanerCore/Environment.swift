@@ -57,8 +57,9 @@ struct EngineEnvironment: Sendable {
     var selfBundlePath: String? = nil
     /// Spotlight's last-used record of a bundle.
     var lastUsed: @Sendable (String) -> LastUsedLookup = { _ in .unknown }
-    /// Executable paths of the running processes (for "is this app running").
-    var runningExecutables: @Sendable () -> [String] = { [] }
+    /// Executable paths of the running processes (for "is this app running"). nil = the process list could not
+    /// be read, and removing an app is then refused rather than assumed safe.
+    var runningExecutables: @Sendable () -> [String]? = { [] }
     /// Application groups an app's entitlements name.
     var appGroups: @Sendable (String) -> [String] = { _ in [] }
 
