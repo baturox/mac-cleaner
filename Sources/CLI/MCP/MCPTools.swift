@@ -182,6 +182,14 @@ final class MCPTools: @unchecked Sendable {
                  ]) { a, _ in a }),
                  output: Self.out(["groups": ["type": "array"], "total_groups": ["type": "integer"], "has_more": ["type": "boolean"]]),
                  readOnly: true, destructive: false, idempotent: true),
+            tool("list_apps", "List installed apps", "Installed applications (.app bundles in /Applications, /Applications/Utilities and ~/Applications) with bundle size, the size of the data each keeps in the user's Library (caches, settings, data), when it was last opened (Spotlight; null when unknown) and whether it is running, from the App Store, from Homebrew or removable. Read-only; nothing here can remove an app." + n,
+                 input: Self.schema(Self.paging.merging([
+                    "unused_days": Self.p("integer", "Only apps not opened for at least this many days (apps never opened count; apps with no record do not).", extra: ["minimum": 0]),
+                    "sort": Self.p("string", "size (default, app plus data), data, opened (oldest first) or name.", extra: ["enum": ["size", "data", "opened", "name"]]),
+                    "include_leftovers": Self.p("boolean", "Also list each app's exact-match data folders (default false)."),
+                 ]) { a, _ in a }),
+                 output: Self.out(["apps": ["type": "array"], "total_apps": ["type": "integer"], "total_bytes": ["type": "integer"], "has_more": ["type": "boolean"]]),
+                 readOnly: true, destructive: false, idempotent: true),
             tool("explore_folder", "Explore a folder", "Show the biggest children of a folder with on-disk sizes. Restricted to the home folder and temp folders. Credential and configuration locations (SSH keys, keychains, tool credentials) and the user's protected folders are refused as the path and left out of the listing; the size of a folder that contains one still includes it. Read-only." + n,
                  input: Self.schema(["path": Self.p("string", "Absolute path or ~/…; default: home."),
                                      "top": Self.p("integer", "Number of entries (default 15, maximum 50).", extra: ["minimum": 1, "maximum": 50])]),
@@ -235,6 +243,7 @@ final class MCPTools: @unchecked Sendable {
             case "list_category_items": return try await listItems(raw, settings, progress)
             case "scan_projects": return try await scanProjects(raw, settings, progress)
             case "scan_repos": return try await scanRepos(raw, settings, progress)
+            case "list_apps": return try await listApps(raw, settings, progress)
             case "explore_folder": return try await explore(raw, settings)
             case "growth_report": return try await growth(raw, settings, progress)
             case "audit_history": return try await audit(raw)
@@ -436,6 +445,46 @@ final class MCPTools: @unchecked Sendable {
         }
         return .ok("\(groups.count) repositories; showing \(list.count). Nothing here can remove a clone.",
                    ["root": .string(MCPSanitizer.path(root)), "groups": .array(list), "total_groups": .int(Int64(groups.count)),
+                    "offset": .int(Int64(p.offset)), "has_more": .bool(p.hasMore)])
+    }
+
+    private func listApps(_ raw: [String: JSONValue], _ s: (settings: EngineSettings, problem: String?), _ progress: @escaping ProgressHandler) async throws -> ToolOutcome {
+        let a = try ToolArgs(raw, allowed: ["unused_days", "sort", "include_leftovers", "limit", "offset"])
+        let sort = try a.string("sort", max: 10) ?? "size"
+        guard AppsCommand.sortKeys.contains(sort) else { throw ToolError("'sort' must be one of: \(AppsCommand.sortKeys.joined(separator: ", ")).") }
+        let unusedValue = try a.int("unused_days", default: -1, range: -1...100_000)
+        let unused: Int? = unusedValue < 0 ? nil : unusedValue
+        let withLeftovers = try a.bool("include_leftovers", default: false)
+        let found = await engine.scanApps(progress: progress)
+        try Task.checkCancellation()
+        let acc = access(s.settings)
+        let moment = now()
+        let visible = found.filter { !acc.isHidden($0.url.path) }
+        let matching = AppsCommand.filtered(visible, unused: unused, sort: sort, now: moment)
+        let total = matching.reduce(Int64(0)) { $0 + $1.reclaimBytes }
+        let p = try page(matching, a, defaultLimit: 25, maxLimit: 100)
+        let list: [JSONValue] = p.items.map { app in
+            var o: [String: JSONValue] = [
+                "name": .string(MCPSanitizer.text(app.name)), "bundle_id": .string(MCPSanitizer.text(app.bundleID, max: 150)),
+                "path": .string(MCPSanitizer.path(app.url.path)), "bundle_bytes": .int(app.bundleBytes), "data_bytes": .int(app.dataBytes),
+                "cache_bytes": .int(app.cacheBytes), "running": .bool(app.isRunning), "app_store": .bool(app.isAppStore),
+                "removable": .bool(app.canRemove), "never_opened": .bool(app.neverOpened),
+                "possible_leftover_count": .int(Int64(app.possibleLeftovers.count)),
+            ]
+            if let v = app.version { o["version"] = .string(MCPSanitizer.text(v, max: 60)) }
+            o["last_opened"] = app.lastOpened.map { JSON.iso($0) } ?? .null
+            if let token = app.homebrewCask { o["homebrew_cask"] = .string(MCPSanitizer.text(token, max: 100)) }
+            if let block = app.removalBlock { o["not_removable_reason"] = .string(block.message) }
+            if withLeftovers {
+                o["leftovers"] = .array(app.leftovers.prefix(20).map { l in
+                    ["path": .string(MCPSanitizer.path(l.url.path)), "label": .string(MCPSanitizer.text(l.label, max: 60)), "kind": .string(l.kind.rawValue),
+                     "match": .string(l.match.rawValue), "size_bytes": .int(l.sizeBytes)]
+                })
+            }
+            return .object(o)
+        }
+        return .ok("\(matching.count) apps, \(fmt(total)) with the data they keep; showing \(list.count). Nothing here can remove an app.",
+                   ["apps": .array(list), "total_apps": .int(Int64(matching.count)), "total_bytes": .int(total),
                     "offset": .int(Int64(p.offset)), "has_more": .bool(p.hasMore)])
     }
 

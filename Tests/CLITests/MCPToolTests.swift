@@ -244,6 +244,9 @@ final class MCPToolTests: XCTestCase {
                                     failedItemCount: 1, items: [AuditItem(path: s.home + "/" + evil, name: evil, sizeBytes: 1,
                                                                           action: .deleted, outcome: .failed, reason: evil)])]
         engine.resultMessages = [evil]
+        engine.apps = [makeApp(evil, name: evil, path: s.home + "/Applications/" + evil + ".app",
+                               leftovers: [makeLeftover(s.home + "/Library/Caches/" + evil), makeLeftover(s.home + "/Library/Application Support/" + evil, kind: .data, match: .possible)],
+                               cask: evil)]
         let o = cleanOptions()
         let h = MCPHarness(tools: s.tools(engine, o), options: o)
 
@@ -257,6 +260,7 @@ final class MCPToolTests: XCTestCase {
         results.append(("list_category_items", await h.callTool("list_category_items", ["category": "user-caches"])))
         results.append(("scan_projects", await h.callTool("scan_projects", ["root": "~/code", "min_size_mb": 1])))
         results.append(("scan_repos", await h.callTool("scan_repos")))
+        results.append(("list_apps", await h.callTool("list_apps", ["include_leftovers": true])))
         results.append(("explore_folder", await h.callTool("explore_folder")))
         results.append(("growth_report", await h.callTool("growth_report")))
         results.append(("audit_history", await h.callTool("audit_history", ["include_items": true])))
@@ -269,7 +273,7 @@ final class MCPToolTests: XCTestCase {
         results.append(("error: bad plan group", await h.callTool("plan_cleanup", ["groups": [.string(evil)]])))
         results.append(("error: bad plan category", await h.callTool("plan_cleanup", ["categories": [.string(evil)]])))
         let listed = await h.request("tools/list")
-        XCTAssertEqual(Set(results.prefix(10).map(\.0)), Set(listed?["result"]?["tools"]?.array?.compactMap { $0["name"]?.string } ?? []),
+        XCTAssertEqual(Set(results.prefix(11).map(\.0)), Set(listed?["result"]?["tools"]?.array?.compactMap { $0["name"]?.string } ?? []),
                        "every listed tool was exercised")
 
         var sawTheHostileText = 0
@@ -299,6 +303,57 @@ final class MCPToolTests: XCTestCase {
         XCTAssertTrue(h.allRawLines.allSatisfy { JSON.parse(Data($0.utf8))?["jsonrpc"]?.string == "2.0" })
         // On the wire every message is one line: the raw bytes hold no control character at all.
         for line in h.allRawLines { XCTAssertEqual(forbidden(in: line), [], "raw line \(line.prefix(60))") }
+    }
+
+    func testListAppsReportsSizesDataAndLastOpenedAndIsPaged() async throws {
+        let engine = FakeEngine()
+        let s = try MCPScratch()
+        let cache = makeLeftover(s.home + "/Library/Caches/com.acme.one", size: 3_000_000)
+        engine.apps = [
+            makeApp("com.acme.one", name: "One", bundle: 500_000_000, leftovers: [cache], lastOpened: Date().addingTimeInterval(-200 * 86_400)),
+            makeApp("com.acme.two", name: "Two", bundle: 100_000_000, never: true),
+            makeApp("com.acme.three", name: "Three", bundle: 50_000_000, lastOpened: Date()),
+            makeApp("com.apple.Four", name: "Four", bundle: 10_000_000, block: .apple),
+        ]
+        let o = cleanOptions()
+        let h = MCPHarness(tools: s.tools(engine, o), options: o)
+        let all = await h.callTool("list_apps", ["include_leftovers": true])
+        XCTAssertFalse(all.isError, all.text)
+        let apps = all.structured?["apps"]?.array ?? []
+        XCTAssertEqual(apps.count, 4)
+        XCTAssertEqual(apps.first?["name"]?.string, "One", "largest (app plus data) first")
+        XCTAssertEqual(apps.first?["cache_bytes"]?.int, 3_000_000)
+        XCTAssertEqual(apps.first?["leftovers"]?.array?.first?["kind"]?.string, "cache")
+        XCTAssertEqual(apps.first { $0["name"]?.string == "Four" }?["removable"]?.bool, false)
+        XCTAssertEqual(apps.first { $0["name"]?.string == "Two" }?["never_opened"]?.bool, true)
+        let unused = await h.callTool("list_apps", ["unused_days": 90])
+        XCTAssertEqual(Set((unused.structured?["apps"]?.array ?? []).compactMap { $0["name"]?.string }), ["One", "Two"])
+        let paged = await h.callTool("list_apps", ["limit": 3])
+        XCTAssertEqual(paged.structured?["apps"]?.array?.count, 3)
+        XCTAssertEqual(paged.structured?["has_more"]?.bool, true)
+        let bad = await h.callTool("list_apps", ["sort": "colour"])
+        XCTAssertTrue(bad.isError)
+        let extra = await h.callTool("list_apps", ["remove": "com.acme.one"])
+        XCTAssertTrue(extra.isError, "unknown arguments are rejected")
+        XCTAssertTrue(engine.removedApps.isEmpty && engine.clearedApps.isEmpty)
+    }
+
+    func testListAppsHidesAppsInProtectedFoldersAndNothingCanRemoveAnApp() async throws {
+        let engine = FakeEngine()
+        let s = try MCPScratch()
+        try s.mkdir("Applications/Secret")
+        engine.apps = [makeApp("com.acme.open", name: "Open", path: s.home + "/Applications/Open.app"),
+                       makeApp("com.acme.secret", name: "Secret", path: s.home + "/Applications/Secret/Secret.app")]
+        let o = cleanOptions()
+        let h = MCPHarness(tools: s.tools(engine, o, extraProtected: [s.home + "/Applications/Secret"]), options: o)
+        let r = await h.callTool("list_apps")
+        XCTAssertEqual((r.structured?["apps"]?.array ?? []).compactMap { $0["name"]?.string }, ["Open"])
+        XCTAssertFalse(r.text.contains("Secret"))
+        let list = await h.request("tools/list")
+        let names = (list?["result"]?["tools"]?.array ?? []).compactMap { $0["name"]?.string }
+        XCTAssertTrue(names.contains("list_apps"))
+        XCTAssertFalse(names.contains { $0.contains("remove") || $0.contains("uninstall") }, "no app removal tool, even with cleanup enabled")
+        XCTAssertTrue(engine.removedApps.isEmpty && engine.clearedApps.isEmpty)
     }
 
     func testSanitizerUnit() {

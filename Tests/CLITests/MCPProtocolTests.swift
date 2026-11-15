@@ -72,7 +72,7 @@ final class MCPProtocolTests: XCTestCase {
     func testToolListWithoutAllowCleanHasNoDeletionTools() async throws {
         let (h, _, _) = try harness(allowClean: false)
         let list = await h.request("tools/list")
-        XCTAssertEqual(Set(names(list)), ["disk_status", "scan_cleanup", "list_category_items", "scan_projects", "scan_repos",
+        XCTAssertEqual(Set(names(list)), ["disk_status", "scan_cleanup", "list_category_items", "scan_projects", "scan_repos", "list_apps",
                                           "explore_folder", "growth_report", "audit_history"])
         let d = await h.request("server/discover")
         let text = d?["result"]?["instructions"]?.string ?? ""
@@ -90,7 +90,7 @@ final class MCPProtocolTests: XCTestCase {
         let (h, _, _) = try harness(allowClean: true)
         let list = await h.request("tools/list")
         let tools = list?["result"]?["tools"]?.array ?? []
-        XCTAssertEqual(Set(names(list)).count, 10)
+        XCTAssertEqual(Set(names(list)).count, 11)
         for t in tools {
             let name = t["name"]?.string ?? "?"
             let a = t["annotations"]
@@ -111,7 +111,7 @@ final class MCPProtocolTests: XCTestCase {
         XCTAssertEqual(ann("plan_cleanup", "readOnlyHint"), true, "planning changes nothing on disk")
         XCTAssertEqual(ann("growth_report", "readOnlyHint"), false, "it saves a snapshot in the app's own history file")
         XCTAssertEqual(ann("growth_report", "destructiveHint"), false)
-        for n in ["disk_status", "scan_cleanup", "list_category_items", "scan_projects", "scan_repos", "explore_folder", "audit_history"] {
+        for n in ["disk_status", "scan_cleanup", "list_category_items", "scan_projects", "scan_repos", "list_apps", "explore_folder", "audit_history"] {
             XCTAssertEqual(ann(n, "readOnlyHint"), true, n)
             XCTAssertEqual(ann(n, "destructiveHint"), false, n)
         }

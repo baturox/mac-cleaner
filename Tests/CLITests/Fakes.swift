@@ -44,6 +44,7 @@ final class FakeEngine: CleanerEngine, @unchecked Sendable {
     var categories: [CleanCategory] = []
     var artifacts: [ProjectArtifact] = []
     var groups: [RepoGroup] = []
+    var apps: [InstalledApp] = []
     var folder: [FolderEntry] = []
     var growth = GrowthReport.empty
     var audit: [AuditRecord] = []
@@ -76,6 +77,9 @@ final class FakeEngine: CleanerEngine, @unchecked Sendable {
     private(set) var deletedCalls: [(urls: [URL], mode: DeleteMode)] = []
     private(set) var removeCalls: [(clones: [RepoClone], force: Bool, mode: DeleteMode)] = []
     private(set) var configured: [EngineSettings] = []
+    private(set) var removedApps: [(app: InstalledApp, leftovers: [AppLeftover], mode: DeleteMode)] = []
+    private(set) var clearedApps: [(app: InstalledApp, mode: DeleteMode)] = []
+    var appResult = CleanResult(freedBytes: 0, failedCount: 0, messages: [], auditRecorded: true)
 
     func configure(_ settings: EngineSettings) async { lock.withLock { configured.append(settings) } }
 
@@ -118,6 +122,17 @@ final class FakeEngine: CleanerEngine, @unchecked Sendable {
         lock.withLock { removeCalls.append((clones, force, mode)) }
         return CleanResult(freedBytes: clones.reduce(0) { $0 + $1.sizeBytes }, failedCount: 0, messages: [])
     }
+    func scanApps(progress: @escaping ProgressHandler) async -> [InstalledApp] { apps }
+    func removeApp(_ app: InstalledApp, leftovers: [AppLeftover], leftoverMode: DeleteMode, progress: @escaping ProgressHandler,
+                   deleteProgress: @escaping DeleteProgressHandler) async -> CleanResult {
+        lock.withLock { removedApps.append((app, leftovers, leftoverMode)) }
+        return appResult
+    }
+    func clearAppCaches(_ app: InstalledApp, mode: DeleteMode, progress: @escaping ProgressHandler,
+                        deleteProgress: @escaping DeleteProgressHandler) async -> CleanResult {
+        lock.withLock { clearedApps.append((app, mode)) }
+        return appResult
+    }
     func recordSnapshot(categories: [CleanCategory], artifacts: [ProjectArtifact]) async -> GrowthReport { growth }
     func auditLog(limit: Int, before: Date?) async -> [AuditRecord] {
         Array(audit.filter { before == nil || $0.startedAt < before! }.sorted { $0.startedAt > $1.startedAt }.prefix(limit))
@@ -145,6 +160,20 @@ func makeClone(_ path: String, branch: String? = "main", linked: Bool = false, u
     RepoClone(url: URL(fileURLWithPath: path), branch: branch, isLinkedWorktree: linked, uncommittedCount: uncommitted,
               unpushedCount: unpushed, hasStash: stash, lastCommit: nil, idleDays: idle, sizeBytes: size, artifactBytes: 0,
               ignoredFileCount: ignored, untrustedConfigKeys: untrusted)
+}
+
+func makeApp(_ id: String, name: String? = nil, path: String? = nil, bundle: Int64 = 100_000_000, leftovers: [AppLeftover] = [],
+             lastOpened: Date? = nil, never: Bool = false, running: Bool = false, block: AppRemovalBlock? = nil, cask: String? = nil) -> InstalledApp {
+    let n = name ?? id
+    return InstalledApp(url: URL(fileURLWithPath: path ?? "/Applications/\(n).app"), name: n, bundleID: id, version: "1.0", bundleBytes: bundle,
+                        lastOpened: lastOpened, neverOpened: never, isRunning: running, homebrewCask: cask, removalBlock: block,
+                        device: 1, inode: 2, leftovers: leftovers)
+}
+
+func makeLeftover(_ path: String, kind: AppLeftoverKind = .cache, match: AppLeftoverMatch = .exact, size: Int64 = 1_000_000,
+                  tick: Bool? = nil, label: String = "Caches") -> AppLeftover {
+    AppLeftover(url: URL(fileURLWithPath: path), label: label, kind: kind, match: match, sizeBytes: size,
+                selectedByDefault: tick ?? (match == .exact))
 }
 
 func invoke(_ args: [String], engine: FakeEngine = FakeEngine(), console: FakeConsole = FakeConsole(),

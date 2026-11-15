@@ -94,6 +94,34 @@ struct RepoCloneReport: Codable {
     var removable: Bool
 }
 
+/// `mac-cleaner apps --json`
+struct AppsReport: Codable {
+    var schemaVersion = jsonSchemaVersion
+    var generatedAt: Date
+    var apps: [AppReport]
+    /// Bundles plus exact leftovers, minus caches the Cleanup screen already lists.
+    var totalBytes: Int64
+    /// The `--unused` filter, when given.
+    var unusedDays: Int?
+}
+
+struct AppReport: Codable {
+    /// Contract type `InstalledApp`.
+    var app: InstalledApp
+    var removable: Bool
+    /// Why not (system, administrator, protected, Homebrew...), or nil.
+    var notRemovableReason: String?
+    /// "3 days ago", "never" or "unknown".
+    var lastOpenedText: String
+
+    init(_ a: InstalledApp, now: Date) {
+        app = a
+        removable = a.canRemove
+        if let token = a.homebrewCask { notRemovableReason = "installed by Homebrew: brew uninstall --cask \(token)" } else { notRemovableReason = a.removalBlock?.message }
+        lastOpenedText = AppsCommand.lastOpenedText(a, now: now)
+    }
+}
+
 /// `mac-cleaner explore --json`
 struct ExploreReport: Codable {
     var schemaVersion = jsonSchemaVersion

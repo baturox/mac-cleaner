@@ -104,6 +104,38 @@ enum Commands {
         ]
     )
 
+    static let apps = CommandSpec(
+        name: "apps",
+        summary: "List installed apps with size, last use and the data they keep; remove one or clear its caches",
+        usage: "apps [bundle-id] [--unused N] [--sort size|data|opened|name] [--clear-caches | --remove [--with-data]] [--trash] [-n] [-y]",
+        positionalHelp: ["bundle-id   Show one app, or act on it with --clear-caches / --remove (exact bundle identifier, e.g. com.acme.app)."],
+        maxPositionals: 1,
+        options: [
+            OptionSpec("unused", value: "N", "Only apps not opened for at least N days (apps never opened count; apps Spotlight has no record for do not)."),
+            OptionSpec("sort", value: "KEY", "size (default, app plus data), data, opened (oldest first) or name."),
+            OptionSpec("clear-caches", "Remove only the cache folders matched by the app's exact bundle identifier."),
+            OptionSpec("remove", "Move the app to the Trash (always the Trash). Refused while it runs, for Apple apps, Homebrew apps and Mac Cleaner."),
+            OptionSpec("with-data", "With --remove: also remove its exact-match data (large data folders are left alone)."),
+            OptionSpec("trash", "With --clear-caches or --remove: move the data to the Trash too (default: delete it permanently)."),
+            OptionSpec("dry-run", short: "n", "Show what would be removed; remove nothing."),
+            OptionSpec("yes", short: "y", "Do not ask for confirmation (required when not on a terminal)."),
+        ],
+        examples: [
+            "mac-cleaner apps --unused 90 --sort size",
+            "mac-cleaner apps com.acme.app",
+            "mac-cleaner apps com.acme.app --clear-caches -n",
+            "mac-cleaner apps com.acme.app --remove --with-data",
+        ],
+        notes: [
+            "Apps are the .app bundles directly in /Applications, /Applications/Utilities and ~/Applications (one level of",
+            "subfolders). Nothing under /System is listed. Data is looked up in your Library only: by the exact bundle",
+            "identifier (that is what --clear-caches and --with-data use); folders merely named like the app are shown in the",
+            "app but never removed here. The app itself always goes to the Trash so it can be undone. An app owned by root needs an",
+            "administrator: remove it in Finder. A Homebrew app is left to `brew uninstall --cask`. Every action is written to the",
+            "audit log first (`mac-cleaner history`). --json implies --dry-run when acting.",
+        ]
+    )
+
     static let explore = CommandSpec(
         name: "explore",
         summary: "Show the biggest children of a folder",
@@ -193,7 +225,7 @@ enum Commands {
         ]
     )
 
-    static let all: [CommandSpec] = [scan, clean, projects, repos, explore, growth, history, mcp, doctor]
+    static let all: [CommandSpec] = [scan, clean, projects, repos, apps, explore, growth, history, mcp, doctor]
 
     static func named(_ name: String) -> CommandSpec? { all.first { $0.name == name } }
 }
@@ -229,6 +261,7 @@ enum Help {
             "  mac-cleaner clean --safe -n       # preview the safe cleanup",
             "  mac-cleaner projects ~/Developer  # stale node_modules / target / .next",
             "  mac-cleaner repos --multiple-only # duplicate clones and leftover agent worktrees",
+            "  mac-cleaner apps --unused 90      # apps you have not opened for a while, with their data",
             "  mac-cleaner history               # what did Mac Cleaner delete?",
             "  mac-cleaner mcp                   # MCP server for AI agents (see `mac-cleaner help mcp`)",
             "  mac-cleaner doctor                # why is my free space not what Finder says?",

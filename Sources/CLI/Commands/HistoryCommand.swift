@@ -125,6 +125,8 @@ enum HistoryCommand {
         case .projectArtifacts: return "project folders"
         case .explorerDelete: return "explorer delete"
         case .removeClones: return "remove clones"
+        case .removeApp: return "remove app"
+        case .clearAppCaches: return "app caches"
         }
     }
 

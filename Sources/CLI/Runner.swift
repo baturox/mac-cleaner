@@ -126,6 +126,7 @@ func runCLI(arguments: [String],
         case "clean": return try await CleanCommand.run(parsed, ctx)
         case "projects": return try await ProjectsCommand.run(parsed, ctx)
         case "repos": return try await ReposCommand.run(parsed, ctx)
+        case "apps": return try await AppsCommand.run(parsed, ctx)
         case "explore": return try await ExploreCommand.run(parsed, ctx)
         case "growth": return try await GrowthCommand.run(parsed, ctx)
         case "history": return try await HistoryCommand.run(parsed, ctx)
