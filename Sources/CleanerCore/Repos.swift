@@ -430,7 +430,14 @@ extension LiveEngine {
         var cancelled = false
         var messages: [String] = []
         for clone in clones {
-            if Task.isCancelled { cancelled = true; break }
+            if Task.isCancelled {
+                // Still listed in the outcome record, so it accounts for every clone of the "started" one.
+                cancelled = true
+                op.audit.add(AuditItem(path: clone.url.path, name: clone.url.lastPathComponent, sizeBytes: clone.sizeBytes,
+                                       action: mode == .trash ? .movedToTrash : .deleted, outcome: .failed,
+                                       reason: Self.cancelledReason, branch: clone.branch, forced: force))
+                continue
+            }
             defer { tally.itemFinished() }
             let path = clone.url.path
             let name = (path as NSString).lastPathComponent

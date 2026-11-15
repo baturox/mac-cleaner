@@ -211,7 +211,12 @@ public struct LiveEngine: CleanerEngine {
             }
             for item in cat.items {
                 guard let cmd = item.deleteCommand else { continue }
-                if Task.isCancelled { cancelled = true; break }
+                if Task.isCancelled {
+                    cancelled = true
+                    op.audit.add(AuditItem(path: item.url.path, name: item.displayName, categoryID: cat.id, sizeBytes: item.sizeBytes,
+                                           action: .commandRun, command: cmd, outcome: .failed, reason: Self.cancelledReason))
+                    continue
+                }
                 progress("Removing \(item.displayName)…")
                 let r = await runAllowed(cmd, timeout: 600)
                 tally.itemFinished()
@@ -225,17 +230,23 @@ public struct LiveEngine: CleanerEngine {
                                        action: .commandRun, command: cmd,
                                        outcome: r.ok ? .ok : (r.status == 126 && !r.launched ? .refused : .failed), reason: reason))
             }
-            if cat.id == "snapshots", !Task.isCancelled {
+            if cat.id == "snapshots", Task.isCancelled {
+                cancelled = true
+                op.audit.add(Self.snapshotStep(cat, outcome: .failed, reason: Self.cancelledReason))
+            } else if cat.id == "snapshots" {
                 let r = await GenericScanner.snapshotCleanup(env: env, progress: progress)
                 tally.itemFinished()
                 failed += r.failed
                 messages += r.messages
-                op.audit.add(AuditItem(path: nil, name: cat.name, categoryID: cat.id, sizeBytes: cat.sizeBytes, action: .commandRun,
-                                       command: ["tmutil", "deletelocalsnapshots", "<each local snapshot date>"],
-                                       outcome: r.failed > 0 ? .failed : .ok, reason: r.messages.first))
+                op.audit.add(Self.snapshotStep(cat, outcome: r.failed > 0 ? .failed : .ok, reason: r.messages.first))
             }
             for (i, cmd) in cat.commands.enumerated() {
-                if Task.isCancelled { cancelled = true; break }
+                if Task.isCancelled {
+                    cancelled = true
+                    op.audit.add(AuditItem(path: nil, name: cmd.joined(separator: " "), categoryID: cat.id, sizeBytes: i == 0 ? cat.sizeBytes : 0,
+                                           action: .commandRun, command: cmd, outcome: .failed, reason: Self.cancelledReason))
+                    continue
+                }
                 progress("Running \(cmd.joined(separator: " "))…")
                 let r = await runAllowed(cmd, timeout: 1800)
                 tally.itemFinished()
@@ -258,16 +269,24 @@ public struct LiveEngine: CleanerEngine {
 
     /// Audit entries for what a cancelled clean never got to (so the outcome record accounts for every item).
     private static func notReached(_ cat: CleanCategory) -> [AuditItem] {
-        let why = "Not removed (the operation was cancelled)"
+        let why = cancelledReason
         var out: [AuditItem] = cat.items.map {
             AuditItem(path: $0.url.path, name: $0.displayName, categoryID: cat.id, sizeBytes: $0.sizeBytes,
                       action: $0.deleteCommand == nil ? .deleted : .commandRun, command: $0.deleteCommand, outcome: .failed, reason: why)
         }
+        if cat.id == "snapshots" { out.append(snapshotStep(cat, outcome: .failed, reason: why)) }
         for cmd in cat.commands {
             out.append(AuditItem(path: nil, name: cmd.joined(separator: " "), categoryID: cat.id, sizeBytes: 0, action: .commandRun,
                                  command: cmd, outcome: .failed, reason: why))
         }
         return out
+    }
+
+    static let cancelledReason = "Not removed (the operation was cancelled)"
+
+    private static func snapshotStep(_ cat: CleanCategory, outcome: AuditOutcome, reason: String?) -> AuditItem {
+        AuditItem(path: nil, name: cat.name, categoryID: cat.id, sizeBytes: cat.sizeBytes, action: .commandRun,
+                  command: ["tmutil", "deletelocalsnapshots", "<each local snapshot date>"], outcome: outcome, reason: reason)
     }
 
     /// The size written to the outcome record: what was counted while removing; the scanned size only when

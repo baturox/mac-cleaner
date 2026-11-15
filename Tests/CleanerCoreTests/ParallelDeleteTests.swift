@@ -318,6 +318,89 @@ final class ParallelDeleteTests: EngineTestCase {
         XCTAssertTrue(rec.items.allSatisfy { $0.outcome == .failed && ($0.reason ?? "").contains("cancelled") })
     }
 
+    // MARK: Review fixes
+
+    /// The first name of a hard-linked file is refused (read-only folder), the folder is made writable and the
+    /// name retried: the file's size must still be counted once, not lost because the refused try remembered it.
+    func testHardLinkedFileInAReadOnlyFolderIsCountedOnceAfterTheRetry() throws {
+        for workers in [1, 4] {
+            let f = try Fixture()
+            let a = try f.file("Documents/ro/a.bin", bytes: 64 * 1024)
+            try FileManager.default.linkItem(atPath: a, toPath: f.path("Documents/ro/b.bin"))
+            chmod(f.path("Documents/ro"), 0o555)
+            let expected = Self.count([f.path("Documents/ro")])
+            let r = f.deleter().removeEach([f.path("Documents/ro")], workers: workers)[0]
+            XCTAssertEqual(r.failed, 0, "workers \(workers): \(r.messages)")
+            XCTAssertFalse(f.exists("Documents/ro"))
+            XCTAssertEqual(r.entries, expected.entries, "workers \(workers)")
+            XCTAssertEqual(r.bytes, expected.bytes, "workers \(workers)")
+        }
+    }
+
+    /// Items that contain one another (or the same item twice) are not walked by two threads at once.
+    func testNestedOrRepeatedItemsAreDetectedAndRemovedCorrectly() throws {
+        XCTAssertTrue(Deleter.overlaps(["/u/a", "/u/a/b"]))
+        XCTAssertTrue(Deleter.overlaps(["/u/a/b/c", "/u/x", "/u/a"]))
+        XCTAssertTrue(Deleter.overlaps(["/u/a", "/u/a/"]))
+        XCTAssertTrue(Deleter.overlaps(["/u/Cache", "/u/cache/x"]), "letter case does not separate two items")
+        XCTAssertFalse(Deleter.overlaps(["/u/a", "/u/ab", "/u/b/a"]))
+        let f = try Fixture()
+        for i in 0..<6 { try f.file("Documents/outer/inner/d\(i)/x.txt", "x"); try f.file("Documents/outer/o\(i)/y.txt", "y") }
+        let expected = Self.count([f.path("Documents/outer")])
+        let results = f.deleter().removeEach([f.path("Documents/outer"), f.path("Documents/outer/inner")], workers: 4)
+        XCTAssertFalse(f.exists("Documents/outer"))
+        XCTAssertEqual(results[0].failed, 0, "\(results[0].messages)")
+        // Walked by two threads at once, entries were counted twice (30 instead of 26).
+        XCTAssertEqual(results.reduce(0) { $0 + $1.entries }, expected.entries, "nothing counted twice")
+    }
+
+    /// Stopped while a category's folders are being removed: its command steps that never ran are still in the record.
+    func testStopInsideACategoryRecordsTheStepsItNeverReached() async throws {
+        let f = try Fixture()
+        for i in 0..<20 { try f.file("Library/Caches/big/d\(i)/x.txt", "x") }
+        let cat = CleanCategory(id: "c1", name: "c1", detail: "d", level: .safe, symbol: "folder",
+                                items: [CleanItem(url: URL(fileURLWithPath: f.path("Library/Caches/big")), sizeBytes: 10),
+                                        CleanItem(url: URL(fileURLWithPath: f.path("Library/Caches/tool")), sizeBytes: 5, deleteCommand: ["true"])],
+                                commands: [["true"]], sizeBytes: 15)
+        let handle = Locked<Task<CleanResult, Never>?>(nil)
+        f.env.beforeDescend = { _ in
+            let deadline = Date().addingTimeInterval(5)
+            while handle.get() == nil && Date() < deadline { usleep(1000) }
+            handle.get()?.cancel()
+        }
+        let e = engine(f)
+        let task = Task { await e.clean(categories: [cat], mode: .permanent, progress: { _ in }) }
+        handle.set(task)
+        let r = await task.value
+        XCTAssertTrue(r.cancelled)
+        let log = await e.auditLog(limit: 5, before: nil)
+        let rec = try XCTUnwrap(log.first)
+        XCTAssertEqual(rec.cancelled, true)
+        XCTAssertEqual(rec.items.count, 3, "the folder, the command item and the category command: \(rec.items.map(\.name))")
+        XCTAssertEqual(rec.items.filter { $0.action == .commandRun }.count, 2)
+        XCTAssertTrue(rec.items.filter { $0.action == .commandRun }.allSatisfy { $0.outcome == .failed && ($0.reason ?? "").contains("cancelled") })
+    }
+
+    func testCancelledCloneRemovalRecordsClonesItNeverReached() async throws {
+        let f = try Fixture()
+        let path = try f.dir("Projects/clone")
+        let clone = RepoClone(url: URL(fileURLWithPath: path), branch: "main", isLinkedWorktree: false, uncommittedCount: 0,
+                              unpushedCount: 0, hasStash: false, lastCommit: nil, idleDays: 1, sizeBytes: 10, artifactBytes: 0)
+        let e = engine(f)
+        let task = Task { () -> CleanResult in
+            withUnsafeCurrentTask { $0?.cancel() }
+            return await e.removeClones([clone], force: false, mode: .permanent, progress: { _ in })
+        }
+        let r = await task.value
+        XCTAssertTrue(r.cancelled)
+        XCTAssertTrue(f.exists(path))
+        let log = await e.auditLog(limit: 5, before: nil)
+        let rec = try XCTUnwrap(log.first)
+        XCTAssertEqual(rec.cancelled, true)
+        XCTAssertEqual(rec.items.map(\.path), [path])
+        XCTAssertEqual(rec.items.first?.outcome, .failed)
+    }
+
     // MARK: Format compatibility
 
     func testOldRecordsWithoutTheNewFieldsStillDecodeAndNewFieldsAreOptional() throws {
