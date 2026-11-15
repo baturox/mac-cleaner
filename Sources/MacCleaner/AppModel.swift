@@ -129,6 +129,17 @@ enum ActiveSheet: Identifiable {
 
 enum TriState { case none, some, all }
 
+/// A value that progress callbacks (any thread) and the main actor share.
+final class Locked<T>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: T
+    init(_ value: T) { stored = value }
+    var value: T {
+        get { lock.lock(); defer { lock.unlock() }; return stored }
+        set { lock.lock(); stored = newValue; lock.unlock() }
+    }
+}
+
 /// Throttles progress callbacks (which may arrive from any thread) onto the main actor.
 final class ProgressRelay: @unchecked Sendable {
     private let lock = NSLock()
@@ -206,7 +217,13 @@ final class AppModel {
 
     var sheet: ActiveSheet?
     var cleanProgress = ""
+    /// Counts while a clean or delete runs (nil until the first report) and when it began.
+    var deleteProgress: DeleteProgress?
+    var cleanStartedAt = Date()
+    /// Stop was pressed; the engine is finishing the entry it is on and writing its outcome record.
+    var isStoppingClean = false
     var started = false
+    private var cleanTask: Task<Void, Never>?
 
     private var categoriesTask: Task<Bool, Never>?
     private var projectsTask: Task<Bool, Never>?
@@ -230,6 +247,8 @@ final class AppModel {
 
     var isScanning: Bool { isScanningCategories || isScanningProjects || isScanningRepos }
     var isBusy: Bool { sheet != nil }
+    /// A clean or delete is running. Scans neither start nor continue meanwhile: they would only compete for the disk.
+    var isCleaning: Bool { if case .running = sheet { return true } else { return false } }
     func refreshAuditStats() {
         let engine = self.engine
         Task {
@@ -459,6 +478,7 @@ final class AppModel {
 
     /// Starts the scan of the screen that was just opened, once. A later refresh button rescans.
     func sectionOpened() {
+        guard !isCleaning else { return }
         switch section {
         case .projects: if !hasScannedProjects && !isScanningProjects && !stoppedSections.contains(.projects) { scanProjects() }
         case .repos: if !hasScannedRepos && !isScanningRepos && !stoppedSections.contains(.repos) { scanRepos() }
@@ -468,7 +488,7 @@ final class AppModel {
 
     /// Every scan, from scratch: the folder walk kept by the engine is dropped first.
     func scanAll() {
-        guard !isBusy, !isScanning else { return }
+        guard !isBusy, !isScanning, !isCleaning else { return }
         resultsStale = false
         refreshDisk()
         engine.discardScanCache()
@@ -501,6 +521,7 @@ final class AppModel {
 
     @discardableResult
     func scanCategories() -> Task<Bool, Never> {
+        if isCleaning { return Task { false } }
         if isScanningCategories, let t = categoriesTask { return t }
         isScanningCategories = true
         stoppedSections.remove(.cleanup)
@@ -526,6 +547,7 @@ final class AppModel {
     /// screen may reuse a walk another screen just made.
     @discardableResult
     func scanProjects(fresh: Bool = false) -> Task<Bool, Never> {
+        if isCleaning { return Task { false } }
         if isScanningProjects, let t = projectsTask { return t }
         if fresh { engine.discardScanCache() }
         isScanningProjects = true
@@ -556,6 +578,7 @@ final class AppModel {
 
     @discardableResult
     func scanRepos(fresh: Bool = false) -> Task<Bool, Never> {
+        if isCleaning { return Task { false } }
         if isScanningRepos, let t = reposTask { return t }
         if fresh { engine.discardScanCache() }
         isScanningRepos = true
@@ -803,22 +826,42 @@ final class AppModel {
 
     func execute(_ plan: DeletionPlan) {
         cleanProgress = "Starting…"
+        deleteProgress = nil
+        isStoppingClean = false
+        cleanStartedAt = Date()
+        // Scans would only compete with the deletion for the disk; they are stopped and do not restart until it ends.
+        stopScanning()
         sheet = .running
         let relay = ProgressRelay { [weak self] in self?.cleanProgress = $0 }
         let engine = self.engine
         let mode = plan.mode
         let mock = isMock
-        Task {
+        let expected: Int64? = mode == .permanent && plan.expectedBytes > 0 ? plan.expectedBytes : nil
+        /// Counts of the first engine call, added to the second one's (clones are removed in two calls).
+        let first = Locked<DeleteProgress?>(nil)
+        func counts(offset: Bool) -> DeleteProgressHandler {
+            { [weak self] p in
+                var shown = p
+                if offset, let base = first.value {
+                    shown.itemsDone += base.itemsDone; shown.entriesRemoved += base.entriesRemoved; shown.bytesFreed += base.bytesFreed
+                    shown.itemsTotal += base.itemsTotal
+                } else if !offset { first.value = p }
+                if shown.expectedBytes == nil { shown.expectedBytes = expected }
+                Task { @MainActor in self?.deleteProgress = shown }
+            }
+        }
+        cleanTask = Task {
             var result: CleanResult
             switch plan.source {
             case .categories(let cats):
                 // Category items are re-checked by the engine itself: it refuses any path that is no longer
                 // reached without a symlink and never follows one while deleting.
-                result = await engine.clean(categories: cats, mode: mode, progress: relay.handler)
+                result = await engine.clean(categories: cats, mode: mode, progress: relay.handler, deleteProgress: counts(offset: false))
             case .projects(let urls), .explorer(let urls):
                 let purpose: DeletePurpose = { if case .projects = plan.source { return .projectArtifacts } else { return .explorer } }()
                 let checked = mock ? (urls, []) : await Task.detached { Self.revalidate(urls) }.value
-                result = await engine.delete(urls: checked.0, mode: mode, purpose: purpose, progress: relay.handler)
+                result = await engine.delete(urls: checked.0, mode: mode, purpose: purpose, progress: relay.handler,
+                                             deleteProgress: counts(offset: false))
                 result.failedCount += checked.1.count
                 result.messages = checked.1 + result.messages
             case .clones(let unforced, let forced):
@@ -826,7 +869,7 @@ final class AppModel {
                 let checked = mock ? (unforced.map(\.url), []) : await Task.detached { Self.revalidate(unforced.map(\.url)) }.value
                 let stillThere = Set(checked.0.map(\.path))
                 result = await engine.removeClones(unforced.filter { stillThere.contains($0.url.path) }, force: false, mode: mode,
-                                                   progress: relay.handler)
+                                                   progress: relay.handler, deleteProgress: counts(offset: false))
                 result.failedCount += checked.1.count
                 result.messages = checked.1 + result.messages
                 // A forced removal skips the engine's refusals, so it is only made for copies that are, right
@@ -843,8 +886,12 @@ final class AppModel {
                     }
                     acknowledged = unchanged
                 }
-                if !acknowledged.isEmpty {
-                    let r = await engine.removeClones(acknowledged, force: true, mode: mode, progress: relay.handler)
+                if !acknowledged.isEmpty && !result.cancelled && !Task.isCancelled {
+                    let r = await engine.removeClones(acknowledged, force: true, mode: mode, progress: relay.handler,
+                                                      deleteProgress: counts(offset: true))
+                    result.cancelled = result.cancelled || r.cancelled
+                    result.entriesRemoved += r.entriesRemoved
+                    result.bytesRemoved += r.bytesRemoved
                     result.freedBytes += r.freedBytes
                     result.failedCount += r.failedCount
                     result.messages += r.messages
@@ -852,6 +899,21 @@ final class AppModel {
             }
             finish(plan, result)
         }
+    }
+
+    /// Stop on the cleaning overlay: the engine stops at the next entry (well within a second), writes its
+    /// outcome record and returns; what was already removed stays removed.
+    func stopCleaning() {
+        guard isCleaning, !isStoppingClean else { return }
+        isStoppingClean = true
+        cleanTask?.cancel()
+    }
+
+    /// For quitting: stops a running clean and calls `done` once its outcome is on record (at once if none runs).
+    func stopCleaningForQuit(done: @escaping @MainActor () -> Void) {
+        guard let task = cleanTask else { done(); return }
+        stopCleaning()
+        Task { await task.value; done() }
     }
 
     /// Right before deleting: is each thing still what the scan saw? A folder that has become a symlink or
@@ -876,13 +938,13 @@ final class AppModel {
     }
 
     private func finish(_ plan: DeletionPlan, _ result: CleanResult) {
+        cleanTask = nil
+        isStoppingClean = false
+        // No rescan: the rows that are gone are removed and the disk numbers refreshed. A full rescan is one press
+        // of the rescan button away, and would only walk the disk again right after a deletion.
         switch plan.source {
         case .categories(let cats):
-            let ids = Set(cats.map(\.id))
-            // Selection state is rebuilt by the rescan; drop what was just cleaned right away.
-            categories.removeAll { ids.contains($0.id) && !isItemSelectable($0) }
-            selectedCategoryIDs.subtract(ids)
-            scanCategories()
+            pruneCategories(cats, result: result)
         case .projects(let urls):
             pruneProjects(removed: urls)
             explore.didDelete(urls)
@@ -901,11 +963,40 @@ final class AppModel {
             selectedCloneIDs.subtract(paths)
             allowedCloneIDs.subtract(paths)
             explore.didDelete(clones.map(\.url))
-            scanRepos()
         }
+        deleteProgress = nil
         refreshDisk()
         refreshAuditStats()
         sheet = .result(CleanSummary(result: result, expectedBytes: plan.expectedBytes, mode: plan.mode))
+    }
+
+    /// Takes cleaned categories (or the cleaned items of a category) out of the list without scanning again.
+    private func pruneCategories(_ cats: [CleanCategory], result: CleanResult) {
+        let allDone = !result.cancelled && result.failedCount == 0
+        for c in cats {
+            guard let index = categories.firstIndex(where: { $0.id == c.id }) else { continue }
+            if allDone && !(c.itemsSelectable && c.items.count < categories[index].items.count) {
+                categories.remove(at: index)
+                selectedCategoryIDs.remove(c.id)
+                selectedItemIDs[c.id] = nil
+                continue
+            }
+            // Partly done: keep what is still on disk (items removed by a command cannot be checked, so they stay).
+            var live = categories[index]
+            let cleaned = Set(c.items.filter { item in
+                item.deleteCommand == nil && (isMock || !FileManager.default.fileExists(atPath: item.url.path))
+            }.map(\.id))
+            live.items.removeAll { cleaned.contains($0.id) }
+            if live.items.isEmpty && (c.commands.isEmpty || allDone) {
+                categories.remove(at: index)
+                selectedCategoryIDs.remove(c.id)
+                selectedItemIDs[c.id] = nil
+            } else {
+                if !live.sizeIsUpperBound { live.sizeBytes = live.items.reduce(0) { $0 + $1.sizeBytes } }
+                categories[index] = live
+                selectedItemIDs[c.id]?.subtract(cleaned)
+            }
+        }
     }
 
     private func pruneProjects(removed urls: [URL], onlyIfGone: Bool = true) {

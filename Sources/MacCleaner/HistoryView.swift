@@ -194,6 +194,10 @@ private struct HistoryRow: View {
                             ClientBadge(client: record.client)
                             if record.mode == .trash { KindBadge(kind: "Trash") }
                             if record.planID != nil { KindBadge(kind: "plan") }
+                            if record.cancelled == true {
+                                Text("stopped before it was done").foregroundStyle(.orange)
+                                    .help("The operation was stopped by the user. What was removed before that stays removed; the items not reached are listed as failed.")
+                            }
                             if record.isUnfinished {
                                 Text("interrupted — outcome unknown").foregroundStyle(.orange)
                                     .help("This operation has no result record: its process ended before it finished (or it is still running). The items below are what it was about to remove; some, all or none may be gone.")

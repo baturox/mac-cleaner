@@ -40,6 +40,31 @@ enum AppInfo {
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    /// Set by the app at launch, so quitting can stop a running clean first.
+    static weak var model: AppModel?
+
+    /// Quitting while files are being deleted stops the deletion first and waits (a few seconds at most) for its
+    /// outcome record, instead of ending the process between the "started" record and the outcome.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard let model = Self.model, model.isCleaning else { return .terminateNow }
+        let alert = NSAlert()
+        alert.messageText = "A clean is still running"
+        alert.informativeText = "Quitting stops it. What was already removed stays removed, and the history will show that it was stopped."
+        alert.addButton(withTitle: "Stop and Quit")
+        alert.addButton(withTitle: "Keep Cleaning")
+        guard alert.runModal() == .alertFirstButtonReturn else { return .terminateCancel }
+        let answered = Locked(false)
+        let reply: @MainActor () -> Void = {
+            guard !answered.value else { return }
+            answered.value = true
+            NSApplication.shared.reply(toApplicationShouldTerminate: true)
+        }
+        model.stopCleaningForQuit(done: reply)
+        // Never wait forever, even if the engine is stuck in a slow disk call.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8) { reply() }
+        return .terminateLater
+    }
+
     func applicationWillFinishLaunching(_ notification: Notification) {
         NSApplication.shared.setActivationPolicy(.regular)
     }
@@ -73,6 +98,7 @@ struct MacCleanerApp: App {
         // Release builds: always the real engine, and no environment variable changes the app's behavior.
         let m = AppModel(engine: LiveEngine(client: .app), isMock: false)
         #endif
+        AppDelegate.model = m
         _model = State(initialValue: m)
     }
 

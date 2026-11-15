@@ -202,21 +202,56 @@ private struct EntryRow: View {
 
 struct CleaningSheet: View {
     let progress: String
+    let counts: DeleteProgress?
+    let startedAt: Date
+    let stopping: Bool
+    var onStop: () -> Void
+
     var body: some View {
         VStack(spacing: 14) {
-            ProgressView().controlSize(.large)
-            Text("Cleaning…").font(.headline)
-            Text(progress)
-                .font(.callout).foregroundStyle(.secondary)
-                .lineLimit(2).truncationMode(.middle)
-                .multilineTextAlignment(.center)
-                .frame(maxWidth: .infinity)
-            Text("Please keep the app open.").font(.caption).foregroundStyle(.tertiary)
+            Text(stopping ? "Stopping…" : "Cleaning…").font(.headline)
+            if let counts {
+                ProgressView(value: stopping ? nil : counts.fraction)
+                    .progressViewStyle(.linear)
+                Text(Self.summary(counts, startedAt: startedAt))
+                    .font(.callout).monospacedDigit().foregroundStyle(.secondary)
+                    .lineLimit(1).minimumScaleFactor(0.8)
+                if let item = counts.currentItem {
+                    Text(item)
+                        .font(.caption).foregroundStyle(.tertiary)
+                        .lineLimit(1).truncationMode(.middle)
+                        .frame(maxWidth: .infinity)
+                }
+            } else {
+                ProgressView().controlSize(.large)
+                Text(progress)
+                    .font(.callout).foregroundStyle(.secondary)
+                    .lineLimit(2).truncationMode(.middle)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: .infinity)
+            }
+            Text(stopping ? "Finishing the entry it is on. What was already removed stays removed."
+                          : "Stopping keeps what was already removed.")
+                .font(.caption).foregroundStyle(.tertiary).multilineTextAlignment(.center)
+            Button("Stop", role: .cancel, action: onStop)
+                .keyboardShortcut(.cancelAction)
+                .disabled(stopping)
         }
         .padding(28)
-        .frame(width: 420)
+        .frame(width: 440)
         .interactiveDismissDisabled()
-        .accessibilityElement(children: .combine)
+        .accessibilityElement(children: .contain)
+    }
+
+    /// "3 of 8 items · 120,000 entries · 4.2 GB freed · 0:42" (elapsed time ticks on its own).
+    private static func summary(_ c: DeleteProgress, startedAt: Date) -> String {
+        let elapsed = max(0, Int(Date().timeIntervalSince(startedAt)))
+        let time = String(format: "%d:%02d", elapsed / 60, elapsed % 60)
+        var parts = ["\(c.itemsDone) of \(c.itemsTotal) item\(c.itemsTotal == 1 ? "" : "s")",
+                     "\(c.entriesRemoved.formatted()) entries", "\(Fmt.bytes(c.bytesFreed)) freed"]
+        if let total = c.expectedBytes, total > 0 { parts[2] += " of \(Fmt.bytes(total))" }
+        parts.append(time)
+        return parts.joined(separator: " · ")
     }
 }
 
