@@ -26,7 +26,7 @@ struct HistoryView: View {
             Button("Clear History", role: .destructive) { Task { await history.clear(); model.refreshAuditStats() } }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("This erases the record of \(history.stats.operations) operation\(history.stats.operations == 1 ? "" : "s"). Nothing on disk is touched, but the record cannot be restored.")
+            Text("This erases the record of \(history.stats.operations) operation\(history.stats.operations == 1 ? "" : "s"). Nothing on disk is touched, but the record cannot be restored. The remembered results of the last scan are removed too.")
         }
         .alert("Export", isPresented: Binding(get: { history.exportMessage != nil }, set: { if !$0 { history.exportMessage = nil } })) {
             Button("OK") { history.exportMessage = nil }

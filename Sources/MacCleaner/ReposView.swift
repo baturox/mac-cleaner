@@ -62,7 +62,19 @@ struct ReposView: View {
         }
         .navigationTitle("Repos")
         .searchable(text: $search, prompt: "Filter by repository or path")
+        .safeAreaInset(edge: .top, spacing: 0) {
+            ResultsNote(text: reposNote, refreshing: model.isScanningRepos)
+        }
         .safeAreaInset(edge: .bottom, spacing: 0) { footer }
+    }
+
+    /// Old rows say how old they are; rows of a scan in progress say how far it is.
+    private var reposNote: String? {
+        if let old = model.resultsNote([.repos]) { return old }
+        if model.repoStreaming && model.isScanningRepos {
+            return "Checking copies: \(model.repoInspected) of \(model.repoTotal) inspected so far…"
+        }
+        return nil
     }
 
     @ViewBuilder private var emptyState: some View {
@@ -210,7 +222,9 @@ struct ReposView: View {
                                                       set: { model.setAllowed(c, allowed: $0) }))
                     .toggleStyle(.checkbox).controlSize(.small)
                     .font(.caption).foregroundStyle(.secondary)
-                    .help("This copy holds work that exists nowhere else. Turn on to be able to select it.")
+                    .disabled(model.reposAreProvisional)
+                    .help(model.reposAreProvisional ? "Available once the copies have been checked again."
+                                                    : "This copy holds work that exists nowhere else. Turn on to be able to select it.")
             }
             VStack(alignment: .trailing, spacing: 2) {
                 Text(Fmt.bytes(c.sizeBytes)).font(.body.weight(.medium)).monospacedDigit()
@@ -299,9 +313,15 @@ struct ReposView: View {
                 Label("Removes every local copy of \(wiped.count) repo\(wiped.count == 1 ? "" : "s")", systemImage: "exclamationmark.triangle.fill")
                     .font(.callout).foregroundStyle(.orange)
             }
+            if model.reposAreProvisional {
+                Label(model.isScanningRepos ? "Checking these copies again…" : "Scan again to check these copies.",
+                      systemImage: "hourglass")
+                    .font(.callout).foregroundStyle(.secondary)
+                    .help("Whether a copy is fully backed up can change, so copies can only be removed once they have been checked again.")
+            }
             Spacer()
             Button("Remove copies…", role: .destructive) { model.requestRemoveClones(sel) }
-                .disabled(sel.isEmpty || model.isBusy)
+                .disabled(sel.isEmpty || model.isBusy || model.reposAreProvisional)
         }
     }
 }

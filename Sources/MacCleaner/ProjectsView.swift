@@ -110,6 +110,9 @@ struct ProjectsView: View {
         }
         .navigationTitle("Projects")
         .searchable(text: $search, prompt: "Filter by path")
+        .safeAreaInset(edge: .top, spacing: 0) {
+            ResultsNote(text: model.resultsNote([.projects]), refreshing: model.isScanningProjects)
+        }
         .safeAreaInset(edge: .bottom, spacing: 0) { footer }
         .onChange(of: sortOrder) {
             if let (key, asc) = ProjectSortKey.from(sortOrder) {

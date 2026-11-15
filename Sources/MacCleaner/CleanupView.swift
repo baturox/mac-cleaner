@@ -69,6 +69,9 @@ struct CleanupView: View {
         }
         .navigationTitle("Cleanup")
         .searchable(text: $search, prompt: "Filter categories and items")
+        .safeAreaInset(edge: .top, spacing: 0) {
+            ResultsNote(text: model.resultsNote([.categories]), refreshing: model.isScanningCategories)
+        }
         .safeAreaInset(edge: .bottom, spacing: 0) { footer }
         .onAppear(perform: applyFocus)
         .onChange(of: model.cleanupFocusID) { applyFocus() }

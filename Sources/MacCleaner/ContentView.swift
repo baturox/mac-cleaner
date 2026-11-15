@@ -66,7 +66,6 @@ struct ContentView: View {
         }
         .onChange(of: model.section) {
             Prefs.store.set(model.section.rawValue, forKey: Prefs.Key.lastSection)
-            model.sectionOpened()
         }
         .onChange(of: columns) { Prefs.store.set(columns != .detailOnly, forKey: Prefs.Key.sidebarVisible) }
         .task {

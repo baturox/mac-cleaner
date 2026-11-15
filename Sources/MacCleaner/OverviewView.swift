@@ -55,9 +55,8 @@ struct OverviewView: View {
                 Group {
                     if model.isScanning {
                         VStack(alignment: .leading, spacing: 1) {
-                            if model.isScanningCategories { Text("Caches: \(model.categoryProgress)") }
-                            if model.isScanningProjects { Text("Projects: \(model.projectProgress)") }
-                            if model.isScanningRepos { Text("Repos: \(model.repoProgress)") }
+                            Text(model.scanSummary ?? "Scanning…")
+                            if let old = model.resultsNote(ScanPart.allCases) { Text(old) }
                         }
                     } else if !model.stoppedSections.isEmpty {
                         Text("Scan stopped. Results from the previous scan are kept.")

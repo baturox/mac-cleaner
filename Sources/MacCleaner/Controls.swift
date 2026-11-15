@@ -152,3 +152,26 @@ struct FooterBar<Content: View>: View {
         }
     }
 }
+
+/// One line under the toolbar of a screen that shows rows remembered from the last run (or an incomplete scan).
+struct ResultsNote: View {
+    var text: String?
+    var refreshing: Bool
+
+    var body: some View {
+        if let text {
+            VStack(spacing: 0) {
+                HStack(spacing: 6) {
+                    if refreshing { ProgressView().controlSize(.mini) } else { Image(systemName: "clock.arrow.circlepath") }
+                    Text(text)
+                    Spacer()
+                }
+                .font(.callout).foregroundStyle(.secondary)
+                .padding(.horizontal, 16).padding(.vertical, 5)
+                .background(.bar)
+                Divider()
+            }
+            .accessibilityElement(children: .combine)
+        }
+    }
+}

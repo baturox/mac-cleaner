@@ -403,6 +403,10 @@ final class MockEngine: CleanerEngine, @unchecked Sendable {
     }
 
     func scanRepos(root: URL, progress: @escaping ProgressHandler) async -> [RepoGroup] {
+        await scanRepos(root: root, progress: progress, partial: { _ in })
+    }
+
+    func scanRepos(root: URL, progress: @escaping ProgressHandler, partial: @escaping RepoScanHandler) async -> [RepoGroup] {
         let all = repoList()
         for dir in ["Developer", "Desktop", "Documents"] {
             progress("Looking for repositories in ~/\(dir)…")
@@ -410,11 +414,25 @@ final class MockEngine: CleanerEngine, @unchecked Sendable {
             if Task.isCancelled { return [] }
         }
         let removed = lock.withLock { removedPaths }
-        return all.compactMap { g in
+        let result = all.compactMap { g -> RepoGroup? in
             var g = g
             g.clones.removeAll { removed.contains($0.id) }
             return g.clones.isEmpty ? nil : g
         }.sorted { $0.totalBytes > $1.totalBytes }
+        // Report copies one by one, as the real scan does.
+        let total = result.reduce(0) { $0 + $1.clones.count }
+        var seen = 0
+        for (gi, g) in result.enumerated() {
+            for ci in g.clones.indices {
+                seen += 1
+                await sleep(0.12)
+                if Task.isCancelled { return [] }
+                var groups = Array(result.prefix(gi))
+                groups.append(RepoGroup(id: g.id, name: g.name, remote: g.remote, clones: Array(g.clones.prefix(ci + 1))))
+                partial(RepoScanProgress(inspected: seen, total: total, groups: groups))
+            }
+        }
+        return result
     }
 
     // MARK: Growth

@@ -196,6 +196,17 @@ final class AppModel {
     var stoppedSections: Set<AppSection> = []
     /// Settings that influence scan results changed after the last scan.
     var resultsStale = false
+    /// When the rows of each screen were measured. Set for fresh results and for rows loaded from the last run.
+    var asOf: [ScanPart: Date] = [:]
+    /// Screens that still show rows remembered from an earlier run. They are display state only: the engine
+    /// re-checks every path (and every clone) on disk before deleting, and clone removal stays off for
+    /// these rows until the scan of this run has replaced them.
+    var oldParts: Set<ScanPart> = []
+    /// Repos: working copies inspected so far in the running scan, and how many there are.
+    var repoInspected = 0
+    var repoTotal = 0
+    /// Repos: the rows shown are the incomplete result of the running scan (nothing was shown before it).
+    var repoStreaming = false
 
     // Selection
     /// Whole-category selection for categories without per-item selection.
@@ -230,10 +241,28 @@ final class AppModel {
     private var reposTask: Task<Bool, Never>?
     private var snapshotTask: Task<Void, Never>?
     private var monitorTask: Task<Void, Never>?
+    /// nil in mock mode: it never reads or writes the real remembered scan.
+    private let resultStore: ScanSnapshotStore?
+    private let resultQueue = DispatchQueue(label: "maccleaner.last-scan", qos: .utility)
+    private var repoScanRun = 0
+    private var repoRootBase = (inspected: 0, total: 0)
+    private var repoRootSeen = 0
+    private var repoCompletedRoots: [RepoGroup] = []
 
     init(engine: any CleanerEngine, isMock: Bool) {
         self.engine = engine
         self.isMock = isMock
+        if isMock {
+            #if DEBUG
+            // Screenshot runs only: a throw-away folder, never the real one.
+            let dir = ProcessInfo.processInfo.environment["MACCLEANER_MOCK_SNAPSHOT_DIR"]
+            resultStore = dir.map { ScanSnapshotStore(directory: URL(fileURLWithPath: $0, isDirectory: true)) }
+            #else
+            resultStore = nil
+            #endif
+        } else {
+            resultStore = ScanSnapshotStore.standard
+        }
         let home = URL(fileURLWithPath: AccountEnvironment.home, isDirectory: true)
         self.home = home
         self.disk = engine.diskInfo()
@@ -270,6 +299,42 @@ final class AppModel {
     var extraCopyBytes: Int64 { repoGroups.reduce(0) { $0 + extraCopies(in: $1).reduce(0) { $0 + $1.sizeBytes } } }
 
     var allClones: [RepoClone] { repoGroups.flatMap(\.clones) }
+
+    /// The repo rows may not be current (remembered from an earlier run, or an incomplete scan in progress).
+    /// Removing copies waits until the scan of this run has finished: whether a copy is "backed up" can change.
+    var reposAreProvisional: Bool { oldParts.contains(.repos) || repoStreaming }
+
+    func isScanning(_ part: ScanPart) -> Bool {
+        switch part {
+        case .categories: isScanningCategories
+        case .projects: isScanningProjects
+        case .repos: isScanningRepos
+        }
+    }
+
+    /// "Results from 12 minutes ago · refreshing…" for screens that show remembered rows; nil otherwise.
+    func resultsNote(_ parts: [ScanPart]) -> String? {
+        let old = parts.filter { oldParts.contains($0) }
+        guard let date = old.compactMap({ asOf[$0] }).min() else { return nil }
+        let age = Date().timeIntervalSince(date)
+        let when = age < 60 ? "less than a minute ago" : Fmt.relative(date)
+        return "Results from \(when) · " + (old.contains { isScanning($0) } ? "refreshing…" : "not refreshed")
+    }
+
+    /// One line for the Overview while the launch scan (or any full scan) runs.
+    var scanSummary: String? {
+        guard isScanning else { return nil }
+        func state(_ part: ScanPart, _ section: AppSection, _ name: String, done: String) -> String {
+            if isScanning(part) { return name + "…" }
+            return stoppedSections.contains(section) ? name + " stopped" : name + " ✓" + done
+        }
+        let caches = state(.categories, .cleanup, "caches", done: "")
+        var projectsText = state(.projects, .projects, "projects", done: hasScannedProjects ? " \(projects.count) found" : "")
+        if isScanningProjects { projectsText = "projects…" }
+        var reposText = state(.repos, .repos, "repos", done: hasScannedRepos ? " \(allClones.count)" : "")
+        if isScanningRepos && repoTotal > 0 { reposText = "repos \(repoInspected) of \(repoTotal)" }
+        return "Scanning: " + [caches, projectsText, reposText].joined(separator: " · ")
+    }
     var selectedClones: [RepoClone] { allClones.filter { selectedCloneIDs.contains($0.id) } }
 
     /// Trailing text for the sidebar.
@@ -379,7 +444,7 @@ final class AppModel {
     }
 
     func setAllowed(_ c: RepoClone, allowed: Bool) {
-        if allowed && c.wasInspected { allowedCloneIDs.insert(c.id) } else {
+        if allowed && c.wasInspected && !reposAreProvisional { allowedCloneIDs.insert(c.id) } else {
             allowedCloneIDs.remove(c.id)
             selectedCloneIDs.remove(c.id)
         }
@@ -464,25 +529,53 @@ final class AppModel {
             await engine.configure(Prefs.engineSettings)
             recheckFullDiskAccess()
             refreshAuditStats()
-            if isMock {
-                scanAll()
-            } else {
-                // Walking the home folder for build folders and repositories is the heavy part: it starts when
-                // one of those screens is opened (or a rescan is pressed), not at launch.
-                refreshDisk()
-                scanCategories()
-                sectionOpened()
-            }
+            // What the last run found is shown at once, marked as old, while everything is scanned again.
+            await loadRemembered()
+            scanAll()
         }
     }
 
-    /// Starts the scan of the screen that was just opened, once. A later refresh button rescans.
-    func sectionOpened() {
-        guard !isCleaning else { return }
-        switch section {
-        case .projects: if !hasScannedProjects && !isScanningProjects && !stoppedSections.contains(.projects) { scanProjects() }
-        case .repos: if !hasScannedRepos && !isScanningRepos && !stoppedSections.contains(.repos) { scanRepos() }
-        default: break
+    /// Fills the screens with the last finished scan, if there is a recent one. Display only.
+    private func loadRemembered() async {
+        guard let store = resultStore else { return }
+        let snap = await Task.detached { store.load() }.value
+        guard !isScanning, !isCleaning else { return }
+        if let c = snap.categories, let d = snap.categoriesDate, categories.isEmpty {
+            resetSelection(old: [], new: c)
+            categories = c; hasScannedCategories = true; asOf[.categories] = d; oldParts.insert(.categories)
+            lastScanDate = d
+        }
+        if let p = snap.projects, let d = snap.projectsDate, projects.isEmpty {
+            projects = p; hasScannedProjects = true; asOf[.projects] = d; oldParts.insert(.projects)
+        }
+        if let r = snap.repos, let d = snap.reposDate, repoGroups.isEmpty {
+            repoGroups = r; hasScannedRepos = true; asOf[.repos] = d; oldParts.insert(.repos)
+        }
+    }
+
+    /// A scan of this run replaced the rows of `part`.
+    private func markFresh(_ part: ScanPart) {
+        asOf[part] = Date()
+        oldParts.remove(part)
+        persist(part)
+    }
+
+    /// Writes the rows now shown to the remembered scan (off the main thread, in order). Rows that are still
+    /// old keep their old date; partial results of a running scan are never written.
+    private func persist(_ part: ScanPart) {
+        guard let store = resultStore else { return }
+        let date = asOf[part] ?? Date()
+        switch part {
+        case .categories:
+            let value = categories
+            resultQueue.async { store.saveCategories(value, finishedAt: date) }
+        case .projects:
+            let value = projects
+            resultQueue.async { store.saveProjects(value, finishedAt: date) }
+        case .repos:
+            guard !repoStreaming else { return }
+            let value = repoGroups
+            resultQueue.async { store.saveRepos(value, finishedAt: date) }
         }
     }
 
@@ -536,6 +629,7 @@ final class AppModel {
             categories = result
             hasScannedCategories = true
             lastScanDate = Date()
+            markFresh(.categories)
             refreshDisk()
             return true
         }
@@ -570,6 +664,7 @@ final class AppModel {
             selectedProjectIDs.formIntersection(result.map(\.id))
             projects = result
             hasScannedProjects = true
+            markFresh(.projects)
             return true
         }
         projectsTask = task
@@ -584,27 +679,69 @@ final class AppModel {
         isScanningRepos = true
         stoppedSections.remove(.repos)
         repoProgress = "Starting…"
+        repoInspected = 0; repoTotal = 0
+        repoRootBase = (0, 0); repoRootSeen = 0; repoCompletedRoots = []
+        repoScanRun += 1
+        let run = repoScanRun
         let relay = ProgressRelay { [weak self] in self?.repoProgress = $0 }
         let engine = self.engine
         let roots = Prefs.scanRoots(home: home)
         let task = Task { () -> Bool in
             var parts: [RepoGroup] = []
             for root in roots {
-                parts += await engine.scanRepos(root: root, progress: relay.handler)
+                let part = await engine.scanRepos(root: root, progress: relay.handler, partial: { [weak self] p in
+                    Task { @MainActor in self?.applyRepoPartial(p, run: run) }
+                })
                 if Task.isCancelled { break }
+                parts += part
+                repoCompletedRoots = parts
+                repoRootBase = (repoRootBase.inspected + repoRootSeen, repoRootBase.total + repoRootSeen)
+                repoRootSeen = 0
             }
-            defer { isScanningRepos = false; repoProgress = "" }
-            guard !Task.isCancelled else { stoppedSections.insert(.repos); return false }
+            defer { isScanningRepos = false; repoProgress = ""; repoInspected = 0; repoTotal = 0 }
+            guard !Task.isCancelled else {
+                stoppedSections.insert(.repos)
+                if repoStreaming {
+                    // Half a list is not a result: drop it (rows from an earlier run were never touched).
+                    repoStreaming = false
+                    repoGroups = []
+                    selectedCloneIDs = []; allowedCloneIDs = []
+                }
+                return false
+            }
             let result = Self.mergeGroups(parts)
             let ids = Set(result.flatMap(\.clones).map(\.id))
+            if oldParts.contains(.repos) {
+                // Acknowledgements ("allow removal") were given on remembered rows: they must be given again
+                // for what the fresh scan found.
+                allowedCloneIDs = []
+            }
             selectedCloneIDs.formIntersection(ids)
             allowedCloneIDs.formIntersection(ids)
             repoGroups = result
+            repoStreaming = false
             hasScannedRepos = true
+            // A copy that is no longer removable under its fresh state loses its selection.
+            selectedCloneIDs = selectedCloneIDs.filter { id in allClones.first { $0.id == id }.map(isCloneSelectable) ?? false }
+            markFresh(.repos)
             return true
         }
         reposTask = task
         return task
+    }
+
+    /// A working copy of the running scan was inspected. Shown only when nothing else is (rows from an earlier
+    /// run or a finished scan stay until the whole result replaces them).
+    private func applyRepoPartial(_ p: RepoScanProgress, run: Int) {
+        guard run == repoScanRun, isScanningRepos else { return }
+        let inspected = repoRootBase.inspected + p.inspected
+        guard inspected >= repoInspected else { return }   // callbacks can arrive out of order
+        repoInspected = inspected
+        repoRootSeen = p.total
+        repoTotal = repoRootBase.total + p.total
+        guard !hasScannedRepos || repoStreaming else { return }
+        repoStreaming = true
+        repoGroups = Self.mergeGroups(repoCompletedRoots + p.groups)
     }
 
     /// Several scan roots can report the same group; merge them and drop duplicate clones.
@@ -759,7 +896,7 @@ final class AppModel {
     func requestRemoveClones(_ requested: [RepoClone]) {
         // Copies that were not inspected are never part of a removal.
         let scanned = requested.filter(\.wasInspected)
-        guard !scanned.isEmpty, !isBusy else { return }
+        guard !scanned.isEmpty, !isBusy, !reposAreProvisional else { return }
         Task { await presentCloneRemoval(scanned) }
     }
 
@@ -945,12 +1082,15 @@ final class AppModel {
         switch plan.source {
         case .categories(let cats):
             pruneCategories(cats, result: result)
+            persist(.categories)
         case .projects(let urls):
             pruneProjects(removed: urls)
+            persist(.projects)
             explore.didDelete(urls)
         case .explorer(let urls):
             explore.didDelete(urls)
             pruneProjects(removed: urls, onlyIfGone: false)
+            persist(.projects)
         case .clones(let unforced, let forced):
             let clones = unforced + forced
             let gone = clones.filter { isMock || !FileManager.default.fileExists(atPath: $0.url.path) }
@@ -962,6 +1102,7 @@ final class AppModel {
             }
             selectedCloneIDs.subtract(paths)
             allowedCloneIDs.subtract(paths)
+            persist(.repos)
             explore.didDelete(clones.map(\.url))
         }
         deleteProgress = nil
