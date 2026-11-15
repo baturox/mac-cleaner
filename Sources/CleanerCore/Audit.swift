@@ -426,7 +426,9 @@ extension LiveEngine {
 
     public func clearAuditLog() async {
         let store = auditStore
-        _ = await onBackground { try? store.clear() }
+        // The remembered last scan holds paths too: "clear history" removes it with the log.
+        let snapshot = ScanSnapshotStore(directory: env.historyDir)
+        _ = await onBackground { try? store.clear(); snapshot.clear() }
     }
 
     /// nil when a record could be appended to the audit log right now; otherwise why not.

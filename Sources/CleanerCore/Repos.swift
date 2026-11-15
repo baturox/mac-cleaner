@@ -325,18 +325,68 @@ enum RepoInspector {
     }
 }
 
+// MARK: - Grouping
+
+struct RepoDetail: Sendable {
+    var state: RepoState
+    var size: Int64
+    var artifacts: Int64
+    var idle: Int
+}
+
+/// Collects inspected copies from the scan's worker tasks and hands out the grouped state so far.
+final class RepoCollector: @unchecked Sendable {
+    private let lock = NSLock()
+    private var items: [(FoundRepo, RepoDetail)] = []
+
+    func add(_ f: FoundRepo, _ d: RepoDetail, total: Int) -> RepoScanProgress {
+        lock.lock()
+        items.append((f, d))
+        let copy = items
+        lock.unlock()
+        return RepoScanProgress(inspected: copy.count, total: total, groups: groupRepos(copy))
+    }
+}
+
+/// Copies of the same repository (same remote, or same main clone) form one group; groups largest first.
+func groupRepos(_ items: [(FoundRepo, RepoDetail)]) -> [RepoGroup] {
+    var groups: [String: (name: String, remote: String?, clones: [RepoClone])] = [:]
+    var order: [String] = []
+    for (f, d) in items {
+        let clone = RepoClone(url: URL(fileURLWithPath: f.path, isDirectory: true), branch: d.state.branch,
+                              isLinkedWorktree: f.isLinkedWorktree, uncommittedCount: d.state.uncommitted,
+                              unpushedCount: d.state.unpushed, hasStash: d.state.hasStash, lastCommit: d.state.lastCommit,
+                              idleDays: d.idle, sizeBytes: d.size, artifactBytes: d.artifacts,
+                              ignoredFileCount: d.state.ignored, untrustedConfigKeys: d.state.untrustedKeys,
+                              hiddenFromStatusCount: d.state.hidden)
+        let key: String, name: String
+        if let remote = d.state.remote {
+            key = remote.lowercased()
+            name = RemoteURL.displayName(remote)
+        } else {
+            let main = f.mainPath ?? f.path
+            key = main
+            name = (main as NSString).lastPathComponent
+        }
+        if groups[key] == nil { groups[key] = (name, d.state.remote, []); order.append(key) }
+        groups[key]!.clones.append(clone)
+    }
+    let result = order.map { key -> RepoGroup in
+        let g = groups[key]!
+        return RepoGroup(id: key, name: g.name, remote: g.remote, clones: g.clones.sorted { $0.sizeBytes > $1.sizeBytes })
+    }
+    return result.sorted { $0.totalBytes > $1.totalBytes }
+}
+
 // MARK: - Engine
 
 extension LiveEngine {
-    private func makeClone(_ f: FoundRepo, state: RepoState, size: Int64, artifactBytes: Int64, idle: Int) -> RepoClone {
-        RepoClone(url: URL(fileURLWithPath: f.path, isDirectory: true), branch: state.branch,
-                  isLinkedWorktree: f.isLinkedWorktree, uncommittedCount: state.uncommitted, unpushedCount: state.unpushed,
-                  hasStash: state.hasStash, lastCommit: state.lastCommit, idleDays: idle, sizeBytes: size, artifactBytes: artifactBytes,
-                  ignoredFileCount: state.ignored, untrustedConfigKeys: state.untrustedKeys,
-                  hiddenFromStatusCount: state.hidden)
+    public func scanRepos(root: URL, progress: @escaping ProgressHandler) async -> [RepoGroup] {
+        await scanRepos(root: root, progress: progress, partial: { _ in })
     }
 
-    public func scanRepos(root: URL, progress: @escaping ProgressHandler) async -> [RepoGroup] {
+    public func scanRepos(root: URL, progress: @escaping ProgressHandler,
+                          partial: @escaping RepoScanHandler) async -> [RepoGroup] {
         let rootPath = realPath(root.path) ?? root.path
         let env = self.env
         guard let snapshot = await walkSnapshot(root: rootPath, progress: progress), !Task.isCancelled else { return [] }
@@ -350,12 +400,16 @@ extension LiveEngine {
         for c in snapshot.candidates { if let r = c.repoRoot, foundPaths.contains(r) { ownCandidates[r, default: []].append(c) } }
         let own = ownCandidates
 
-        struct Detail: Sendable { var state: RepoState; var size: Int64; var artifacts: Int64; var idle: Int }
-        let details: [Detail?] = await PoliteScan.$enabled.withValue(true) {
+        let collector = RepoCollector()
+        let total = found.count
+        let inspected: [(FoundRepo, RepoDetail?)] = await PoliteScan.$enabled.withValue(true) {
             let artifactSizes = await self.measureArtifacts(own.values.flatMap { $0 }, progress: progress)
             progress("Measuring \(found.count) working copies…")
             let cloneSizes = await self.measureClones(found.map(\.path))
-            return await boundedMap(found, limit: 3) { f -> Detail? in
+            // Biggest first: the list a front end shows while the scan runs fills with what matters most. Every
+            // copy is still inspected from scratch, nothing is skipped or remembered (see the README).
+            let ordered = found.sorted { (cloneSizes[$0.path] ?? 0) > (cloneSizes[$1.path] ?? 0) }
+            let details = await boundedMap(ordered, limit: 3) { f -> RepoDetail? in
                 if Task.isCancelled { return nil }
                 async let state = RepoInspector.inspect(path: f.path, isLinkedWorktree: f.isLinkedWorktree, env: env)
                 let cands = own[f.path] ?? []
@@ -365,33 +419,14 @@ extension LiveEngine {
                 let st = await state
                 let newest = max(touched, st.lastCommit?.timeIntervalSince1970 ?? 0)
                 let idle = max(0, Int((Date().timeIntervalSince1970 - newest) / 86400))
-                return Detail(state: st, size: cloneSizes[f.path] ?? 0, artifacts: artifactBytes, idle: idle)
+                let detail = RepoDetail(state: st, size: cloneSizes[f.path] ?? 0, artifacts: artifactBytes, idle: idle)
+                if !Task.isCancelled { partial(collector.add(f, detail, total: total)) }
+                return detail
             }
+            return Array(zip(ordered, details))
         }
         if Task.isCancelled { return [] }
-
-        var groups: [String: (name: String, remote: String?, clones: [RepoClone])] = [:]
-        var order: [String] = []
-        for (f, d) in zip(found, details) {
-            guard let d else { continue }
-            let clone = makeClone(f, state: d.state, size: d.size, artifactBytes: d.artifacts, idle: d.idle)
-            let key: String, name: String
-            if let remote = d.state.remote {
-                key = remote.lowercased()
-                name = RemoteURL.displayName(remote)
-            } else {
-                let main = f.mainPath ?? f.path
-                key = main
-                name = (main as NSString).lastPathComponent
-            }
-            if groups[key] == nil { groups[key] = (name, d.state.remote, []); order.append(key) }
-            groups[key]!.clones.append(clone)
-        }
-        let result = order.map { key -> RepoGroup in
-            let g = groups[key]!
-            return RepoGroup(id: key, name: g.name, remote: g.remote, clones: g.clones.sorted { $0.sizeBytes > $1.sizeBytes })
-        }
-        return result.sorted { $0.totalBytes > $1.totalBytes }
+        return groupRepos(inspected.compactMap { f, d in d.map { (f, $0) } })
     }
 
     public func removeClones(_ clones: [RepoClone], force: Bool, mode: DeleteMode,

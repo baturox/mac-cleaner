@@ -450,7 +450,25 @@ public protocol CleanerEngine: Sendable {
     /// Like `removeClones(_:force:mode:progress:)` with counts (see above).
     func removeClones(_ clones: [RepoClone], force: Bool, mode: DeleteMode, progress: @escaping ProgressHandler,
                       deleteProgress: @escaping DeleteProgressHandler) async -> CleanResult
+
+    // ---- v7: the repository scan reports each working copy as it is inspected (default implementation below) ----
+
+    /// Like `scanRepos(root:progress:)`; `partial` is called (from any thread) after every inspected working
+    /// copy with the groups known so far. Those are final answers for the copies in them, but the list is not
+    /// complete until this call returns. A cancelled scan returns [].
+    func scanRepos(root: URL, progress: @escaping ProgressHandler, partial: @escaping RepoScanHandler) async -> [RepoGroup]
 }
+
+/// How far the repository scan has come, and what it knows so far.
+public struct RepoScanProgress: Sendable {
+    public var inspected: Int
+    public var total: Int
+    public var groups: [RepoGroup]
+    public init(inspected: Int, total: Int, groups: [RepoGroup]) {
+        self.inspected = inspected; self.total = total; self.groups = groups
+    }
+}
+public typealias RepoScanHandler = @Sendable (RepoScanProgress) -> Void
 
 /// The current state of one working copy (see `CleanerEngine.inspectClones`).
 public struct CloneInspection: Sendable, Identifiable {
@@ -495,5 +513,8 @@ public extension CleanerEngine {
     func removeClones(_ clones: [RepoClone], force: Bool, mode: DeleteMode, progress: @escaping ProgressHandler,
                       deleteProgress: @escaping DeleteProgressHandler) async -> CleanResult {
         await removeClones(clones, force: force, mode: mode, progress: progress)
+    }
+    func scanRepos(root: URL, progress: @escaping ProgressHandler, partial: @escaping RepoScanHandler) async -> [RepoGroup] {
+        await scanRepos(root: root, progress: progress)
     }
 }
