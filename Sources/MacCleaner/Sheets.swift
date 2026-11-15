@@ -13,7 +13,16 @@ struct ConfirmDeleteSheet: View {
     private var n: Int { plan.itemCount }
     private var trash: Bool { plan.mode == .trash }
 
+    private var appName: String {
+        switch plan.source {
+        case .app(let a, _), .appCaches(let a): return a.name
+        default: return ""
+        }
+    }
+
     private var title: String {
+        if plan.isApp { return "Remove \(appName)?" }
+        if plan.isAppCaches { return trash ? "Move the caches of \(appName) to the Trash?" : "Clear the caches of \(appName)?" }
         if plan.isClones {
             let noun = "working cop\(n == 1 ? "y" : "ies")"
             return trash ? "Move \(n) \(noun) to the Trash?" : "Remove \(n) \(noun) permanently?"
@@ -27,12 +36,23 @@ struct ConfirmDeleteSheet: View {
     }
 
     private var subtitle: String {
-        trash
+        if case .app(_, let leftovers) = plan.source {
+            let app = "The app goes to the Trash, so you can put it back."
+            if leftovers.isEmpty { return app + " Its data stays where it is." }
+            return app + (trash ? " Its data goes to the Trash too." : " Its data is deleted permanently and cannot be undone.")
+        }
+        if plan.isAppCaches {
+            return trash ? "Caches are rebuilt by the app when it needs them. Nothing is freed until you empty the Trash."
+                         : "Caches are rebuilt by the app when it needs them. This cannot be undone."
+        }
+        return trash
             ? "You can restore them from the Trash. No space is freed until you empty it."
             : "This cannot be undone. Nothing is moved to the Trash."
     }
 
     private var buttonTitle: String {
+        if plan.isApp { return "Move App to Trash" }
+        if plan.isAppCaches { return trash ? "Move to Trash" : "Clear Caches" }
         if trash { return "Move to Trash" }
         return plan.isClones ? "Remove permanently" : "Delete permanently"
     }
@@ -56,7 +76,7 @@ struct ConfirmDeleteSheet: View {
                 Spacer()
                 VStack(alignment: .trailing, spacing: 0) {
                     Text(Fmt.bytes(plan.expectedBytes)).font(.title2.weight(.semibold)).monospacedDigit()
-                    Text(trash ? "to be moved" : "to be removed").font(.caption).foregroundStyle(.secondary)
+                    Text(trash || plan.isApp ? "to be moved or removed" : "to be removed").font(.caption).foregroundStyle(.secondary)
                 }
             }
 

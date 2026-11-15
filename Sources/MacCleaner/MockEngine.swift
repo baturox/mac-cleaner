@@ -593,5 +593,80 @@ final class MockEngine: CleanerEngine, @unchecked Sendable {
         lock.withLock { freedSoFar += freed }
         return CleanResult(freedBytes: freed, failedCount: failed, messages: messages)
     }
+
+    // MARK: Apps (fake)
+
+    func scanApps(progress: @escaping ProgressHandler) async -> [InstalledApp] {
+        progress("Looking for apps…")
+        await sleep(0.4)
+        let gone = lock.withLock { removedPaths }
+        func lib(_ rel: String) -> URL { URL(fileURLWithPath: home + "/Library/" + rel) }
+        func l(_ rel: String, _ label: String, _ kind: AppLeftoverKind, _ mb: Int64, match: AppLeftoverMatch = .exact, note: String? = nil,
+               cleanup: String? = nil) -> AppLeftover {
+            let big = kind == .data && match == .exact && mb * MB > AppLeftover.dataTickLimitBytes
+            return AppLeftover(url: lib(rel), label: label, kind: kind, match: match, sizeBytes: mb * MB,
+                               selectedByDefault: match == .exact && !big,
+                               note: big ? "Holds app data (\(mb) MB); it starts unticked, check it before removing." : note, cleanupCategoryID: cleanup)
+        }
+        func days(_ d: Double) -> Date { Date().addingTimeInterval(-d * 86_400) }
+        func app(_ name: String, _ id: String, _ version: String, _ mb: Int64, opened: Date?, never: Bool = false, running: Bool = false,
+                 mas: Bool = false, cask: String? = nil, block: AppRemovalBlock? = nil, folder: String = "/Applications",
+                 leftovers: [AppLeftover] = [], note: String? = nil) -> InstalledApp {
+            InstalledApp(url: URL(fileURLWithPath: "\(folder)/\(name).app"), name: name, bundleID: id, version: version, bundleBytes: mb * MB,
+                         lastOpened: opened, neverOpened: never, isRunning: running, isAppStore: mas, homebrewCask: cask, removalBlock: block,
+                         device: 1, inode: UInt64(id.utf8.reduce(UInt64(7)) { $0 &* 31 &+ UInt64($1) } % 100_000 + 10), leftovers: leftovers, leftoverNote: note)
+        }
+        let all: [InstalledApp] = [
+            app("Xcode", "com.apple.dt.Xcode", "16.2", 12_800, opened: days(2), block: .apple,
+                leftovers: [l("Developer/Xcode", "Application Support", .data, 9_400), l("Caches/com.apple.dt.Xcode", "Caches", .cache, 2_400, cleanup: "caches")]),
+            app("Final Cut Pro", "com.acme.finalcut", "10.8", 3_900, opened: days(212), mas: true,
+                leftovers: [l("Containers/com.acme.finalcut", "Container", .data, 6_200), l("Caches/com.acme.finalcut", "Caches", .cache, 1_300, cleanup: "caches"),
+                            l("Preferences/com.acme.finalcut.plist", "Preferences", .settings, 1)]),
+            app("Slack", "com.tinyspeck.slackmacgap", "4.41", 410, opened: days(0), running: true,
+                leftovers: [l("Application Support/Slack", "Application Support", .data, 1_800), l("Caches/com.tinyspeck.slackmacgap", "Caches", .cache, 640, cleanup: "caches"),
+                            l("Logs/com.tinyspeck.slackmacgap", "Logs", .cache, 12, cleanup: "logs")]),
+            app("Figma", "com.figma.Desktop", "124.3", 560, opened: days(6),
+                leftovers: [l("Application Support/Figma", "Application Support", .data, 980), l("Caches/com.figma.Desktop", "Caches", .cache, 420, cleanup: "caches"),
+                            l("Saved Application State/com.figma.Desktop.savedState", "Saved window state", .cache, 4)]),
+            app("Docker", "com.docker.docker", "4.37", 1_700, opened: days(31), cask: "docker",
+                leftovers: [l("Containers/com.docker.docker", "Container", .data, 38_000), l("Caches/com.docker.docker", "Caches", .cache, 90, cleanup: "caches")]),
+            app("Steam", "com.valvesoftware.steam", "1.0", 8, opened: days(140),
+                leftovers: [l("Application Support/Steam", "Application Support", .data, 64_000), l("Caches/com.valvesoftware.steam", "Caches", .cache, 210, cleanup: "caches")]),
+            app("Frobnicator", "com.acme.frobnicator", "2.2.1", 220, opened: days(400),
+                leftovers: [l("Caches/com.acme.frobnicator", "Caches", .cache, 77, cleanup: "caches"), l("Preferences/com.acme.frobnicator.plist", "Preferences", .settings, 1),
+                            l("Application Support/Frobnicator", "Application Support", .data, 340, match: .possible,
+                              note: "Named like the app, not by its identifier: check before removing."),
+                            AppLeftover(url: lib("Group Containers/ABCDE12345.com.acme.shared"), label: "Group container", kind: .data, match: .shared,
+                                        sizeBytes: 55 * MB, selectedByDefault: false, note: "Shared with other apps from the same developer; never removed from here.")]),
+            app("Old Notes Helper", "org.example.notehelper", "0.9", 35, opened: nil, never: true,
+                leftovers: [l("Application Support/org.example.notehelper", "Application Support", .data, 3)]),
+            app("Setapp Tool", "com.setapp.tool", "5.0", 130, opened: nil, folder: "/Applications/Setapp"),
+            app("Pixelmator Pro", "com.pixelmator.pro", "3.6", 640, opened: days(75), mas: true, block: .notOwned,
+                leftovers: [l("Containers/com.pixelmator.pro", "Container", .data, 2_100)]),
+            app("Mac Cleaner", "io.github.baturox.mac-cleaner", "0.1.4", 18, opened: days(0), block: .macCleaner),
+        ]
+        return all.filter { !gone.contains($0.url.path) }.sorted { $0.totalBytes > $1.totalBytes }
+    }
+
+    func removeApp(_ app: InstalledApp, leftovers: [AppLeftover], leftoverMode: DeleteMode, progress: @escaping ProgressHandler,
+                   deleteProgress: @escaping DeleteProgressHandler) async -> CleanResult {
+        progress("Moving \(app.name) to the Trash…")
+        await sleep(0.8)
+        lock.withLock { _ = removedPaths.insert(app.url.path) }
+        let data = leftovers.reduce(Int64(0)) { $0 + $1.sizeBytes }
+        let freed = leftoverMode == .trash ? 0 : data
+        lock.withLock { freedSoFar += freed }
+        return CleanResult(freedBytes: freed, failedCount: 0, messages: ["(mock) \(app.name) was moved to the Trash. Space is freed when you empty it."],
+                           auditRecorded: true)
+    }
+
+    func clearAppCaches(_ app: InstalledApp, mode: DeleteMode, progress: @escaping ProgressHandler,
+                        deleteProgress: @escaping DeleteProgressHandler) async -> CleanResult {
+        progress("Clearing the caches of \(app.name)…")
+        await sleep(0.6)
+        let freed = mode == .trash ? 0 : app.cacheBytes
+        lock.withLock { freedSoFar += freed }
+        return CleanResult(freedBytes: freed, failedCount: 0, messages: ["(mock) cleared \(app.exactLeftovers.filter { $0.kind == .cache }.count) cache folders"])
+    }
 }
 #endif

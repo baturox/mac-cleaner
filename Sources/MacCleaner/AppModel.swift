@@ -3,7 +3,7 @@ import CleanerCore
 import Observation
 
 enum AppSection: String, CaseIterable, Identifiable, Hashable {
-    case overview, cleanup, projects, repos, explore, history
+    case overview, cleanup, projects, repos, apps, explore, history
     var id: String { rawValue }
     var title: String {
         switch self {
@@ -11,6 +11,7 @@ enum AppSection: String, CaseIterable, Identifiable, Hashable {
         case .cleanup: "Cleanup"
         case .projects: "Projects"
         case .repos: "Repos"
+        case .apps: "Apps"
         case .explore: "Explore"
         case .history: "History"
         }
@@ -21,6 +22,7 @@ enum AppSection: String, CaseIterable, Identifiable, Hashable {
         case .cleanup: "sparkles"
         case .projects: "hammer"
         case .repos: "square.on.square.dashed"
+        case .apps: "app.badge"
         case .explore: "folder.badge.questionmark"
         case .history: "clock.arrow.circlepath"
         }
@@ -31,8 +33,9 @@ enum AppSection: String, CaseIterable, Identifiable, Hashable {
         case .cleanup: "2"
         case .projects: "3"
         case .repos: "4"
-        case .explore: "5"
-        case .history: "6"
+        case .apps: "5"
+        case .explore: "6"
+        case .history: "7"
         }
     }
 }
@@ -72,6 +75,9 @@ struct DeletionPlan: Identifiable {
         case explorer([URL])
         /// `forced` are the copies whose loss the user acknowledged; `force` is passed for those only.
         case clones(unforced: [RepoClone], forced: [RepoClone])
+        /// The app (always to the Trash) and the leftovers the user ticked (removed in `mode`).
+        case app(InstalledApp, leftovers: [AppLeftover])
+        case appCaches(InstalledApp)
     }
     let id = UUID()
     var source: Source
@@ -100,6 +106,14 @@ struct DeletionPlan: Identifiable {
     }
     var isClones: Bool {
         if case .clones = source { return true }
+        return false
+    }
+    var isApp: Bool {
+        if case .app = source { return true }
+        return false
+    }
+    var isAppCaches: Bool {
+        if case .appCaches = source { return true }
         return false
     }
     var itemCount: Int { entries.count }
@@ -179,12 +193,17 @@ final class AppModel {
     var categories: [CleanCategory] = []
     var projects: [ProjectArtifact] = []
     var repoGroups: [RepoGroup] = []
+    var apps: [InstalledApp] = []
+    var appSelectionID: String?
     var growth: GrowthReport?
     var lastScanDate: Date?
 
     var hasScannedCategories = false
     var hasScannedProjects = false
     var hasScannedRepos = false
+    var hasScannedApps = false
+    var isScanningApps = false
+    var appProgress = ""
     var isScanningCategories = false
     var isScanningProjects = false
     var isScanningRepos = false
@@ -239,6 +258,7 @@ final class AppModel {
     private var categoriesTask: Task<Bool, Never>?
     private var projectsTask: Task<Bool, Never>?
     private var reposTask: Task<Bool, Never>?
+    private var appsTask: Task<Bool, Never>?
     private var snapshotTask: Task<Void, Never>?
     private var monitorTask: Task<Void, Never>?
     /// nil in mock mode: it never reads or writes the real remembered scan.
@@ -274,7 +294,7 @@ final class AppModel {
 
     // MARK: Derived numbers
 
-    var isScanning: Bool { isScanningCategories || isScanningProjects || isScanningRepos }
+    var isScanning: Bool { isScanningCategories || isScanningProjects || isScanningRepos || isScanningApps }
     var isBusy: Bool { sheet != nil }
     /// A clean or delete is running. Scans neither start nor continue meanwhile: they would only compete for the disk.
     var isCleaning: Bool { if case .running = sheet { return true } else { return false } }
@@ -286,7 +306,7 @@ final class AppModel {
         }
     }
 
-    var hasAnyScan: Bool { hasScannedCategories || hasScannedProjects || hasScannedRepos }
+    var hasAnyScan: Bool { hasScannedCategories || hasScannedProjects || hasScannedRepos || hasScannedApps }
 
     private func exact(_ c: CleanCategory) -> Int64 { c.sizeIsUpperBound ? 0 : c.sizeBytes }
     var safeCategories: [CleanCategory] { categories.filter { $0.level == .safe } }
@@ -304,11 +324,16 @@ final class AppModel {
     /// Removing copies waits until the scan of this run has finished: whether a copy is "backed up" can change.
     var reposAreProvisional: Bool { oldParts.contains(.repos) || repoStreaming }
 
+    /// The app rows are remembered from an earlier run: the app could have been updated, opened or removed since,
+    /// so neither removing nor clearing is offered until this run's scan has replaced them.
+    var appsAreProvisional: Bool { oldParts.contains(.apps) || isScanningApps }
+
     func isScanning(_ part: ScanPart) -> Bool {
         switch part {
         case .categories: isScanningCategories
         case .projects: isScanningProjects
         case .repos: isScanningRepos
+        case .apps: isScanningApps
         }
     }
 
@@ -333,7 +358,8 @@ final class AppModel {
         if isScanningProjects { projectsText = "projects…" }
         var reposText = state(.repos, .repos, "repos", done: hasScannedRepos ? " \(allClones.count)" : "")
         if isScanningRepos && repoTotal > 0 { reposText = "repos \(repoInspected) of \(repoTotal)" }
-        return "Scanning: " + [caches, projectsText, reposText].joined(separator: " · ")
+        let appsText = state(.apps, .apps, "apps", done: hasScannedApps ? " \(apps.count)" : "")
+        return "Scanning: " + [caches, projectsText, reposText, appsText].joined(separator: " · ")
     }
     var selectedClones: [RepoClone] { allClones.filter { selectedCloneIDs.contains($0.id) } }
 
@@ -348,6 +374,7 @@ final class AppModel {
         case .repos:
             guard hasScannedRepos, extraCopyBytes > 0 else { return nil }
             return Fmt.bytes(extraCopyBytes)
+        case .apps: return hasScannedApps ? "\(apps.count)" : nil
         case .explore, .history: return nil
         }
     }
@@ -551,6 +578,9 @@ final class AppModel {
         if let r = snap.repos, let d = snap.reposDate, repoGroups.isEmpty {
             repoGroups = r; hasScannedRepos = true; asOf[.repos] = d; oldParts.insert(.repos)
         }
+        if let a = snap.apps, let d = snap.appsDate, apps.isEmpty {
+            apps = a; hasScannedApps = true; asOf[.apps] = d; oldParts.insert(.apps)
+        }
     }
 
     /// A scan of this run replaced the rows of `part`.
@@ -576,6 +606,9 @@ final class AppModel {
             guard !repoStreaming else { return }
             let value = repoGroups
             resultQueue.async { store.saveRepos(value, finishedAt: date) }
+        case .apps:
+            let value = apps
+            resultQueue.async { store.saveApps(value, finishedAt: date) }
         }
     }
 
@@ -588,6 +621,7 @@ final class AppModel {
         let c = scanCategories()
         let p = scanProjects()
         scanRepos()
+        scanApps()
         snapshotTask?.cancel()
         snapshotTask = Task {
             let okC = await c.value
@@ -602,6 +636,7 @@ final class AppModel {
         categoriesTask?.cancel()
         projectsTask?.cancel()
         reposTask?.cancel()
+        appsTask?.cancel()
         snapshotTask?.cancel()
     }
 
@@ -727,6 +762,28 @@ final class AppModel {
             return true
         }
         reposTask = task
+        return task
+    }
+
+    @discardableResult
+    func scanApps() -> Task<Bool, Never> {
+        if isCleaning { return Task { false } }
+        if isScanningApps, let t = appsTask { return t }
+        isScanningApps = true
+        stoppedSections.remove(.apps)
+        appProgress = "Starting…"
+        let relay = ProgressRelay { [weak self] in self?.appProgress = $0 }
+        let engine = self.engine
+        let task = Task { () -> Bool in
+            let result = await engine.scanApps(progress: relay.handler)
+            defer { isScanningApps = false; appProgress = "" }
+            guard !Task.isCancelled else { stoppedSections.insert(.apps); return false }
+            apps = result
+            hasScannedApps = true
+            markFresh(.apps)
+            return true
+        }
+        appsTask = task
         return task
     }
 
@@ -959,6 +1016,42 @@ final class AppModel {
         sheet = .confirm(removalPlan)
     }
 
+    // MARK: Apps
+
+    /// Confirmation for removing an app: the app (to the Trash, always) and the ticked leftovers (in the chosen delete mode).
+    func requestRemoveApp(_ app: InstalledApp, leftovers: [AppLeftover]) {
+        guard !isBusy, !appsAreProvisional, app.canRemove, !app.isRunning else { return }
+        var entries = [DeletionEntry(name: app.name, subtitle: "\(app.url.abbreviatedPath) · moved to the Trash", symbol: "app", size: app.bundleBytes)]
+        let how = Prefs.deleteMode == .trash ? "moved to the Trash" : "deleted permanently"
+        for l in leftovers.sorted(by: { $0.sizeBytes > $1.sizeBytes }) {
+            entries.append(DeletionEntry(name: "\(l.label)\(l.match == .possible ? " (possibly related)" : "")",
+                                         subtitle: "\(l.url.abbreviatedPath) · \(how)", symbol: l.kind == .cache ? "internaldrive" : "folder",
+                                         size: l.sizeBytes))
+        }
+        var warnings: [String] = []
+        if leftovers.contains(where: { $0.match == .possible }) {
+            warnings.append("Some of these folders are only named like the app, not by its identifier. Check that they really belong to it.")
+        }
+        if leftovers.contains(where: { $0.kind == .data }) {
+            warnings.append("This includes data the app keeps for you (documents, databases). Without it, the app starts empty if you reinstall it.")
+        }
+        sheet = .confirm(DeletionPlan(source: .app(app, leftovers: leftovers), mode: Prefs.deleteMode, entries: entries,
+                                      expectedBytes: app.bundleBytes + leftovers.reduce(0) { $0 + $1.sizeBytes },
+                                      warnings: warnings, totalItemCount: entries.count))
+    }
+
+    func requestClearCaches(of app: InstalledApp) {
+        guard !isBusy, !appsAreProvisional, !app.isRunning else { return }
+        let caches = app.exactLeftovers.filter { $0.kind == .cache }
+        guard !caches.isEmpty else { return }
+        let how = Prefs.deleteMode == .trash ? "moved to the Trash" : "deleted permanently"
+        let entries = caches.sorted { $0.sizeBytes > $1.sizeBytes }.map {
+            DeletionEntry(name: $0.label, subtitle: "\($0.url.abbreviatedPath) · \(how)", symbol: "internaldrive", size: $0.sizeBytes)
+        }
+        sheet = .confirm(DeletionPlan(source: .appCaches(app), mode: Prefs.deleteMode, entries: entries,
+                                      expectedBytes: caches.reduce(0) { $0 + $1.sizeBytes }, totalItemCount: entries.count))
+    }
+
     // MARK: Executing
 
     func execute(_ plan: DeletionPlan) {
@@ -1001,6 +1094,13 @@ final class AppModel {
                                              deleteProgress: counts(offset: false))
                 result.failedCount += checked.1.count
                 result.messages = checked.1 + result.messages
+            case .app(let app, let leftovers):
+                // The engine checks the bundle (identity, bundle id, not running) and every leftover again; the bundle goes
+                // to the Trash whatever the mode, the leftovers follow `mode`.
+                result = await engine.removeApp(app, leftovers: leftovers, leftoverMode: mode, progress: relay.handler,
+                                                deleteProgress: counts(offset: false))
+            case .appCaches(let app):
+                result = await engine.clearAppCaches(app, mode: mode, progress: relay.handler, deleteProgress: counts(offset: false))
             case .clones(let unforced, let forced):
                 // Two calls: `force` covers a whole call, so it must never ride along with unacknowledged copies.
                 let checked = mock ? (unforced.map(\.url), []) : await Task.detached { Self.revalidate(unforced.map(\.url)) }.value
@@ -1091,6 +1191,13 @@ final class AppModel {
             explore.didDelete(urls)
             pruneProjects(removed: urls, onlyIfGone: false)
             persist(.projects)
+        case .app(let app, let leftovers):
+            removeAppRows(app, leftovers: leftovers, bundleRemoved: true)
+            persist(.apps)
+            explore.didDelete([app.url] + leftovers.map(\.url))
+        case .appCaches(let app):
+            removeAppRows(app, leftovers: app.exactLeftovers.filter { $0.kind == .cache }, bundleRemoved: false)
+            persist(.apps)
         case .clones(let unforced, let forced):
             let clones = unforced + forced
             let gone = clones.filter { isMock || !FileManager.default.fileExists(atPath: $0.url.path) }
@@ -1108,7 +1215,9 @@ final class AppModel {
         deleteProgress = nil
         refreshDisk()
         refreshAuditStats()
-        sheet = .result(CleanSummary(result: result, expectedBytes: plan.expectedBytes, mode: plan.mode))
+        var summaryMode = plan.mode
+        if case .app(_, let leftovers) = plan.source, leftovers.isEmpty { summaryMode = .trash }   // the bundle always goes to the Trash
+        sheet = .result(CleanSummary(result: result, expectedBytes: plan.expectedBytes, mode: summaryMode))
     }
 
     /// Takes cleaned categories (or the cleaned items of a category) out of the list without scanning again.
@@ -1138,6 +1247,17 @@ final class AppModel {
                 selectedItemIDs[c.id]?.subtract(cleaned)
             }
         }
+    }
+
+    /// Takes the app (when its bundle is gone) or its removed leftovers out of the rows, without scanning again.
+    private func removeAppRows(_ app: InstalledApp, leftovers: [AppLeftover], bundleRemoved: Bool) {
+        guard let index = apps.firstIndex(where: { $0.id == app.id }) else { return }
+        if bundleRemoved && (isMock || !FileManager.default.fileExists(atPath: app.url.path)) {
+            apps.remove(at: index)
+            return
+        }
+        let gone = Set(leftovers.filter { isMock || !FileManager.default.fileExists(atPath: $0.url.path) }.map(\.id))
+        apps[index].leftovers.removeAll { gone.contains($0.id) }
     }
 
     private func pruneProjects(removed urls: [URL], onlyIfGone: Bool = true) {

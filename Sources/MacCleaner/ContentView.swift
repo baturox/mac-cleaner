@@ -82,6 +82,7 @@ struct ContentView: View {
         case .cleanup: CleanupView(model: model)
         case .projects: ProjectsView(model: model)
         case .repos: ReposView(model: model)
+        case .apps: AppsView(model: model)
         case .explore: ExploreView(model: model, explore: model.explore)
         case .history: HistoryView(model: model, history: model.history)
         }
@@ -92,6 +93,7 @@ struct ContentView: View {
         case .cleanup: model.isScanningCategories
         case .projects: model.isScanningProjects
         case .repos: model.isScanningRepos
+        case .apps: model.isScanningApps
         default: false
         }
     }
@@ -138,7 +140,7 @@ struct ContentView: View {
         let env = ProcessInfo.processInfo.environment
         guard let step = env["MACCLEANER_SHEET"] ?? env["MACCLEANER_ACTION"] else { return }
         for _ in 0..<120 {
-            if model.hasScannedCategories, model.hasScannedProjects, model.hasScannedRepos, !model.isRecordingGrowth,
+            if model.hasScannedCategories, model.hasScannedProjects, model.hasScannedRepos, model.hasScannedApps, !model.isRecordingGrowth,
                !model.isScanning { break }
             try? await Task.sleep(nanoseconds: 250_000_000)
         }
@@ -180,6 +182,17 @@ struct ContentView: View {
                 for c in g.clones { model.setClone(c, selected: true) }
                 model.requestRemoveClones(model.selectedClones)
             }
+        case "apps":
+            model.section = .apps
+            model.appSelectionID = model.apps.first { $0.possibleLeftovers.count > 0 }?.id
+        case "removeapp":
+            model.section = .apps
+            if let app = model.apps.first(where: { $0.canRemove && !$0.isRunning }) {
+                model.requestRemoveApp(app, leftovers: app.leftovers.filter(\.selectedByDefault))
+            }
+        case "clearcaches":
+            model.section = .apps
+            if let app = model.apps.first(where: { $0.cacheBytes > 0 && !$0.isRunning }) { model.requestClearCaches(of: app) }
         case "history":
             model.section = .history
             await model.history.reload()

@@ -168,6 +168,8 @@ private struct HistoryRow: View {
         case .projectArtifacts: return "Project build folders · \(n)"
         case .explorerDelete: return "Deleted from Explore · \(n)"
         case .removeClones: return "Removed clone\(n == 1 ? "" : "s") · \(n)"
+        case .removeApp: return "Removed app · \(n) item\(n == 1 ? "" : "s")"
+        case .clearAppCaches: return "App caches · \(n) item\(n == 1 ? "" : "s")"
         }
     }
 
@@ -177,6 +179,8 @@ private struct HistoryRow: View {
         case .projectArtifacts: "hammer"
         case .explorerDelete: "folder.badge.minus"
         case .removeClones: "square.on.square.dashed"
+        case .removeApp: "app.badge.checkmark"
+        case .clearAppCaches: "trash.slash"
         }
     }
 
