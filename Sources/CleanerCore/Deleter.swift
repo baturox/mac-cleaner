@@ -377,8 +377,8 @@ struct Deleter: Sendable {
         /// What this walk really removed. `reported*` is how much of it the shared tally already knows.
         var entries = 0
         var bytes: Int64 = 0
-        private var reportedEntries = 0
-        private var reportedBytes: Int64 = 0
+        fileprivate var reportedEntries = 0
+        fileprivate var reportedBytes: Int64 = 0
         /// Folders this deep (the item itself is 0) hand their children to several threads.
         private static let fanOutDepth = 1
 
