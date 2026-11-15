@@ -4,6 +4,15 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- The app scans everything at launch: caches, Projects and Repos start together and share one folder walk, instead of Projects and Repos waiting until their screen is opened. A section you stopped is not restarted by itself, and nothing starts while a clean is running.
+- The last finished scan is kept in `~/Library/Application Support/MacCleaner/last-scan.json` (readable by you only) and shown at once at launch, marked "Results from 12 minutes ago · refreshing…", until the fresh scan replaces it. Selections survive the swap for rows that are still there. It is display state only; deletions still re-check everything on disk. Copies on the Repos screen cannot be removed while their rows are remembered or incomplete. Snapshots older than 7 days, unreadable or of another format are ignored; lists are cut at 5,000 rows; *Clear history…* removes the file; the rows a clean removes are removed from it too.
+- The Overview shows one status line for the whole scan ("Scanning: caches ✓ · projects… · repos 54 of 131").
+- The Repos scan inspects the biggest copies first and shows each copy as soon as it is inspected. Every copy is still inspected from scratch on every scan; "fully backed up" is not remembered between scans.
+
 ## [0.1.4] - 2026-11-15
 
 ### Changed
