@@ -184,7 +184,7 @@ final class MCPTools: @unchecked Sendable {
                  readOnly: true, destructive: false, idempotent: true),
             tool("list_apps", "List installed apps", "Installed applications (.app bundles in /Applications, /Applications/Utilities and ~/Applications) with bundle size, the size of the data each keeps in the user's Library (caches, settings, data), when it was last opened (Spotlight; null when unknown) and whether it is running, from the App Store, from Homebrew or removable. Read-only; nothing here can remove an app." + n,
                  input: Self.schema(Self.paging.merging([
-                    "unused_days": Self.p("integer", "Only apps not opened for at least this many days (apps never opened count; apps with no record do not).", extra: ["minimum": 0]),
+                    "unused_days": Self.p("integer", "Only apps not opened for at least this many days (apps macOS has no launch record for are left out).", extra: ["minimum": 0]),
                     "sort": Self.p("string", "size (default, app plus data), data, opened (oldest first) or name.", extra: ["enum": ["size", "data", "opened", "name"]]),
                     "include_leftovers": Self.p("boolean", "Also list each app's exact-match data folders (default false)."),
                  ]) { a, _ in a }),

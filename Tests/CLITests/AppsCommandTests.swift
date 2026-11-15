@@ -40,11 +40,11 @@ final class AppsCommandTests: XCTestCase {
         XCTAssertEqual(order, order.sorted(), "default order is by total size, largest first")
     }
 
-    func testUnusedFilterCountsNeverButNotUnknown() async {
+    func testUnusedFilterLeavesOutAppsWithoutALaunchRecord() async {
         let r = await invoke(["apps", "--unused", "90", "--json"], engine: engineWithApps())
         XCTAssertEqual(r.code, 0, r.err)
         let names = apps(from: r.out).map { $0["name"] as? String ?? "" }
-        XCTAssertEqual(Set(names), ["Acme", "Never", "Pages", "Brewed"])
+        XCTAssertEqual(Set(names), ["Acme", "Pages", "Brewed"], "no launch record means unknown, not unused")
     }
 
     func testSortKeys() async {

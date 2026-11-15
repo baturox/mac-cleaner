@@ -42,7 +42,7 @@ extension InstalledApp {
     fileprivate var lowerName: String { name.lowercased() }
 
     fileprivate var openedText: String {
-        if neverOpened { return "never" }
+        if neverOpened { return "no record" }
         guard let lastOpened else { return "unknown" }
         if Date().timeIntervalSince(lastOpened) < 86_400 { return "today" }
         return Fmt.relative(lastOpened)
@@ -51,7 +51,8 @@ extension InstalledApp {
     /// Opened at least `days` ago. An app Spotlight has no record for is not counted: nothing is claimed without one.
     fileprivate func unused(forAtLeast days: Int, now: Date = Date()) -> Bool {
         if isRunning { return false }
-        if neverOpened { return true }
+        // No launch record usually means macOS does not know, not that the app is unused.
+        if neverOpened { return false }
         guard let lastOpened else { return false }
         return now.timeIntervalSince(lastOpened) >= Double(days) * 86_400
     }

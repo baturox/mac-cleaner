@@ -111,7 +111,7 @@ enum Commands {
         positionalHelp: ["bundle-id   Show one app, or act on it with --clear-caches / --remove (exact bundle identifier, e.g. com.acme.app)."],
         maxPositionals: 1,
         options: [
-            OptionSpec("unused", value: "N", "Only apps not opened for at least N days (apps never opened count; apps Spotlight has no record for do not)."),
+            OptionSpec("unused", value: "N", "Only apps not opened for at least N days (apps macOS has no launch record for are left out: that usually means unknown, not unused)."),
             OptionSpec("sort", value: "KEY", "size (default, app plus data), data, opened (oldest first) or name."),
             OptionSpec("clear-caches", "Remove only the cache folders matched by the app's exact bundle identifier."),
             OptionSpec("remove", "Move the app to the Trash (always the Trash). Refused while it runs, for Apple apps, Homebrew apps and Mac Cleaner."),

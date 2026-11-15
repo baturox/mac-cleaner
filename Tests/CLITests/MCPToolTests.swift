@@ -327,7 +327,7 @@ final class MCPToolTests: XCTestCase {
         XCTAssertEqual(apps.first { $0["name"]?.string == "Four" }?["removable"]?.bool, false)
         XCTAssertEqual(apps.first { $0["name"]?.string == "Two" }?["never_opened"]?.bool, true)
         let unused = await h.callTool("list_apps", ["unused_days": 90])
-        XCTAssertEqual(Set((unused.structured?["apps"]?.array ?? []).compactMap { $0["name"]?.string }), ["One", "Two"])
+        XCTAssertEqual(Set((unused.structured?["apps"]?.array ?? []).compactMap { $0["name"]?.string }), ["One"], "an app without a launch record is not claimed to be unused")
         let paged = await h.callTool("list_apps", ["limit": 3])
         XCTAssertEqual(paged.structured?["apps"]?.array?.count, 3)
         XCTAssertEqual(paged.structured?["has_more"]?.bool, true)

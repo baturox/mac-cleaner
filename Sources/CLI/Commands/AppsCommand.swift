@@ -64,13 +64,13 @@ enum AppsCommand {
 
     // MARK: List
 
-    /// Apps older than `unused` days (never-opened ones count, unknown ones do not: nothing is claimed without a record), sorted.
+    /// Apps older than `unused` days (apps without a launch record do not count: nothing is claimed without a record), sorted.
     static func filtered(_ apps: [InstalledApp], unused: Int?, sort: String, now: Date) -> [InstalledApp] {
         var list = apps
         if let unused {
             list = list.filter { app in
                 if app.isRunning { return false }
-                if app.neverOpened { return true }
+                if app.neverOpened { return false }
                 guard let d = app.lastOpened else { return false }
                 return now.timeIntervalSince(d) >= Double(unused) * 86400
             }
@@ -89,7 +89,7 @@ enum AppsCommand {
     }
 
     static func lastOpenedText(_ app: InstalledApp, now: Date) -> String {
-        if app.neverOpened { return "never" }
+        if app.neverOpened { return "no record" }
         guard let d = app.lastOpened else { return "unknown" }
         let days = max(0, Int(now.timeIntervalSince(d) / 86400))
         if days < 1 { return "today" }
@@ -137,7 +137,7 @@ enum AppsCommand {
         ctx.out(s.bold("\(listed.count) app\(listed.count == 1 ? "" : "s"), \(formatBytes(listed.reduce(0) { $0 + $1.reclaimBytes })) "
                        + "(apps plus the data they keep, caches the Cleanup screen already lists left out); \(removable) removable"))
         ctx.out(s.dim("`mac-cleaner apps <bundle-id>` shows the data an app keeps; `--clear-caches` and `--remove` act on it. "
-                      + "\"never\": Spotlight has no launch record; \"unknown\": it could not say."))
+                      + "\"no record\": macOS has no launch date for the app (often simply unknown); \"unknown\": it could not say."))
     }
 
     static func showDetail(_ app: InstalledApp, _ ctx: Context, now: Date) -> Int32 {
