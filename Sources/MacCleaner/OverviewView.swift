@@ -206,7 +206,7 @@ struct OverviewView: View {
                         Text("Clean safe items (\(Fmt.bytes(model.safeBytes)))").padding(.horizontal, 6)
                     }
                     .buttonStyle(.borderedProminent).controlSize(.large)
-                    .disabled(model.safeCategories.isEmpty || model.isBusy || model.isScanningCategories)
+                    .disabled(model.safeCategories.isEmpty || model.isBusy || model.isScanningCategories || model.categoriesAreRemembered)
                 }
             }
         }

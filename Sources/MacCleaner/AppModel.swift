@@ -328,6 +328,11 @@ final class AppModel {
     /// so neither removing nor clearing is offered until this run's scan has replaced them.
     var appsAreProvisional: Bool { oldParts.contains(.apps) || isScanningApps }
 
+    /// Rows remembered from last-scan.json. The engine only re-checks that a path lies in an allowed area, not
+    /// that it is still (or ever was) a cache or a build folder, so remembered rows are never handed to it.
+    var categoriesAreRemembered: Bool { oldParts.contains(.categories) }
+    var projectsAreRemembered: Bool { oldParts.contains(.projects) }
+
     func isScanning(_ part: ScanPart) -> Bool {
         switch part {
         case .categories: isScanningCategories
@@ -876,18 +881,18 @@ final class AppModel {
 
     func requestCleanSafe() {
         let cats = safeCategories
-        guard !cats.isEmpty, !isBusy else { return }
+        guard !cats.isEmpty, !isBusy, !categoriesAreRemembered else { return }
         sheet = .confirm(plan(for: cats))
     }
 
     func requestCleanSelected() {
         let cats = selectedCategories
-        guard !cats.isEmpty, !isBusy else { return }
+        guard !cats.isEmpty, !isBusy, !categoriesAreRemembered else { return }
         sheet = .confirm(plan(for: cats))
     }
 
     func requestDeleteProjects(_ items: [ProjectArtifact]) {
-        guard !items.isEmpty, !isBusy else { return }
+        guard !items.isEmpty, !isBusy, !projectsAreRemembered else { return }
         let entries = items.sorted { $0.sizeBytes > $1.sizeBytes }.map {
             DeletionEntry(name: $0.projectURL.lastPathComponent + " / " + $0.kind,
                           subtitle: $0.url.abbreviatedPath, symbol: "hammer", size: $0.sizeBytes)

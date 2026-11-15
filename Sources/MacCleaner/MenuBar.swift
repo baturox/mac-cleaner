@@ -127,7 +127,7 @@ struct MenuBarContent: View {
             model.section = .cleanup
             model.requestCleanSafe()
         }
-        .disabled(model.safeCategories.isEmpty || model.isBusy || model.isScanningCategories)
+        .disabled(model.safeCategories.isEmpty || model.isBusy || model.isScanningCategories || model.categoriesAreRemembered)
         Divider()
         Button("Open Mac Cleaner") { showMainWindow() }
         SettingsLink { Text("Settings…") }

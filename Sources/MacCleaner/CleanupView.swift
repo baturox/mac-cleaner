@@ -432,7 +432,7 @@ struct CleanupView: View {
             Spacer()
             Button("Clean…") { model.requestCleanSelected() }
                 .buttonStyle(.borderedProminent)
-                .disabled(cats.isEmpty || model.isBusy || model.isScanningCategories)
+                .disabled(cats.isEmpty || model.isBusy || model.isScanningCategories || model.categoriesAreRemembered)
         }
     }
 }

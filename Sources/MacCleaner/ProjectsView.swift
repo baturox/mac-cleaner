@@ -322,7 +322,7 @@ struct ProjectsView: View {
                 .monospacedDigit().foregroundStyle(.secondary)
             Spacer()
             Button("Delete…", role: .destructive) { model.requestDeleteProjects(sel) }
-                .disabled(sel.isEmpty || model.isBusy)
+                .disabled(sel.isEmpty || model.isBusy || model.projectsAreRemembered)
         }
     }
 }

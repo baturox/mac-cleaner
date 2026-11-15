@@ -78,9 +78,14 @@ public struct ScanSnapshotStore: Sendable {
     }
 
     private func readFile() -> File? {
+        // Opened without following a link and checked on the descriptor, so a swap after the check cannot make
+        // the read follow a symlink or run past the size cap.
+        let fd = open(fileURL.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+        guard fd >= 0 else { return nil }
+        let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
         var st = stat()
-        guard lstat(fileURL.path, &st) == 0, (st.st_mode & S_IFMT) == S_IFREG, st.st_size <= Self.maxFileBytes,
-              let data = FileManager.default.contents(atPath: fileURL.path),
+        guard fstat(fd, &st) == 0, (st.st_mode & S_IFMT) == S_IFREG, st.st_size <= Self.maxFileBytes,
+              let data = try? handle.read(upToCount: Self.maxFileBytes + 1), data.count <= Self.maxFileBytes,
               let file = try? Self.decoder().decode(File.self, from: data),
               file.version == Self.schemaVersion else { return nil }
         return file
