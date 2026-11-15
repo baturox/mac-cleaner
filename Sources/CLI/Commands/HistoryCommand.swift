@@ -67,7 +67,7 @@ enum HistoryCommand {
                 return [formatDateTime(r.startedAt), r.client.rawValue, kindText(r) + s.yellow(" (interrupted)"), String(r.itemCount),
                         s.yellow("unknown"), s.yellow("?")]
             }
-            return [formatDateTime(r.startedAt), r.client.rawValue, kindText(r), String(r.itemCount),
+            return [formatDateTime(r.startedAt), r.client.rawValue, kindText(r) + (r.cancelled == true ? s.yellow(" (stopped)") : ""), String(r.itemCount),
                     r.mode == .trash ? "trash" : formatBytes(r.freedBytes),
                     r.failedItemCount > 0 ? s.yellow(String(r.failedItemCount)) : s.dim("0")]
         }

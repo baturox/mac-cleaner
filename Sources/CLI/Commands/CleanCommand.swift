@@ -79,7 +79,8 @@ enum CleanCommand {
             }
         }
 
-        let result = await ctx.engine.clean(categories: selected, mode: mode, progress: progress.handler)
+        let result = await ctx.engine.clean(categories: selected, mode: mode, progress: progress.handler,
+                                             deleteProgress: progress.deleteHandler)
         progress.finish()
         printResult(result, mode: mode, ctx)
         try Task.checkCancellation()
@@ -200,12 +201,14 @@ enum CleanCommand {
     static func printResult(_ r: CleanResult, mode: DeleteMode, _ ctx: Context) {
         let s = ctx.style
         ctx.out()
-        if mode == .trash {
+        if r.cancelled {
+            ctx.out(s.yellow("Stopped.") + " What was already removed stays removed (\(r.entriesRemoved.formatted()) entries, \(formatBytes(r.bytesRemoved))).")
+        } else if mode == .trash {
             ctx.out(s.green("Done.") + " Items were moved to the Trash; empty it to get the space back.")
         } else {
             ctx.out(s.green("Done.") + " Free space changed by \(formatDelta(r.freedBytes)).")
         }
-        if r.failedCount > 0 {
+        if r.failedCount > 0 && !r.cancelled {
             ctx.out(s.yellow("\(r.failedCount) entr\(r.failedCount == 1 ? "y" : "ies") could not be removed (in use or protected by macOS)."))
         }
         for m in r.messages { ctx.out(s.dim("  " + m)) }

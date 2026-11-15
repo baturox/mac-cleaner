@@ -88,7 +88,8 @@ enum ReposCommand {
         }
         // Never force: the engine re-checks every clone and refuses anything that is not fully backed up.
         // (`force` would apply to the whole call; the CLI has no way to acknowledge losing work, so it never passes it.)
-        let result = await ctx.engine.removeClones(removable, force: false, mode: mode, progress: progress.handler)
+        let result = await ctx.engine.removeClones(removable, force: false, mode: mode, progress: progress.handler,
+                                             deleteProgress: progress.deleteHandler)
         progress.finish()
         CleanCommand.printResult(result, mode: mode, ctx)
         try Task.checkCancellation()

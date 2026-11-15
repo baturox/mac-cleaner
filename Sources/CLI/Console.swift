@@ -194,6 +194,28 @@ final class ProgressLine: @unchecked Sendable {
         { [self] message in update(message) }
     }
 
+    /// For deleting: "[#####-----] 3/8  120,000 entries  4.2 GB  12s  Projects/app/node_modules".
+    var deleteHandler: DeleteProgressHandler {
+        { [self] p in updateDelete(p) }
+    }
+
+    private var deleteStart: Date?
+
+    func updateDelete(_ p: DeleteProgress) {
+        guard enabled else { return }
+        lock.lock()
+        let start = deleteStart ?? Date()
+        deleteStart = start
+        lock.unlock()
+        let cells = 20
+        let filled = Int((p.fraction * Double(cells)).rounded(.down))
+        let bar = "[" + String(repeating: "#", count: filled) + String(repeating: "-", count: cells - filled) + "]"
+        var text = "\(bar) \(p.itemsDone)/\(p.itemsTotal)  \(p.entriesRemoved.formatted()) entries  \(formatBytes(p.bytesFreed))"
+        text += "  \(Int(Date().timeIntervalSince(start)))s"
+        if let item = p.currentItem { text += "  " + item }
+        update(text)
+    }
+
     func update(_ message: String) {
         guard enabled else { return }
         lock.lock()
