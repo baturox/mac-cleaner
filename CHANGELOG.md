@@ -4,6 +4,20 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- Deleting is faster: up to 4 threads share the work, across the selected items and inside big folders (their first and second level), so one huge `node_modules` is parallel too. Every thread uses the same descriptor-based, no-follow removal and the same checks as before. Moving to the Trash is still one rename per item, one after another.
+- Nothing is measured before deleting any more. The `du` pass that walked every tree a second time for the audit record is gone; entries and allocated bytes (a file with several hard links once) are counted while removing and written to the result and to the audit record.
+- Cleaning shows a progress bar with items done, entries removed, bytes freed, elapsed time and the item being deleted, instead of a bare "Please keep the app open". The CLI prints the same on stderr when it is a terminal.
+- A clean or delete stops running scans and no scan starts until it ends. Afterwards the deleted rows are removed from the lists and the disk numbers refreshed, without scanning everything again; the rescan buttons do a full rescan.
+
+### Added
+
+- A Stop button on the cleaning overlay. Stopping takes about a second; what was already removed stays removed. Quitting the app during a clean asks, stops it and writes its outcome before quitting.
+- Audit records of a stopped operation are marked `cancelled` and shown as "stopped" in History and `mac-cleaner history`, not as interrupted. Finished records have optional `entriesRemoved` and `bytesRemoved` fields (and `entriesRemoved` per item); the file stays readable by older versions.
+
 ## [0.1.3] - 2026-11-14
 
 ### Changed
