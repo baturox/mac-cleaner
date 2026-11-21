@@ -14,26 +14,46 @@
 </p>
 
 <p align="center">
-  <img src="docs/screenshots/overview.png" width="860" alt="Overview: real free space versus what Finder reports, and the biggest things you can reclaim">
+  <img src="docs/screenshots/overview.png" width="860" alt="Overview: real free space versus what Finder reports, and the biggest things you can reclaim (mock data)">
 </p>
+
+```sh
+brew install --cask baturox/tap/mac-cleaner   # the app, plus the mac-cleaner command
+open -a "Mac Cleaner"                          # or download the .dmg from the latest release
+mac-cleaner scan                               # the same numbers on the command line
+```
+
+Mac Cleaner updates itself in place: the download is checked against its published checksum and the developer's signature and notarization before anything is replaced, and nothing is installed without your click (see [Updates](#updates)). The app works without [Full Disk Access](#full-disk-access); some sizes are then too small.
 
 <table>
   <tr>
-    <td><img src="docs/screenshots/cleanup.png" alt="Cleanup: categories grouped by safe and caution"></td>
-    <td><img src="docs/screenshots/projects.png" alt="Projects: stale build folders with idle time"></td>
+    <td><img src="docs/screenshots/cleaning.png" alt="Cleaning: every item shown as it is removed, with a progress bar and a time estimate (mock data)"></td>
+    <td><img src="docs/screenshots/apps.png" alt="Apps: size, data kept and last use, with an approximate date marked when macOS has none (mock data)"></td>
   </tr>
   <tr>
-    <td><img src="docs/screenshots/repos.png" alt="Repos: every clone and worktree with its backup status"></td>
-    <td><img src="docs/screenshots/repos-remove-warning.png" alt="Removing a clone that is not backed up needs an explicit confirmation"></td>
+    <td><img src="docs/screenshots/repos.png" alt="Repos: every clone and worktree with its backup status (mock data)"></td>
+    <td><img src="docs/screenshots/cleanup.png" alt="Cleanup: categories grouped by safe and caution (mock data)"></td>
   </tr>
   <tr>
-    <td colspan="2"><img src="docs/screenshots/history.png" alt="History: every deletion made by the app, the command line or an AI agent, with items and outcomes (mock data)"></td>
+    <td colspan="2" align="center"><img src="docs/screenshots/update.png" width="480" alt="The update prompt: current and new version, release notes, Install Update, Later and Skip This Version"></td>
   </tr>
 </table>
 
 Mac Cleaner is a free, open-source macOS app (with a command-line tool) that frees up the disk space developers actually lose: `node_modules` and Rust `target` folders in dozens of projects, duplicate git clones and worktrees left behind by coding agents, Claude Code / Cursor / Codex session data, Hugging Face and Ollama model downloads, npm / pnpm / uv / Homebrew caches, Xcode DerivedData and simulators, Docker images.
 
 If your Mac says the disk is full and "System Data" is enormous, this is the tool that tells you which folders it really is, and which of them are safe to delete.
+
+## How it compares
+
+An honest, short comparison. "—" means not something I can state with confidence.
+
+| | Mac Cleaner | DaisyDisk | CleanMyMac | npkill | kondo |
+|---|---|---|---|---|---|
+| Scope | Developer caches, build folders, git clones, AI tool data, apps | Disk-space map of any folder | General Mac cleanup | `node_modules` folders | Build folders of many project types |
+| Knows developer artifacts | Yes (build folders, package caches, Xcode, AI models and sessions) | No | — | `node_modules` only | Yes (project build folders) |
+| Git-safety checks before deleting | Yes (uncommitted, unpushed, stash, no remote; never removes work that exists nowhere else without a confirmation) | No | — | — | — |
+| Command line / MCP for AI agents | Both | No | No | Command line | Command line |
+| Price and licence | Free, MIT, open source | Paid, closed source | Paid, closed source | Free, open source | Free, open source |
 
 ## Why another cleaner?
 
@@ -74,7 +94,7 @@ Mac Cleaner knows these places. It shows what each one is, how big it is, whethe
 
 1. Download `MacCleaner-<version>.dmg` from the [latest release](https://github.com/baturox/mac-cleaner/releases/latest).
 2. Open it and drag **Mac Cleaner** to **Applications**.
-3. Read the next section before the first launch.
+3. Optionally grant [Full Disk Access](#full-disk-access) for complete sizes.
 
 Each release also contains a `.zip` of the app, a CLI-only `.tar.gz`, and `SHA256SUMS` to verify the downloads.
 
@@ -277,7 +297,7 @@ $ mac-cleaner apps com.acme.app --clear-caches -n
 $ mac-cleaner apps com.acme.app --remove --with-data
 ```
 
-`apps` lists installed apps (`--json`, `--unused <days>`, `--sort size|data|opened|name`). With a bundle identifier it shows the data the app keeps; `--clear-caches` removes only its cache folders, `--remove` moves the app to the Trash (`--with-data` also removes its exact-match data, except data folders over 50 MB, which are named and left alone). `-n/--dry-run` previews, `-y` skips the question (required off a terminal), `--trash` moves the data to the Trash too instead of deleting it. `--json` with an action is a dry run. The CLI never removes "possibly related" folders or group containers.
+`apps` lists installed apps (`--json`, `--unused <days>`, `--sort size|data|opened|name`). *Last opened* is Spotlight's launch date; when macOS has none, a date marked `≈` is an estimate from the newest change in the app's own data files (Preferences plist, Container, Caches, Saved Application State; only for apps with a reverse-DNS bundle id). The estimate never counts an app as unused: `--unused` and the "Not opened in 90+ days" filter use launch dates only. In `--json` it is the optional `app.lastActivity` field; `lastOpenedText` keeps its meaning. With a bundle identifier it shows the data the app keeps; `--clear-caches` removes only its cache folders, `--remove` moves the app to the Trash (`--with-data` also removes its exact-match data, except data folders over 50 MB, which are named and left alone). `-n/--dry-run` previews, `-y` skips the question (required off a terminal), `--trash` moves the data to the Trash too instead of deleting it. `--json` with an action is a dry run. The CLI never removes "possibly related" folders or group containers.
 
 **How leftovers are matched.** Only your own `~/Library`, never `/System`, never through a symlink.
 - *Exact*: the full bundle identifier as the whole name, no prefix or substring: `Caches/<id>`, `Application Support/<id>`, `Containers/<id>`, `Preferences/<id>.plist`, `Saved Application State/<id>.savedState`, `HTTPStorages/<id>` and `<id>.binarycookies`, `WebKit/<id>`, `Logs/<id>`, `Application Scripts/<id>`, `Cookies/<id>.binarycookies`, and `LaunchAgents/<id>*.plist` only when the program it starts is inside the app bundle. Each is a *cache* (rebuilt by the app), *settings* or *data* (documents, databases). They start ticked, except data-class folders over 50 MB, which start unticked with a note. An app whose identifier has unusual characters, or that is installed twice, gets none.
@@ -394,7 +414,7 @@ claude mcp add mac-cleaner -- mac-cleaner mcp --allow-clean --min-idle-days 30 -
 | `list_category_items` | Items of one category, paged | read-only, idempotent |
 | `scan_projects` | Rebuildable build folders (root, min size, min idle days, kinds), paged | read-only, idempotent |
 | `scan_repos` | Git clones and worktrees with backup status, untrusted-config, ignored-file and hidden-from-status signals, paged | read-only, idempotent |
-| `list_apps` | Installed apps with bundle size, data kept (caches, settings, data), last opened, running / App Store / Homebrew / removable; filter `unused_days`, sort, paged. There is no tool that removes an app | read-only, idempotent |
+| `list_apps` | Installed apps with bundle size, data kept (caches, settings, data), last opened, running / App Store / Homebrew / removable; filter `unused_days` (launch dates only), sort, paged; an optional `last_activity_estimate` (approximate, from the app's own data files) appears when there is no launch date. There is no tool that removes an app | read-only, idempotent |
 | `explore_folder` | Biggest children of a folder, inside your home and temp folders only. Credential locations and your protected folders are refused and left out; `~/Documents`, `~/Library` and your other top-level folders are listed. A folder's size includes protected folders inside it | read-only, idempotent |
 | `growth_report` | Takes a size snapshot (the only thing it writes, in Mac Cleaner's own history file) and reports what grew | not read-only, not destructive |
 | `audit_history` | What was deleted, by whom, paged; interrupted operations are marked `unfinished` | read-only, idempotent |
