@@ -58,6 +58,8 @@ final class FakeEngine: CleanerEngine, @unchecked Sendable {
     var auditProblem: String?
     /// Notes returned with every deleting call (the engine passes on tool output and file names).
     var resultMessages: [String] = []
+    /// Per-item states returned with every clean (what a real engine reports).
+    var resultItems: [CleanItemEvent] = []
     /// When set, cleaning and deleting really remove the given paths, but only below this folder
     /// (a scratch tree under the system temp directory).
     var removeBelow: String?
@@ -109,8 +111,8 @@ final class FakeEngine: CleanerEngine, @unchecked Sendable {
         }
         if cleanDelay > 0 { try? await Task.sleep(nanoseconds: cleanDelay) }
         reallyRemove(categories.flatMap { $0.items.map { $0.url.path } })
-        return CleanResult(freedBytes: categories.reduce(0) { $0 + $1.sizeBytes }, failedCount: 0, messages: resultMessages,
-                           auditRecorded: auditRecorded)
+        return CleanResult(freedBytes: categories.reduce(0) { $0 + $1.sizeBytes }, failedCount: resultItems.filter { $0.state == .failed }.count,
+                           messages: resultMessages, auditRecorded: auditRecorded, items: resultItems)
     }
     func delete(urls: [URL], mode: DeleteMode, progress: @escaping ProgressHandler) async -> CleanResult {
         lock.withLock { deletedCalls.append((urls, mode)) }

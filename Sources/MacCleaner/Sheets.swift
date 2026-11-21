@@ -521,7 +521,7 @@ struct ResultSheet: View {
                 }
                 .padding(10)
             }
-            .frame(height: min(200, CGFloat(items.count) * 46 + 20))
+            .frame(height: min(220, CGFloat(items.count) * 64 + 20))
             .background(.background.secondary, in: RoundedRectangle(cornerRadius: 8))
             .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(.quaternary))
         }

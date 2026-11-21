@@ -200,20 +200,43 @@ final class ProgressLine: @unchecked Sendable {
     }
 
     private var deleteStart: Date?
+    private var estimator = ProgressEstimator()
 
+    /// One updating line: "[#####---------------] 3/8  4.2 GB of 9.8 GB  12s  ~1m left  Projects/app/node_modules".
+    /// While a helper program runs there is no honest fraction, so the bar is replaced by what it is doing.
     func updateDelete(_ p: DeleteProgress) {
         guard enabled else { return }
         lock.lock()
         let start = deleteStart ?? Date()
         deleteStart = start
+        let elapsed = Date().timeIntervalSince(start)
+        let useBytes = (p.expectedBytes ?? 0) > 0
+        let done = useBytes ? Double(p.bytesFreed) : Double(p.itemsDone)
+        estimator.add(time: elapsed, done: done)
+        let left = estimator.secondsLeft(remaining: max(0, (useBytes ? Double(p.expectedBytes ?? 0) : Double(p.itemsTotal)) - done), elapsed: elapsed)
         lock.unlock()
         let cells = 20
-        let filled = Int((p.fraction * Double(cells)).rounded(.down))
-        let bar = "[" + String(repeating: "#", count: filled) + String(repeating: "-", count: cells - filled) + "]"
-        var text = "\(bar) \(p.itemsDone)/\(p.itemsTotal)  \(p.entriesRemoved.formatted()) entries  \(formatBytes(p.bytesFreed))"
-        text += "  \(Int(Date().timeIntervalSince(start)))s"
-        if let item = p.currentItem { text += "  " + item }
+        var text: String
+        if let fraction = p.displayFraction {
+            let filled = Int((fraction * Double(cells)).rounded(.down))
+            text = "[" + String(repeating: "#", count: filled) + String(repeating: "-", count: cells - filled) + "]"
+        } else {
+            text = "[" + String(repeating: "~", count: cells) + "]"
+        }
+        text += " \(p.itemsDone)/\(p.itemsTotal)  "
+        text += p.expectedBytes.map { $0 > 0 ? "\(formatBytes(p.bytesFreed)) of \(formatBytes($0))" : formatBytes(p.bytesFreed) } ?? formatBytes(p.bytesFreed)
+        text += "  \(Int(elapsed))s"
+        if case .command(let name) = p.phase {
+            text += "  running \(name) (Ctrl-C stops it)"
+        } else {
+            if let left { text += "  ~" + Self.shortDuration(left) + " left" }
+            if let item = p.currentItem { text += "  " + item }
+        }
         update(text)
+    }
+
+    static func shortDuration(_ s: TimeInterval) -> String {
+        s < 60 ? "\(max(1, Int(s)))s" : (s < 3600 ? "\(Int(s / 60))m" : String(format: "%.1fh", s / 3600))
     }
 
     func update(_ message: String) {

@@ -212,5 +212,23 @@ enum CleanCommand {
             ctx.out(s.yellow("\(r.failedCount) entr\(r.failedCount == 1 ? "y" : "ies") could not be removed (in use or protected by macOS)."))
         }
         for m in r.messages { ctx.out(s.dim("  " + m)) }
+        printItemSummary(r, ctx)
+    }
+
+    /// On a terminal: what was not removed, item by item, with the reason. Piped output keeps its established shape
+    /// (the messages above); the same information is in them.
+    static func printItemSummary(_ r: CleanResult, _ ctx: Context) {
+        guard ctx.console.stdoutIsTTY, !ctx.json else { return }
+        let s = ctx.style
+        let failed = r.items.filter { $0.state == .failed }
+        let skipped = r.items.filter { $0.state == .skipped && $0.reason != .alreadyGone }
+        guard !failed.isEmpty || !skipped.isEmpty else { return }
+        let done = r.items.filter { $0.state == .done || $0.reason == .alreadyGone }.count
+        ctx.out()
+        ctx.out(s.bold("\(done) of \(r.items.count) items removed") + s.dim(", \(failed.count) failed, \(skipped.count) skipped"))
+        for item in failed + skipped {
+            let mark = item.state == .failed ? s.yellow("failed ") : s.dim("skipped")
+            ctx.out("  \(mark) \(item.name)  " + s.dim((item.reason ?? .other).text))
+        }
     }
 }
