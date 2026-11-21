@@ -5,6 +5,7 @@ import Foundation
 enum ReposCommand {
     static func run(_ args: ParsedArguments, _ ctx: Context) async throws -> Int32 {
         let root = resolvePath(args.positionals.first ?? "~", home: ctx.home)
+        if args.flag("timings") { ScanTimings.enable() }
         let multipleOnly = args.flag("multiple-only")
         let remove = args.flag("remove-clean")
         let mode: DeleteMode = args.flag("trash") ? .trash : .permanent

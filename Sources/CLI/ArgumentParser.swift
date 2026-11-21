@@ -18,8 +18,11 @@ struct OptionSpec {
     /// Placeholder for the value (`N`, `PATH`, …); nil for boolean flags.
     let value: String?
     let help: String
+    /// Accepted but not listed in `--help`.
+    let hidden: Bool
 
-    init(_ long: String, short: Character? = nil, value: String? = nil, _ help: String) {
+    init(_ long: String, short: Character? = nil, value: String? = nil, hidden: Bool = false, _ help: String) {
+        self.hidden = hidden
         self.long = long
         self.short = short
         self.value = value

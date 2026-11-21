@@ -162,6 +162,8 @@ enum SharedWalker {
 
 /// Keeps the finished walk of a scan root for a short time and lets concurrent callers share one walk that is
 /// still running. Dropped on every deletion and when the protected folders change.
+typealias RepoListHandler = @Sendable ([FoundRepo]) -> Void
+
 final class WalkCache: @unchecked Sendable {
     private final class Job: @unchecked Sendable {
         let flag = CancelFlag()
@@ -169,7 +171,25 @@ final class WalkCache: @unchecked Sendable {
         var waiters = 1
         private let lock = NSLock()
         private var handlers: [ProgressHandler] = []
+        private var early: [FoundRepo]?
+        private var earlyHandlers: [RepoListHandler] = []
         func add(_ h: @escaping ProgressHandler) { lock.lock(); handlers.append(h); lock.unlock() }
+        /// Calls `h` with the working copies as soon as the walk has found them (at once when it already has).
+        func addEarly(_ h: @escaping RepoListHandler) {
+            lock.lock()
+            if let early { lock.unlock(); h(early); return }
+            earlyHandlers.append(h)
+            lock.unlock()
+        }
+        func publishEarly(_ repos: [FoundRepo]) {
+            lock.lock()
+            guard early == nil else { lock.unlock(); return }
+            early = repos
+            let all = earlyHandlers
+            earlyHandlers = []
+            lock.unlock()
+            for h in all { h(repos) }
+        }
         func emit(_ message: String) {
             lock.lock(); let all = handlers; lock.unlock()
             for h in all { h(message) }
@@ -206,11 +226,22 @@ final class WalkCache: @unchecked Sendable {
     /// this caller was cancelled (or the walk was stopped). `force` drops everything kept first.
     func snapshot(root: String, force: Bool = false, progress: @escaping ProgressHandler,
                   make: @escaping @Sendable (CancelFlag, @escaping ProgressHandler) async -> WalkSnapshot) async -> WalkSnapshot? {
+        await snapshot(root: root, force: force, progress: progress, onRepos: nil) { flag, emit, _ in await make(flag, emit) }
+    }
+
+    /// Like `snapshot`, and `onRepos` is called with the working copies found as soon as the walk knows them,
+    /// which is before the rest of the snapshot (the git check of the build folders) is done. `make` reports them
+    /// through its third argument; a kept walk reports them at once.
+    func snapshot(root: String, force: Bool = false, progress: @escaping ProgressHandler, onRepos: RepoListHandler?,
+                  make: @escaping @Sendable (CancelFlag, @escaping ProgressHandler, @escaping RepoListHandler) async -> WalkSnapshot) async -> WalkSnapshot? {
         let job: Job
         switch join(root: root, force: force, progress: progress, make: make) {
-        case .kept(let s): return s
+        case .kept(let s):
+            onRepos?(s.repos)
+            return s
         case .job(let j): job = j
         }
+        if let onRepos { job.addEarly(onRepos) }
         let snap = await withTaskCancellationHandler {
             await job.task.value
         } onCancel: {
@@ -227,7 +258,7 @@ final class WalkCache: @unchecked Sendable {
 
     /// Under the lock: the kept walk, a walk already running (this caller becomes one more waiter) or a new one.
     private func join(root: String, force: Bool, progress: @escaping ProgressHandler,
-                      make: @escaping @Sendable (CancelFlag, @escaping ProgressHandler) async -> WalkSnapshot) -> Joined {
+                      make: @escaping @Sendable (CancelFlag, @escaping ProgressHandler, @escaping RepoListHandler) async -> WalkSnapshot) -> Joined {
         lock.lock(); defer { lock.unlock() }
         if force { invalidateLocked() }
         if let s = stored[root], clock().timeIntervalSince(s.date) < lifetime { return .kept(s.snapshot) }
@@ -244,7 +275,7 @@ final class WalkCache: @unchecked Sendable {
         let flag = fresh.flag
         fresh.task = Task(priority: .utility) { [self] in
             let snap = await PoliteScan.$enabled.withValue(true) {
-                await make(flag) { fresh.emit($0) }
+                await make(flag, { fresh.emit($0) }, { fresh.publishEarly($0) })
             }
             self.finish(root: root, job: fresh, generation: generationAtStart, snapshot: snap)
             return snap
@@ -274,17 +305,22 @@ final class WalkCache: @unchecked Sendable {
 extension LiveEngine {
     /// The walk (and git filter) for `root`, shared with whoever else asks for it right now or in the last few
     /// minutes. nil when cancelled.
-    func walkSnapshot(root: String, progress: @escaping ProgressHandler) async -> WalkSnapshot? {
+    func walkSnapshot(root: String, progress: @escaping ProgressHandler, onRepos: RepoListHandler? = nil) async -> WalkSnapshot? {
         let guardian = context().guardian
         let env = self.env
         let home = env.home
-        return await walkCache.snapshot(root: root, progress: progress) { flag, emit in
+        return await walkCache.snapshot(root: root, progress: progress, onRepos: onRepos) { flag, emit, emitRepos in
+            let t0 = ScanTimings.now
             let raw = await onBackground { SharedWalker.walk(root: root, home: home, guardian: guardian, flag: flag, progress: emit) }
+            ScanTimings.log("walk", since: t0, "(\(raw.folders) folders, \(raw.repos.count) repos, \(raw.candidates.count) build folders)")
             if flag.isSet || Task.isCancelled {
                 return WalkSnapshot(root: root, candidates: [], repos: [], folders: raw.folders, completed: false)
             }
+            if !flag.isSet && !Task.isCancelled { emitRepos(raw.repos) }
             emit("Checking \(raw.candidates.count) build folders against git…")
+            let t1 = ScanTimings.now
             let kept = await GitArtifactFilter.filter(raw.candidates, env: env)
+            ScanTimings.log("git filter of build folders", since: t1)
             let done = !flag.isSet && !Task.isCancelled
             return WalkSnapshot(root: root, candidates: kept, repos: raw.repos, folders: raw.folders, completed: done)
         }

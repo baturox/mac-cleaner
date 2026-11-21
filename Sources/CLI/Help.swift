@@ -87,6 +87,7 @@ enum Commands {
             OptionSpec("trash", "Move to the Trash instead of deleting permanently."),
             OptionSpec("dry-run", short: "n", "With --remove-clean: show what would go; delete nothing."),
             OptionSpec("yes", short: "y", "With --remove-clean: do not ask for confirmation."),
+            OptionSpec("timings", hidden: true, "Print how long each phase of the scan took to stderr."),
         ],
         examples: [
             "mac-cleaner repos ~/Developer",
@@ -295,7 +296,7 @@ enum Help {
         }
         lines.append("")
         lines.append("OPTIONS")
-        let rendered = (spec.options + globalOptions).map { o -> (String, String) in
+        let rendered = (spec.options + globalOptions).filter { !$0.hidden }.map { o -> (String, String) in
             var left = "  "
             if let s = o.short { left += "-\(s), " } else { left += "    " }
             left += "--\(o.long)"
