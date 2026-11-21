@@ -18,7 +18,8 @@ func runCLI(arguments: [String],
             home: URL = URL(fileURLWithPath: AccountEnvironment.home),
             homeProblem: String? = AccountEnvironment.problem,
             probe: any SystemProbe = LiveProbe(),
-            settingsStore: SettingsStore? = nil) async -> Int32 {
+            settingsStore: SettingsStore? = nil,
+            updates: UpdateService = UpdateService()) async -> Int32 {
     var rest = arguments
     var json = false
     var noColor = false
@@ -109,6 +110,7 @@ func runCLI(arguments: [String],
         var ctx = Context(engine: engine, console: console, style: style(noColor), json: json,
                           home: home, environment: environment, probe: probe)
         ctx.settings = settings
+        ctx.updates = updates
         ctx.extraProtected = extra
         ctx.settingsStore = settingsStore
         ctx.settingsFile = settingsStore.map { abbreviateHome($0.fileURL.path, home: home) }
@@ -137,6 +139,7 @@ func runCLI(arguments: [String],
         case "history": return try await HistoryCommand.run(parsed, ctx)
         case "mcp": return try await MCPCommand.run(parsed, ctx)
         case "doctor": return try await DoctorCommand.run(parsed, ctx)
+        case "update": return try await UpdateCommand.run(parsed, ctx)
         default: throw unknownCommand(name)
         }
     } catch let e as UsageError {

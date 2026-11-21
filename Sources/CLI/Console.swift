@@ -138,6 +138,7 @@ struct Context {
     var home: URL
     var environment: [String: String]
     var probe: any SystemProbe = LiveProbe()
+    var updates = UpdateService()
     /// The settings in force: the shared settings file plus any `--protect` paths.
     var settings = EngineSettings()
     /// Paths added with `--protect` for this run (absolute).

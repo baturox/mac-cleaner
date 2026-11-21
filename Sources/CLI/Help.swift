@@ -225,7 +225,20 @@ enum Commands {
         ]
     )
 
-    static let all: [CommandSpec] = [scan, clean, projects, repos, apps, explore, growth, history, mcp, doctor]
+    static let update = CommandSpec(
+        name: "update",
+        summary: "Check whether a newer release exists (`update --check`)",
+        usage: "update --check [--json]",
+        positionalHelp: [],
+        maxPositionals: 0,
+        options: [OptionSpec("check", "Ask GitHub for the latest release and compare it with this version.")],
+        examples: ["mac-cleaner update --check", "mac-cleaner update --check --json | jq .updateAvailable"],
+        notes: ["Sends one anonymous request to api.github.com. Nothing is downloaded or installed: update from the app",
+                "(Mac Cleaner > Check for Updates…) or with Homebrew.",
+                "Exit codes: 0 up to date, 10 a newer version exists, 1 the check failed, 2 usage error."]
+    )
+
+    static let all: [CommandSpec] = [scan, clean, projects, repos, apps, explore, growth, history, mcp, doctor, update]
 
     static func named(_ name: String) -> CommandSpec? { all.first { $0.name == name } }
 }
@@ -255,6 +268,7 @@ enum Help {
             "",
             "EXIT CODES",
             "  0 success   1 runtime failure (or some items could not be removed)   2 usage error   130 cancelled",
+            "  (`update --check` also uses 10: a newer version exists)",
             "",
             "EXAMPLES",
             "  mac-cleaner                       # what can I reclaim?",
