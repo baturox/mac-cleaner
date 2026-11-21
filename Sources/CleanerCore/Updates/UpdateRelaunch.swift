@@ -84,6 +84,12 @@ public struct UpdateFinalizer: Sendable {
         let here = canonicalURL(runningBundle).path
         let theirs = canonicalURL(URL(fileURLWithPath: p.installedPath)).path
         if p.toVersion == runningVersion, here == theirs {
+            // Already confirmed by an earlier launch (the app was quit before the cleanup ran): just finish the cleanup.
+            if FileManager.default.fileExists(atPath: p.ackPath) {
+                log.append(UpdateLogEntry(fromVersion: p.fromVersion, toVersion: p.toVersion, result: "installed"))
+                remove(p, runningBundle: runningBundle)
+                return .nothing
+            }
             // The new version started. Tell the helper, so it does not roll back.
             let dir = URL(fileURLWithPath: p.stageDir, isDirectory: true)
             if UpdateStageFolder.isOurs(dir, besides: runningBundle) {

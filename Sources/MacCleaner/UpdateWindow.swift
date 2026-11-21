@@ -118,7 +118,7 @@ struct UpdateView: View {
             .padding(.horizontal, 10).padding(.vertical, 4)
             .background(.quaternary.opacity(0.6), in: Capsule())
             .accessibilityElement(children: .combine)
-            .accessibilityLabel("From version \(model.currentVersion) to \(offer.version)")
+            .accessibilityLabel("From version \(model.currentVersion) to \(offer.version.description)")
 
             VStack(alignment: .leading, spacing: 6) {
                 Text("What's new").font(.headline)

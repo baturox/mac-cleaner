@@ -337,6 +337,22 @@ final class UpdateFinalizerTests: XCTestCase {
         XCTAssertEqual(f.start(runningVersion: "0.3.0", runningBundle: app), .nothing)
     }
 
+    func testASecondLaunchBeforeTheCleanupDoesNotAnnounceTheUpdateAgain() throws {
+        let s = try UpdateScratch()
+        let apps = try s.dir("apps")
+        let app = try makeFixtureApp(at: apps.appendingPathComponent("Mac Cleaner.app"), version: "0.3.0")
+        let stage = try s.dir("apps/.MacCleaner-update-twice1")
+        let store = PendingUpdateStore(directory: s.url("hist")), log = UpdateLog(directory: s.url("hist"))
+        try store.save(pending(s, stage: stage, installed: app))
+        let f = UpdateFinalizer(store: store, log: log)
+        XCTAssertEqual(f.start(runningVersion: "0.3.0", runningBundle: app), .updated(from: "0.2.0", to: "0.3.0"))
+        // Quit before completeCleanup ran; the next launch finishes quietly.
+        XCTAssertEqual(f.start(runningVersion: "0.3.0", runningBundle: app), .nothing)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: stage.path))
+        XCTAssertNil(store.load())
+        XCTAssertEqual(log.entries().map(\.result), ["installed"])
+    }
+
     func testRolledBackWhenTheOldVersionRunsAgain() throws {
         let s = try UpdateScratch()
         let apps = try s.dir("apps")
