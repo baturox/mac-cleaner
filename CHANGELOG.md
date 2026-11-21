@@ -4,6 +4,23 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- The cleaning overlay shows every planned item with a status icon (waiting, working, done, failed, skipped), its size, and follows the item being worked on. One summary line reads "12 of 40 items · 3.2 GB of 9.8 GB freed · 0:42 elapsed · about 1 min left" (the time left is smoothed, and hidden for the first seconds, while a command runs, and when nothing has moved for a while).
+- The result sheet counts done / failed / skipped items and lists each one that was not removed with its reason. A stopped run reads "Stopped — 14 of 40 items removed".
+- Engine API (additive): `CleanItemEvent`, `CleanItemState` and `CleanItemReason` (typed reasons instead of message text), `CleanerEngine.clean(...itemEvents:)` and `delete(...itemEvents:)` (one event per item when it is queued, starts and ends; never per file), `CleanResult.items`, `DeleteProgress.phase` (`removing` or `command(name)`) and `displayFraction`. The mock engine emits the same events. `--json` output is unchanged.
+- CLI on a terminal: the progress line shows the amount of the total, the time left, and what a running command is, and a clean ends with a list of the items that failed or were skipped and why. Piped output keeps its shape.
+
+### Fixed
+
+- The clock, bar and path in the cleaning overlay no longer freeze during a long command, one huge file or a move to the Trash; the clock is driven by a timer of its own.
+- While a helper command (`brew cleanup`, `docker ...`, `simctl ...`) runs, the overlay says "Running <command> — this can take a few minutes" with an indeterminate bar instead of a stale path. Stop terminates the command; what it already removed stays removed.
+- Moving to the Trash no longer sits at 0 % and then jumps: the bar uses the scanned sizes of the items moved so far, and is indeterminate when one item is moved as a whole.
+- Checking which items are gone after a clean no longer runs on the main thread, so the window does not stall after big deletions.
+- `mac-cleaner --help` (and `-h`) prints the top-level help instead of the help of `scan`.
+
 ## [0.2.0] - 2026-11-15
 
 ### Added
