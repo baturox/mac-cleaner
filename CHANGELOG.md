@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-21
+
 ### Added
 
 - **In-app updates.** *Mac Cleaner > Check for Updates…* and an automatic check (at launch after a short delay, then at most once a day; *Settings > Updates > Automatically check for updates*, on by default) ask GitHub for the latest release. A newer version opens a window with current → new, the release notes as plain text and *Install Update*, *Later* and *Skip This Version*. Installing downloads the release zip, verifies its size and SHA-256, unpacks it in a private folder next to the app, verifies the code signature (Developer ID, Team `35MD9KJ7ZQ`, bundle id, all nested code, strict), the version and the Gatekeeper notarization assessment, swaps the verified bundle in atomically, relaunches, shows "Updated to X" and removes the backup once the new version runs (the old version is put back if it does not start). It never installs or relaunches during a clean, never runs in development or ad-hoc builds, and refuses (with a *Download manually* link) for an app on a disk image, a read-only volume, an App Translocation path or a folder you cannot write to. See README "Updates" and SECURITY.md "Updater".
