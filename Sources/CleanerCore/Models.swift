@@ -154,11 +154,25 @@ public struct RepoClone: Identifiable, Hashable, Sendable, Codable {
     /// `uncommittedCount`; front ends show it as "N files hidden from git status".
     public var hiddenFromStatusCount: Int
 
+    /// True for a placeholder row of a scan that is still running: git has not been asked about this copy yet,
+    /// so every state field is a stand-in. Such a copy is never `isFullyBackedUp`, never selectable and never
+    /// part of a removal. Never stored and never part of the JSON output (see `CodingKeys`).
+    public var inspectionPending = false
+    /// True while the size of a copy (and of its build folders) is still being measured; `sizeBytes` and
+    /// `artifactBytes` are then 0 or a remembered value. Never stored, never in the JSON output.
+    public var sizePending = false
+
+    private enum CodingKeys: String, CodingKey {
+        case url, branch, isLinkedWorktree, uncommittedCount, unpushedCount, hasStash, lastCommit, idleDays
+        case sizeBytes, artifactBytes, ignoredFileCount, untrustedConfigKeys, hiddenFromStatusCount
+    }
+
     /// False when git was not run here because of the repository's own configuration.
     public var wasInspected: Bool { untrustedConfigKeys == nil }
 
     /// Nothing would be lost by deleting the whole folder.
     public var isFullyBackedUp: Bool {
+        if inspectionPending { return false }
         if !wasInspected { return false }
         if uncommittedCount > 0 || ignoredFileCount > 0 { return false }
         if isLinkedWorktree {
@@ -192,7 +206,7 @@ public struct RepoRemovalPlan: Sendable {
     /// `acknowledged` holds the ids of the clones the user confirmed losing work in.
     /// Clones that were not inspected are never forced (the engine refuses them anyway).
     public init(clones: [RepoClone], acknowledged: Set<String>) {
-        forced = clones.filter { !$0.isFullyBackedUp && $0.wasInspected && acknowledged.contains($0.id) }
+        forced = clones.filter { !$0.isFullyBackedUp && $0.wasInspected && !$0.inspectionPending && acknowledged.contains($0.id) }
         let forcedIDs = Set(forced.map(\.id))
         unforced = clones.filter { !forcedIDs.contains($0.id) }
     }

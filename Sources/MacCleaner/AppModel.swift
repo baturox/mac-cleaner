@@ -495,7 +495,7 @@ final class AppModel {
     /// A copy that was not inspected (untrusted git configuration) can never be selected: nobody knows what
     /// it holds, and the engine refuses to remove it.
     func isCloneSelectable(_ c: RepoClone) -> Bool {
-        c.wasInspected && (c.isFullyBackedUp || allowedCloneIDs.contains(c.id))
+        c.wasInspected && !c.inspectionPending && (c.isFullyBackedUp || allowedCloneIDs.contains(c.id))
     }
 
     func setClone(_ c: RepoClone, selected: Bool) {
@@ -503,7 +503,7 @@ final class AppModel {
     }
 
     func setAllowed(_ c: RepoClone, allowed: Bool) {
-        if allowed && c.wasInspected && !reposAreProvisional { allowedCloneIDs.insert(c.id) } else {
+        if allowed && c.wasInspected && !c.inspectionPending && !reposAreProvisional { allowedCloneIDs.insert(c.id) } else {
             allowedCloneIDs.remove(c.id)
             selectedCloneIDs.remove(c.id)
         }
@@ -984,7 +984,7 @@ final class AppModel {
 
     func requestRemoveClones(_ requested: [RepoClone]) {
         // Copies that were not inspected are never part of a removal.
-        let scanned = requested.filter(\.wasInspected)
+        let scanned = requested.filter { $0.wasInspected && !$0.inspectionPending }
         guard !scanned.isEmpty, !isBusy, !reposAreProvisional else { return }
         Task { await presentCloneRemoval(scanned) }
     }

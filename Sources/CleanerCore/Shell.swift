@@ -126,7 +126,8 @@ func runProcess(_ exe: String, _ args: [String], timeout: TimeInterval = 120,
     let handle = ProcessHandle()
     // The project and repository scans start many `du` and `git` children: only a few at a time, at low priority.
     let polite = PoliteScan.enabled
-    if polite { await PoliteScan.limiter.acquire() }
+    let limiter = PoliteScan.override ?? PoliteScan.limiter
+    if polite { await limiter.acquire() }
     let result = await withTaskCancellationHandler {
         await withCheckedContinuation { (cont: CheckedContinuation<ProcResult, Never>) in
             DispatchQueue.global(qos: .utility).async {
@@ -135,7 +136,7 @@ func runProcess(_ exe: String, _ args: [String], timeout: TimeInterval = 120,
             }
         }
     } onCancel: { handle.cancel() }
-    if polite { await PoliteScan.limiter.release() }
+    if polite { await limiter.release() }
     return result
 }
 
@@ -144,6 +145,9 @@ func runProcess(_ exe: String, _ args: [String], timeout: TimeInterval = 120,
 enum PoliteScan {
     @TaskLocal static var enabled = false
     static let limiter = AsyncSemaphore(3)
+    /// A scan that runs several kinds of children side by side gives each kind its own limit (so that slow
+    /// `du` runs never hold up the quick `git` ones); children started inside use it instead of `limiter`.
+    @TaskLocal static var override: AsyncSemaphore?
 }
 
 // MARK: - du

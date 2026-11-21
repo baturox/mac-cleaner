@@ -194,6 +194,90 @@ enum RepoInspector {
         return out
     }
 
+    /// What `status --porcelain=v2 --branch -z` says: the branch (nil when HEAD is detached), how many entries
+    /// are listed (changed, renamed, unmerged and untracked each count once, like `parseStatus`), and whether
+    /// one of them is a `.gitignore` file.
+    struct StatusV2: Equatable {
+        var branch: String?
+        var sawBranchHeader = false
+        var entries = 0
+        var listsGitignore = false
+    }
+
+    static func parseStatusV2(_ output: String) -> StatusV2 {
+        var out = StatusV2()
+        var skipNext = false
+        func note(_ path: Substring?) {
+            out.entries += 1       // a record that cannot be read still counts: erring towards "has changes"
+            guard let path else { out.listsGitignore = true; return }      // unknown: do not skip the ignored pass
+            if path == ".gitignore" || path.hasSuffix("/.gitignore") { out.listsGitignore = true }
+        }
+        for field in output.split(separator: "\0", omittingEmptySubsequences: true) {
+            if skipNext { skipNext = false; continue }      // the original path of a rename or copy
+            if field.hasPrefix("# ") {
+                if field.hasPrefix("# branch.head ") {
+                    out.sawBranchHeader = true
+                    let name = field.dropFirst("# branch.head ".count)
+                    out.branch = name == "(detached)" ? nil : String(name)
+                }
+                continue
+            }
+            guard let kind = field.first, field.dropFirst().first == " " else { note(nil); continue }
+            switch kind {
+            case "?": note(field.dropFirst(2))
+            case "1":
+                let parts = field.split(separator: " ", maxSplits: 8, omittingEmptySubsequences: false)
+                note(parts.count == 9 ? parts[8] : nil)
+            case "2":
+                let parts = field.split(separator: " ", maxSplits: 9, omittingEmptySubsequences: false)
+                note(parts.count == 10 ? parts[9] : nil)
+                skipNext = true
+            case "u":
+                let parts = field.split(separator: " ", maxSplits: 10, omittingEmptySubsequences: false)
+                note(parts.count == 11 ? parts[10] : nil)
+            case "!": break
+            default: note(nil)
+            }
+        }
+        return out
+    }
+
+    /// Whether this repository has a stash, read from the ref files without running git: the stash is the ref
+    /// `refs/stash`, loose or packed. nil when that cannot be told this way (reftable storage, an unreadable or
+    /// huge `packed-refs`); the caller then asks git.
+    static func stashPresent(commonDir: String) -> Bool? {
+        var st = stat()
+        if lstat(commonDir + "/reftable", &st) == 0 { return nil }
+        if lstat(commonDir + "/refs/stash", &st) == 0 { return true }       // anything there counts as a stash
+        let packed = commonDir + "/packed-refs"
+        if lstat(packed, &st) != 0 { return errno == ENOENT ? false : nil }
+        guard (st.st_mode & S_IFMT) == S_IFREG, st.st_size <= 32_000_000,
+              let data = FileManager.default.contents(atPath: packed) else { return nil }
+        let needle = Data(" refs/stash\n".utf8)
+        var haystack = data
+        if haystack.last != UInt8(ascii: "\n") { haystack.append(UInt8(ascii: "\n")) }
+        return haystack.range(of: needle) != nil
+    }
+
+    /// True when some file outside the work tree could make git ignore things: the repository's `info/exclude`,
+    /// a configured `core.excludesFile`, or the default global ignore file (`~/.config/git/ignore`). A `.gitignore`
+    /// in the work tree is checked separately. Unreadable counts as yes.
+    static func hasOutsideIgnoreRules(_ repo: GitRepo, home: String) -> Bool {
+        if repo.config.contains(where: { $0.key.lowercased() == "core.excludesfile" }) { return true }
+        func hasRules(_ file: String) -> Bool {
+            var st = stat()
+            if lstat(file, &st) != 0 { return errno != ENOENT }
+            guard (st.st_mode & S_IFMT) == S_IFREG, st.st_size <= 1_000_000,
+                  let data = FileManager.default.contents(atPath: file) else { return true }
+            return String(decoding: data, as: UTF8.self).split(whereSeparator: \.isNewline).contains { line in
+                let t = line.trimmingCharacters(in: .whitespaces)
+                return !t.isEmpty && !t.hasPrefix("#")
+            }
+        }
+        return hasRules(repo.layout.commonDir + "/info/exclude") || hasRules(repo.layout.gitDir + "/info/exclude")
+            || hasRules(home + "/.config/git/ignore")
+    }
+
     /// A remote name that is safe to put into `--remotes=<name>`: no option, glob or whitespace characters.
     static func isPlainRemoteName(_ name: String) -> Bool {
         !name.isEmpty && name.range(of: "^[A-Za-z0-9][A-Za-z0-9._/-]*$", options: .regularExpression) != nil
@@ -228,18 +312,29 @@ enum RepoInspector {
         }
         // Submodules are never entered by these commands (--ignore-submodules): a submodule has its own
         // configuration, which has to pass its own audit first (see below).
-        async let branchR = Git.run(repo, ["symbolic-ref", "--short", "-q", "HEAD"], env: env, timeout: 15)
-        async let statusR = Git.run(repo, ["status", "--porcelain=v1", "-z", "-uall", "--ignore-submodules=all"], env: env, timeout: 90)
-        async let ignoredR = Git.run(repo, ["status", "--porcelain=v1", "-z", "--untracked-files=normal", "--ignored=matching",
-                                            "--ignore-submodules=all"], env: env, timeout: 90)
+        // One `status --porcelain=v2 --branch` gives the branch and the changed files together; the stash is read
+        // from the ref files (git is asked only when that cannot be done).
+        let ignoredAtOnce = hasOutsideIgnoreRules(repo, home: env.home) || env.exists(path + "/.gitignore")
+        let ignoredArgs = ["status", "--porcelain=v1", "-z", "--untracked-files=normal", "--ignored=matching", "--ignore-submodules=all"]
+        async let statusR = Git.run(repo, ["status", "--porcelain=v2", "--branch", "-z", "-uall", "--ignore-submodules=all"],
+                                    env: env, timeout: 90)
+        async let ignoredFirstR: ProcResult? = ignoredAtOnce ? Git.run(repo, ignoredArgs, env: env, timeout: 90) : nil
         // Prints the ref when there is a stash and nothing (still exit 0) when there is none, so "no stash"
         // is told apart from every kind of failure.
-        async let stashR = Git.run(repo, ["for-each-ref", "--format=%(refname)", "refs/stash"], env: env, timeout: 15)
+        async let stashR: ProcResult? = isLinkedWorktree || stashPresent(commonDir: repo.layout.commonDir) != nil ? nil
+            : Git.run(repo, ["for-each-ref", "--format=%(refname)", "refs/stash"], env: env, timeout: 15)
         async let logR = Git.run(repo, ["log", "-1", "--format=%ct", "--no-show-signature"], env: env, timeout: 15)
         async let flagsR = Git.run(repo, ["ls-files", "-v", "-z"], env: env, timeout: 90)
-        let (branch, status, ignoredOut, stash, log, flags) = await (branchR, statusR, ignoredR, stashR, logR, flagsR)
+        let (status, ignoredFirst, stashRun, log, flags) = await (statusR, ignoredFirstR, stashR, logR, flagsR)
 
-        var uncommitted = status.ok ? parseStatus(status.stdout).count : 1
+        let parsed = status.ok ? parseStatusV2(status.stdout) : nil
+        var branchName: String? = parsed?.branch
+        if parsed?.sawBranchHeader != true {
+            // Old git, or status failed: ask for the branch the plain way.
+            let b = await Git.run(repo, ["symbolic-ref", "--short", "-q", "HEAD"], env: env, timeout: 15)
+            branchName = b.ok ? b.stdout.trimmingCharacters(in: .whitespacesAndNewlines) : nil
+        }
+        var uncommitted = parsed?.entries ?? 1
         var hidden = 0
         if flags.ok {
             hidden = hiddenFromStatus(flags.stdout, repo: path)
@@ -247,11 +342,34 @@ enum RepoInspector {
         } else {
             uncommitted = max(uncommitted, 1)
         }
+        // Ignored entries: with no ignore rule anywhere (nothing outside the work tree, and no `.gitignore` tracked or
+        // untracked in it) nothing can be ignored, so the extra pass is skipped. When anything is in doubt it runs.
+        var ignoredOut = ignoredFirst
+        if ignoredOut == nil {
+            let gitignoreTracked = flags.ok && flags.stdout.split(separator: "\0", omittingEmptySubsequences: true).contains {
+                $0.count > 2 && ($0.dropFirst(2) == ".gitignore" || $0.hasSuffix("/.gitignore"))
+            }
+            if !status.ok || !flags.ok || parsed?.listsGitignore == true || gitignoreTracked {
+                ignoredOut = await Git.run(repo, ignoredArgs, env: env, timeout: 90)
+            }
+        }
         var ignored = 0
-        if ignoredOut.ok {
-            ignored = parseStatus(ignoredOut.stdout).filter { $0.code == "!!" && !isRebuildable(ignored: $0.path, repo: path) }.count
+        if let ignoredOut {
+            if ignoredOut.ok {
+                ignored = parseStatus(ignoredOut.stdout).filter { $0.code == "!!" && !isRebuildable(ignored: $0.path, repo: path) }.count
+            } else {
+                uncommitted = max(uncommitted, 1)
+            }
+        }
+        let stash: ProcResult? = stashRun
+        let hasStash: Bool
+        if isLinkedWorktree {
+            hasStash = false
+        } else if let known = stashPresent(commonDir: repo.layout.commonDir) {
+            hasStash = known
         } else {
-            uncommitted = max(uncommitted, 1)
+            // Anything but a clean run that printed nothing counts as "has a stash / cannot tell".
+            hasStash = !(stash?.ok == true && stash!.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
         }
 
         // Only a remote reached over the network is a backup; a path on this disk is not.
@@ -292,10 +410,7 @@ enum RepoInspector {
         }
 
         let commitDate = Double(log.stdout.trimmingCharacters(in: .whitespacesAndNewlines)).map { Date(timeIntervalSince1970: $0) }
-        return RepoState(branch: branch.ok ? branch.stdout.trimmingCharacters(in: .whitespacesAndNewlines) : nil,
-                         uncommitted: uncommitted, unpushed: unpushed,
-                         // Anything but a clean run that printed nothing counts as "has a stash / cannot tell".
-                         hasStash: !isLinkedWorktree && !(stash.ok && stash.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty),
+        return RepoState(branch: branchName, uncommitted: uncommitted, unpushed: unpushed, hasStash: hasStash,
                          lastCommit: commitDate, remote: remote, ignored: ignored, hidden: hidden, untrustedKeys: nil)
     }
 
@@ -334,33 +449,117 @@ struct RepoDetail: Sendable {
     var idle: Int
 }
 
-/// Collects inspected copies from the scan's worker tasks and hands out the grouped state so far.
-final class RepoCollector: @unchecked Sendable {
-    private let lock = NSLock()
-    private var items: [(FoundRepo, RepoDetail)] = []
+/// One working copy of a running scan and what is known about it so far. Everything but `found` arrives
+/// separately and in any order; a row with no `state` is a placeholder.
+struct RepoRow: Sendable {
+    var found: FoundRepo
+    /// Read from the configuration files without running git, only to put a placeholder into the right group.
+    var provisionalRemote: String?
+    var state: RepoState?
+    /// Days since something inside the working copy (outside its build folders) was modified.
+    var idle: Int?
+    /// True when `idle` already takes the last commit into account (the finished, final value).
+    var idleIsFinal = false
+    var size: Int64?
+    var artifacts: Int64?
 
-    func add(_ f: FoundRepo, _ d: RepoDetail, total: Int) -> RepoScanProgress {
-        lock.lock()
-        items.append((f, d))
-        let copy = items
-        lock.unlock()
-        return RepoScanProgress(inspected: copy.count, total: total, groups: groupRepos(copy))
+    /// The newer of "something in the folder changed" and "the last commit", in days; either one alone until the
+    /// other arrives, 0 when neither is known.
+    func idleDays(now: Date) -> Int {
+        if idleIsFinal { return idle ?? 0 }
+        let commit = state?.lastCommit.map { max(0, Int(now.timeIntervalSince($0) / 86400)) }
+        switch (idle, commit) {
+        case let (a?, c?): return min(a, c)
+        case let (a?, nil): return a
+        case let (nil, c?): return c
+        case (nil, nil): return 0
+        }
+    }
+
+    func clone(now: Date = Date()) -> RepoClone {
+        let url = URL(fileURLWithPath: found.path, isDirectory: true)
+        guard let st = state else {
+            var c = RepoClone(url: url, branch: nil, isLinkedWorktree: found.isLinkedWorktree, uncommittedCount: 0,
+                              unpushedCount: nil, hasStash: false, lastCommit: nil, idleDays: 0,
+                              sizeBytes: size ?? 0, artifactBytes: artifacts ?? 0)
+            c.inspectionPending = true
+            c.sizePending = size == nil || artifacts == nil
+            return c
+        }
+        let idleDays = self.idleDays(now: now)
+        var c = RepoClone(url: url, branch: st.branch, isLinkedWorktree: found.isLinkedWorktree,
+                          uncommittedCount: st.uncommitted, unpushedCount: st.unpushed, hasStash: st.hasStash,
+                          lastCommit: st.lastCommit, idleDays: idleDays, sizeBytes: size ?? 0, artifactBytes: artifacts ?? 0,
+                          ignoredFileCount: st.ignored, untrustedConfigKeys: st.untrustedKeys,
+                          hiddenFromStatusCount: st.hidden)
+        c.sizePending = size == nil || artifacts == nil
+        return c
+    }
+}
+
+/// The scan's working copies as they are known right now, safe to update from the scan's worker tasks.
+final class RepoBoard: @unchecked Sendable {
+    private let lock = NSLock()
+    private var rows: [RepoRow]
+    private var index: [String: Int] = [:]
+    private var dirty = false
+    private(set) var statesDone = 0
+    private(set) var sizesDone = 0
+
+    init(_ found: [FoundRepo], provisionalRemotes: [String?]) {
+        rows = zip(found, provisionalRemotes).map { RepoRow(found: $0, provisionalRemote: $1) }
+        for (i, r) in rows.enumerated() { index[r.found.path] = i }
+    }
+
+    var count: Int { lock.lock(); defer { lock.unlock() }; return rows.count }
+
+    func update(_ path: String, _ change: (inout RepoRow) -> Void) {
+        lock.lock(); defer { lock.unlock() }
+        guard let i = index[path] else { return }
+        let before = (rows[i].state != nil, rows[i].size != nil && rows[i].artifacts != nil)
+        change(&rows[i])
+        if rows[i].state != nil && !before.0 { statesDone += 1 }
+        if rows[i].size != nil && rows[i].artifacts != nil && !before.1 { sizesDone += 1 }
+        dirty = true
+    }
+
+    /// True once since the last change; lets a ticker emit only when something moved.
+    func takeDirty() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        defer { dirty = false }
+        return dirty
+    }
+
+    func snapshotRows() -> [RepoRow] { lock.lock(); defer { lock.unlock() }; return rows }
+
+    func row(_ path: String) -> RepoRow? {
+        lock.lock(); defer { lock.unlock() }
+        return index[path].map { rows[$0] }
+    }
+
+    func progress() -> RepoScanProgress {
+        let (rows, done) = (snapshotRows(), statesDone)
+        return RepoScanProgress(inspected: done, total: rows.count, groups: groupRows(rows))
     }
 }
 
 /// Copies of the same repository (same remote, or same main clone) form one group; groups largest first.
 func groupRepos(_ items: [(FoundRepo, RepoDetail)]) -> [RepoGroup] {
+    groupRows(items.map { f, d in
+        RepoRow(found: f, provisionalRemote: nil, state: d.state, idle: d.idle, idleIsFinal: true, size: d.size, artifacts: d.artifacts)
+    })
+}
+
+func groupRows(_ rows: [RepoRow]) -> [RepoGroup] {
     var groups: [String: (name: String, remote: String?, clones: [RepoClone])] = [:]
     var order: [String] = []
-    for (f, d) in items {
-        let clone = RepoClone(url: URL(fileURLWithPath: f.path, isDirectory: true), branch: d.state.branch,
-                              isLinkedWorktree: f.isLinkedWorktree, uncommittedCount: d.state.uncommitted,
-                              unpushedCount: d.state.unpushed, hasStash: d.state.hasStash, lastCommit: d.state.lastCommit,
-                              idleDays: d.idle, sizeBytes: d.size, artifactBytes: d.artifacts,
-                              ignoredFileCount: d.state.ignored, untrustedConfigKeys: d.state.untrustedKeys,
-                              hiddenFromStatusCount: d.state.hidden)
+    let now = Date()
+    for row in rows {
+        let f = row.found
+        let clone = row.clone(now: now)
+        let remote = row.state != nil ? row.state?.remote : row.provisionalRemote
         let key: String, name: String
-        if let remote = d.state.remote {
+        if let remote {
             key = remote.lowercased()
             name = RemoteURL.displayName(remote)
         } else {
@@ -368,7 +567,7 @@ func groupRepos(_ items: [(FoundRepo, RepoDetail)]) -> [RepoGroup] {
             key = main
             name = (main as NSString).lastPathComponent
         }
-        if groups[key] == nil { groups[key] = (name, d.state.remote, []); order.append(key) }
+        if groups[key] == nil { groups[key] = (name, remote, []); order.append(key) }
         groups[key]!.clones.append(clone)
     }
     let result = order.map { key -> RepoGroup in
@@ -376,6 +575,113 @@ func groupRepos(_ items: [(FoundRepo, RepoDetail)]) -> [RepoGroup] {
         return RepoGroup(id: key, name: g.name, remote: g.remote, clones: g.clones.sorted { $0.sizeBytes > $1.sizeBytes })
     }
     return result.sorted { $0.totalBytes > $1.totalBytes }
+}
+
+// MARK: - Helpers of the scan
+
+struct ArtifactPlan: Sendable {
+    /// Each working copy's own build folders.
+    var own: [String: [ArtifactCandidate]]
+    var lookup: ArtifactSizeLookup
+}
+
+final class FinishFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = false
+    func set() { lock.lock(); value = true; lock.unlock() }
+    var isSet: Bool { lock.lock(); defer { lock.unlock() }; return value }
+}
+
+/// Collects fresh size measurements and writes them to the cache in a few batches (and when the scan ends,
+/// however it ends), so a scan that is stopped halfway still keeps what it measured.
+final class SizeStash: @unchecked Sendable {
+    private let lock = NSLock()
+    private let engine: LiveEngine
+    private let cloneBefore: [String: (FileStamp, FileStamp)]
+    private var clones: [String: Int64] = [:]
+    private var artifacts: [String: Int64] = [:]
+    private var artifactStamps: [String: (FileStamp, FileStamp)] = [:]
+    private var pending = 0
+    init(engine: LiveEngine, cloneBefore: [String: (FileStamp, FileStamp)]) {
+        self.engine = engine; self.cloneBefore = cloneBefore
+    }
+
+    func add(clone path: String, size: Int64) {
+        lock.lock(); clones[path] = size; pending += 1; let due = pending >= 25; lock.unlock()
+        if due { flush() }
+    }
+
+    func add(artifact path: String, size: Int64, stamps: (FileStamp, FileStamp)?) {
+        lock.lock()
+        artifacts[path] = size
+        if let stamps { artifactStamps[path] = stamps }
+        pending += 1
+        let due = pending >= 25
+        lock.unlock()
+        if due { flush() }
+    }
+
+    func flush() {
+        lock.lock()
+        let (c, a, s) = (clones, artifacts, artifactStamps)
+        clones = [:]; artifacts = [:]; artifactStamps = [:]; pending = 0
+        lock.unlock()
+        if !c.isEmpty { engine.storeCloneSizes(c, before: cloneBefore) }
+        if !a.isEmpty { engine.storeArtifactSizes(a, stamps: s) }
+    }
+}
+
+extension LiveEngine {
+    /// Bytes in a working copy's own build folders: remembered sizes where they are still valid, `du` for the rest.
+    func artifactBytes(of candidates: [ArtifactCandidate], lookup: ArtifactSizeLookup?, stash: SizeStash) async -> Int64 {
+        var total: Int64 = 0
+        var misses: [ArtifactCandidate] = []
+        for c in candidates {
+            if let size = lookup?.sizes[c.path] { total += size } else { misses.append(c) }
+        }
+        if misses.isEmpty { return total }
+        let measured = await Self.measure(misses.map(\.path))
+        for c in misses {
+            guard let size = measured[c.path] else { continue }
+            total += size
+            stash.add(artifact: c.path, size: size, stamps: lookup?.stamps[c.path])
+        }
+        return total
+    }
+}
+
+extension RepoInspector {
+    /// The normalized remote a working copy is probably grouped under, read from its configuration files as plain
+    /// text and without running anything. ONLY for putting a placeholder row into a group before git has been
+    /// asked: the real answer comes from the audited configuration and replaces it.
+    static func provisionalRemote(path: String) -> String? {
+        guard let layout = GitLayout.of(workTree: path) else { return nil }
+        var remotes: [(name: String, url: String)] = []
+        for file in layout.configFiles {
+            var st = stat()
+            guard lstat(file, &st) == 0, (st.st_mode & S_IFMT) == S_IFREG, st.st_size <= 1_000_000,
+                  let data = FileManager.default.contents(atPath: file) else { continue }
+            var current: String?
+            for raw in String(decoding: data, as: UTF8.self).split(whereSeparator: \.isNewline) {
+                let line = raw.trimmingCharacters(in: .whitespaces)
+                if line.hasPrefix("[") {
+                    current = nil
+                    let lower = line.lowercased()
+                    guard lower.hasPrefix("[remote \""), let close = line.lastIndex(of: "\""), close > line.startIndex else { continue }
+                    let nameStart = line.index(line.startIndex, offsetBy: "[remote \"".count)
+                    if nameStart <= close { current = String(line[nameStart..<close]) }
+                } else if let name = current, let eq = line.firstIndex(of: "=") {
+                    guard line[line.startIndex..<eq].trimmingCharacters(in: .whitespaces).lowercased() == "url" else { continue }
+                    var value = line[line.index(after: eq)...].trimmingCharacters(in: .whitespaces)
+                    if value.count >= 2, value.hasPrefix("\""), value.hasSuffix("\"") { value = String(value.dropFirst().dropLast()) }
+                    if !remotes.contains(where: { $0.name == name }) { remotes.append((name, value)) }
+                }
+            }
+        }
+        let network = remotes.filter { isPlainRemoteName($0.name) && RemoteURL.normalize($0.url) != nil }
+        guard let chosen = network.first(where: { $0.name == "origin" }) ?? network.first else { return nil }
+        return RemoteURL.normalize(chosen.url)
+    }
 }
 
 // MARK: - Engine
@@ -388,45 +694,173 @@ extension LiveEngine {
     public func scanRepos(root: URL, progress: @escaping ProgressHandler,
                           partial: @escaping RepoScanHandler) async -> [RepoGroup] {
         let rootPath = realPath(root.path) ?? root.path
-        let env = self.env
-        guard let snapshot = await walkSnapshot(root: rootPath, progress: progress), !Task.isCancelled else { return [] }
-        let found = snapshot.repos
-        progress("Inspecting \(found.count) repositories…")
-
-        // A repository's own build folders are the candidates whose nearest enclosing working copy it is, which
-        // leaves out those of nested clones, submodules and worktrees (as before, when each was walked alone).
-        var ownCandidates: [String: [ArtifactCandidate]] = [:]
-        let foundPaths = Set(found.map(\.path))
-        for c in snapshot.candidates { if let r = c.repoRoot, foundPaths.contains(r) { ownCandidates[r, default: []].append(c) } }
-        let own = ownCandidates
-
-        let collector = RepoCollector()
-        let total = found.count
-        let inspected: [(FoundRepo, RepoDetail?)] = await PoliteScan.$enabled.withValue(true) {
-            let artifactSizes = await self.measureArtifacts(own.values.flatMap { $0 }, progress: progress)
-            progress("Measuring \(found.count) working copies…")
-            let cloneSizes = await self.measureClones(found.map(\.path))
-            // Biggest first: the list a front end shows while the scan runs fills with what matters most. Every
-            // copy is still inspected from scratch, nothing is skipped or remembered (see the README).
-            let ordered = found.sorted { (cloneSizes[$0.path] ?? 0) > (cloneSizes[$1.path] ?? 0) }
-            let details = await boundedMap(ordered, limit: 3) { f -> RepoDetail? in
-                if Task.isCancelled { return nil }
-                async let state = RepoInspector.inspect(path: f.path, isLinkedWorktree: f.isLinkedWorktree, env: env)
-                let cands = own[f.path] ?? []
-                let artifactBytes = cands.reduce(Int64(0)) { $0 + (artifactSizes[$1.path] ?? 0) }
-                let activity = await self.projectActivity([(path: f.path, skipping: Set(cands.map(\.path)))])
-                let touched = activity[f.path] ?? Date().timeIntervalSince1970
-                let st = await state
-                let newest = max(touched, st.lastCommit?.timeIntervalSince1970 ?? 0)
-                let idle = max(0, Int((Date().timeIntervalSince1970 - newest) / 86400))
-                let detail = RepoDetail(state: st, size: cloneSizes[f.path] ?? 0, artifacts: artifactBytes, idle: idle)
-                if !Task.isCancelled { partial(collector.add(f, detail, total: total)) }
-                return detail
-            }
-            return Array(zip(ordered, details))
+        let tScan = ScanTimings.now
+        // The walk reports the working copies as soon as it has found them, long before the build folders are
+        // checked against git: the rows appear then, and everything else fills in.
+        let (stream, cont) = AsyncStream.makeStream(of: [FoundRepo].self)
+        let walkTask = Task { () -> WalkSnapshot? in
+            let snapshot = await self.walkSnapshot(root: rootPath, progress: progress, onRepos: { cont.yield($0) })
+            cont.finish()
+            return snapshot
         }
+        return await withTaskCancellationHandler {
+            var first: [FoundRepo]?
+            for await repos in stream { first = repos; break }
+            guard let found = first, !Task.isCancelled else { walkTask.cancel(); return [] }
+            ScanTimings.log("walk (repos known)", since: tScan, "(\(found.count) clones)")
+            return await self.runRepoScan(found: found, walk: walkTask, progress: progress, partial: partial, started: tScan)
+        } onCancel: {
+            walkTask.cancel()
+            cont.finish()
+        }
+    }
+
+    /// How many repositories are inspected at once, and how many git processes may run at once. Tuned by measurement
+    /// (see the timings); a machine that is already busy gets the old, modest number.
+    static func gitJobs() -> Int {
+        if let v = ProcessInfo.processInfo.environment["MAC_CLEANER_GIT_JOBS"], let n = Int(v), (1...16).contains(n) { return n }
+        let cores = ProcessInfo.processInfo.activeProcessorCount
+        return isBusy() ? 4 : max(4, min(8, cores - 2))
+    }
+
+    /// The one-minute load average is well above the number of cores: other work is already competing for the machine.
+    static func isBusy() -> Bool {
+        var load = [Double](repeating: 0, count: 1)
+        return getloadavg(&load, 1) == 1 && load[0] > Double(ProcessInfo.processInfo.activeProcessorCount) * 1.5
+    }
+
+    /// How many folders are measured at once. Sizing is mostly disk work; a few at a time is all it takes.
+    static func sizeJobs() -> Int {
+        if let v = ProcessInfo.processInfo.environment["MAC_CLEANER_SIZE_JOBS"], let n = Int(v), (1...8).contains(n) { return n }
+        return isBusy() ? 2 : 4
+    }
+
+    private func runRepoScan(found: [FoundRepo], walk: Task<WalkSnapshot?, Never>, progress: @escaping ProgressHandler,
+                             partial: @escaping RepoScanHandler, started tScan: Double) async -> [RepoGroup] {
+        let env = self.env
+        let total = found.count
+        progress("Inspecting \(total) repositories…")
+        let board = RepoBoard(found, provisionalRemotes: found.map { RepoInspector.provisionalRemote(path: $0.path) })
+
+        // Sizes remembered from an earlier scan show at once (they are for display only; see ScanCache).
+        let cloneLookup = lookupCloneSizes(found.map(\.path))
+        for (path, size) in cloneLookup.sizes { board.update(path) { $0.size = size } }
+        // The repositories that exist more than once come first: those are the ones a decision is needed about.
+        var perGroup: [String: Int] = [:]
+        for r in board.snapshotRows() { perGroup[r.provisionalRemote?.lowercased() ?? r.found.mainPath ?? r.found.path, default: 0] += 1 }
+        let ordered = board.snapshotRows().sorted { a, b in
+            let am = perGroup[a.provisionalRemote?.lowercased() ?? a.found.mainPath ?? a.found.path, default: 0] > 1
+            let bm = perGroup[b.provisionalRemote?.lowercased() ?? b.found.mainPath ?? b.found.path, default: 0] > 1
+            if am != bm { return am }
+            return (a.size ?? 0) != (b.size ?? 0) ? (a.size ?? 0) > (b.size ?? 0) : a.found.path < b.found.path
+        }.map(\.found)
+
+        partial(board.progress())
+        ScanTimings.log("first rows emitted", since: tScan)
+
+        // The build folders of each clone come from the walk's second half; the git and size work does not wait for it.
+        let plan = Task { () -> ArtifactPlan? in
+            guard let snapshot = await walk.value else { return nil }
+            var own: [String: [ArtifactCandidate]] = [:]
+            let paths = Set(found.map(\.path))
+            for c in snapshot.candidates { if let r = c.repoRoot, paths.contains(r) { own[r, default: []].append(c) } }
+            let all = own.values.flatMap { $0 }
+            return ArtifactPlan(own: own, lookup: self.lookupArtifactSizes(all))
+        }
+
+        let jobs = Self.gitJobs()
+        let gitLimiter = AsyncSemaphore(jobs)
+        let sizeJobs = Self.sizeJobs()
+        let diskLimiter = AsyncSemaphore(sizeJobs)
+        let finished = FinishFlag()
+        let stash = SizeStash(engine: self, cloneBefore: cloneLookup.before)
+
+        await withTaskGroup(of: Void.self) { group in
+            // Stage 1: git (branch, changes, unpushed, stash, last commit). Never waits for a size.
+            group.addTask {
+                let t0 = ScanTimings.now
+                await PoliteScan.$enabled.withValue(true) {
+                    await PoliteScan.$override.withValue(gitLimiter) {
+                        _ = await boundedMap(ordered, limit: jobs) { f -> Void in
+                            if Task.isCancelled { return }
+                            let state = await RepoInspector.inspect(path: f.path, isLinkedWorktree: f.isLinkedWorktree, env: env)
+                            if Task.isCancelled { return }
+                            board.update(f.path) { $0.state = state }
+                            progress("Inspected \(board.statesDone) of \(total) repositories · measured \(board.sizesDone)")
+                        }
+                    }
+                }
+                ScanTimings.log("git stage (\(jobs) at a time)", since: t0)
+            }
+            // Stage 2: sizes, a few folders at a time.
+            group.addTask {
+                let t0 = ScanTimings.now
+                await PoliteScan.$enabled.withValue(true) {
+                    await PoliteScan.$override.withValue(diskLimiter) {
+                        _ = await boundedMap(ordered, limit: sizeJobs) { f -> Void in
+                            if Task.isCancelled { return }
+                            let loaded = await plan.value
+                            if Task.isCancelled { return }
+                            var size = board.row(f.path)?.size
+                            if size == nil {
+                                let m = await Self.measure([f.path])
+                                if Task.isCancelled { return }
+                                size = m[f.path] ?? 0
+                                if m[f.path] != nil { stash.add(clone: f.path, size: m[f.path]!) }
+                            }
+                            let artifactBytes = await self.artifactBytes(of: loaded?.own[f.path] ?? [], lookup: loaded?.lookup, stash: stash)
+                            if Task.isCancelled { return }
+                            board.update(f.path) { $0.size = size; $0.artifacts = artifactBytes }
+                            progress("Inspected \(board.statesDone) of \(total) repositories · measured \(board.sizesDone)")
+                        }
+                    }
+                }
+                stash.flush()
+                ScanTimings.log("size stage", since: t0)
+            }
+            // Stage 3: when something in the working copy was last touched.
+            group.addTask {
+                let t0 = ScanTimings.now
+                _ = await PoliteScan.$enabled.withValue(true) {
+                    await boundedMap(ordered, limit: 3) { f -> Void in
+                        if Task.isCancelled { return }
+                        let cands = (await plan.value)?.own[f.path] ?? []
+                        if Task.isCancelled { return }
+                        let activity = await self.projectActivity([(path: f.path, skipping: Set(cands.map(\.path)))])
+                        if Task.isCancelled { return }
+                        let touched = activity[f.path] ?? Date().timeIntervalSince1970
+                        board.update(f.path) { $0.idle = Int(max(0, Date().timeIntervalSince1970 - touched) / 86400) }
+                    }
+                }
+                ScanTimings.log("activity stage", since: t0)
+            }
+            // Hands the rows to the front end at most ten times a second, and only when something changed.
+            group.addTask {
+                while !finished.isSet && !Task.isCancelled {
+                    try? await Task.sleep(nanoseconds: 100_000_000)
+                    if board.takeDirty(), !Task.isCancelled { partial(board.progress()) }
+                }
+            }
+            // The first three are the work; the ticker stops when they are done.
+            var remaining = 3
+            while remaining > 0, await group.next() != nil {
+                remaining -= 1
+                if remaining == 0 { finished.set() }
+            }
+        }
+        plan.cancel()
         if Task.isCancelled { return [] }
-        return groupRepos(inspected.compactMap { f, d in d.map { (f, $0) } })
+        partial(board.progress())     // the finished state, for a front end that only looks at the stream
+        let rows = board.snapshotRows()
+        let now = Date()
+        let result = groupRows(rows.map { row in
+            var r = row
+            r.idle = row.idleDays(now: now); r.idleIsFinal = true
+            r.size = r.size ?? 0; r.artifacts = r.artifacts ?? 0
+            return r
+        })
+        ScanTimings.log("scanRepos total", since: tScan)
+        return result
     }
 
     public func removeClones(_ clones: [RepoClone], force: Bool, mode: DeleteMode,

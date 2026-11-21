@@ -17,6 +17,17 @@ All notable changes to this project are documented here. The format is based on
 - Engine API (additive): `CleanItemEvent`, `CleanItemState` and `CleanItemReason` (typed reasons instead of message text), `CleanerEngine.clean(...itemEvents:)` and `delete(...itemEvents:)` (one event per item when it is queued, starts and ends; never per file), `CleanResult.items`, `DeleteProgress.phase` (`removing` or `command(name)`) and `displayFraction`. The mock engine emits the same events. `--json` output is unchanged.
 - CLI on a terminal: the progress line shows the amount of the total, the time left, and what a running command is, and a clean ends with a list of the items that failed or were skipped and why. Piped output keeps its shape.
 
+### Changed
+
+- **The Repos scan is much faster and its rows appear at once.** The list shows every working copy as soon as the folder walk has found it (grouped by repository, with remembered sizes where they are still valid and "checking…" / "measuring…" in place of the rest), and the branch, changes, unpushed commits, stash and last commit fill in as git answers, before any size is measured. Sizes are measured at the same time, a few folders at a time, in parallel with git, instead of before it. Copies that exist more than once come first. On a 119-clone home folder under heavy load the complete scan went from 160 s to about 65 s with nothing remembered, and from 40 s to 15 s with sizes remembered; the first rows show after about 2 s.
+- Fewer git processes per working copy: one `git status --porcelain=v2 --branch` gives the branch and the changes together, the stash is read from the ref files, and the second pass for ignored files is skipped when nothing could ignore a file (no `.gitignore`, no `info/exclude`, no global ignore file). Up to 8 git processes run at once (4 when the machine is busy), at low priority. Anything unclear still counts as "not backed up".
+- A copy cannot be selected, allowed or removed while its row is a placeholder; nothing about git state is remembered between scans, and every removal still re-inspects the copy right before acting.
+- Quitting the app while an update is being swapped in now waits (up to 3 minutes) for the swap and its checks to finish, instead of ending the process half way.
+
+### Added (diagnostics)
+
+- `mac-cleaner repos --timings` (hidden) or `MAC_CLEANER_TIMINGS=1` prints how long each phase of the scan took to stderr. `MAC_CLEANER_GIT_JOBS` and `MAC_CLEANER_SIZE_JOBS` override the concurrency for measuring.
+
 ### Fixed
 
 - The clock, bar and path in the cleaning overlay no longer freeze during a long command, one huge file or a move to the Trash; the clock is driven by a timer of its own.

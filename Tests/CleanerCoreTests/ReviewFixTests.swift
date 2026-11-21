@@ -338,6 +338,9 @@ final class ReviewFixTests: EngineTestCase {
         var s = await RepoInspector.inspect(path: f.path("code/app"), isLinkedWorktree: false, env: f.env)
         XCTAssertFalse(s.hasStash)
         XCTAssertNil(RepoInspector.risk(s, isLinkedWorktree: false))
+        // The stash is read from the ref files; only storage that cannot be read that way (reftable) is asked of git.
+        try FileManager.default.createDirectory(atPath: f.path("code/app/.git/reftable"), withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: f.path("code/app/.git/reftable")) }
         for action in ["exit 1", "exit 128", "echo garbage; exit 0", "exec /bin/sleep 30"] {
             var env = f.env
             env.gitExecutable = try fakeGit(f, when: "for-each-ref", do: action)

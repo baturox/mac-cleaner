@@ -109,98 +109,130 @@ struct MeasurementCache: Sendable {
 
 // MARK: - Using the cache from the scans
 
+struct ArtifactSizeLookup: Sendable {
+    var sizes: [String: Int64] = [:]
+    var misses: [ArtifactCandidate] = []
+    var stamps: [String: (FileStamp, FileStamp)] = [:]
+    var distinct = 0
+}
+
 extension LiveEngine {
     var measurementCache: MeasurementCache { MeasurementCache(directory: env.historyDir) }
 
-    /// Sizes of build folders: remembered ones when the folder and its project are unchanged and the entry is
-    /// young enough, `du` for the rest.
-    func measureArtifacts(_ candidates: [ArtifactCandidate], now: Date = Date(),
-                          progress: @escaping ProgressHandler) async -> [String: Int64] {
-        let cache = measurementCache
-        let stored = Dictionary(cache.load().artifacts.map { ($0.path, $0) }, uniquingKeysWith: { a, _ in a })
-        var sizes: [String: Int64] = [:]
-        var misses: [ArtifactCandidate] = []
+    /// What the cache knows about these build folders, and which have to be measured (with the stamps taken now,
+    /// before measuring: a folder that changes meanwhile does not match next time).
+    func lookupArtifactSizes(_ candidates: [ArtifactCandidate], now: Date = Date()) -> ArtifactSizeLookup {
+        let stored = Dictionary(measurementCache.load().artifacts.map { ($0.path, $0) }, uniquingKeysWith: { a, _ in a })
+        var out = ArtifactSizeLookup()
         var seen = Set<String>()
         for c in candidates where seen.insert(c.path).inserted {
             if let e = stored[c.path], now.timeIntervalSince1970 - e.measuredAt < MeasurementCache.sizeLifetime,
                e.measuredAt <= now.timeIntervalSince1970 + 60,
                FileStamp.of(c.path) == e.folder, FileStamp.of(c.project) == e.project {
-                sizes[c.path] = e.sizeBytes
+                out.sizes[c.path] = e.sizeBytes
             } else {
-                misses.append(c)
+                out.misses.append(c)
+                if let f = FileStamp.of(c.path), let p = FileStamp.of(c.project) { out.stamps[c.path] = (f, p) }
             }
         }
-        if misses.isEmpty { return sizes }
-        progress("Measuring \(misses.count) of \(seen.count) build folders…")
-        // Stamps are taken before measuring: a folder that changes meanwhile does not match next time.
-        var stamps: [String: (FileStamp, FileStamp)] = [:]
-        for c in misses { if let f = FileStamp.of(c.path), let p = FileStamp.of(c.project) { stamps[c.path] = (f, p) } }
-        let measured = await Self.measure(misses.map(\.path))
-        if Task.isCancelled { return sizes }
+        out.distinct = seen.count
+        return out
+    }
+
+    func storeArtifactSizes(_ measured: [String: Int64], stamps: [String: (FileStamp, FileStamp)], now: Date = Date()) {
         var fresh = ScanCacheFile()
-        for c in misses {
-            guard let size = measured[c.path] else { continue }
-            sizes[c.path] = size
-            if let (f, p) = stamps[c.path] {
-                fresh.artifacts.append(ArtifactMeasurement(path: c.path, sizeBytes: size, folder: f, project: p,
+        for (path, size) in measured {
+            if let (f, p) = stamps[path] {
+                fresh.artifacts.append(ArtifactMeasurement(path: path, sizeBytes: size, folder: f, project: p,
                                                            measuredAt: now.timeIntervalSince1970))
             }
         }
-        if !fresh.artifacts.isEmpty { cache.save(fresh) }
+        if !fresh.artifacts.isEmpty { measurementCache.save(fresh) }
+    }
+
+    /// Sizes of build folders: remembered ones when the folder and its project are unchanged and the entry is
+    /// young enough, `du` for the rest.
+    func measureArtifacts(_ candidates: [ArtifactCandidate], now: Date = Date(),
+                          progress: @escaping ProgressHandler) async -> [String: Int64] {
+        let lookup = lookupArtifactSizes(candidates, now: now)
+        var sizes = lookup.sizes
+        if lookup.misses.isEmpty { return sizes }
+        progress("Measuring \(lookup.misses.count) of \(lookup.distinct) build folders…")
+        let measured = await Self.measure(lookup.misses.map(\.path))
+        if Task.isCancelled { return sizes }
+        sizes.merge(measured) { a, _ in a }
+        storeArtifactSizes(measured, stamps: lookup.stamps, now: now)
         return sizes
+    }
+
+    /// The two stamps a remembered working copy size is keyed on: the working copy folder and the folder git keeps
+    /// its index and HEAD in (`.git` itself, or for a linked worktree the folder its `.git` file names). That text
+    /// only picks a folder to lstat for the cache key; nothing is read from or run in it.
+    static func cloneStamps(_ path: String) -> (FileStamp, FileStamp)? {
+        let dotGit = path + "/.git"
+        var st = stat()
+        guard lstat(dotGit, &st) == 0, let f = FileStamp.of(path) else { return nil }
+        var gitDir = dotGit
+        if (st.st_mode & S_IFMT) == S_IFREG {
+            guard st.st_size < 4096, let data = FileManager.default.contents(atPath: dotGit),
+                  let text = String(data: data, encoding: .utf8), text.hasPrefix("gitdir: ") else { return nil }
+            let target = text.dropFirst("gitdir: ".count).trimmingCharacters(in: .newlines)
+            gitDir = target.hasPrefix("/") ? target : path + "/" + target
+        } else if (st.st_mode & S_IFMT) != S_IFDIR {
+            return nil
+        }
+        guard lstat(gitDir, &st) == 0, (st.st_mode & S_IFMT) == S_IFDIR, let g = FileStamp.of(gitDir) else { return nil }
+        return (f, g)
+    }
+
+    /// What the cache already knows about these working copies, and what has to be measured. `before` holds the
+    /// stamps taken now (before any measuring): a folder that changes meanwhile does not match next time.
+    struct CloneSizeLookup: Sendable {
+        var sizes: [String: Int64] = [:]
+        var misses: [String] = []
+        var before: [String: (FileStamp, FileStamp)] = [:]
+    }
+
+    func lookupCloneSizes(_ paths: [String], now: Date = Date()) -> CloneSizeLookup {
+        let stored = Dictionary((measurementCache.load().clones ?? []).map { ($0.path, $0) }, uniquingKeysWith: { a, _ in a })
+        let t = now.timeIntervalSince1970
+        var out = CloneSizeLookup()
+        for path in Set(paths) {
+            let current = Self.cloneStamps(path)
+            if let e = stored[path], let current, t - e.measuredAt < MeasurementCache.cloneSizeLifetime, e.measuredAt <= t + 60,
+               current.0 == e.folder, current.1 == e.project {
+                out.sizes[path] = e.sizeBytes
+            } else {
+                out.misses.append(path)
+                if let current { out.before[path] = current }
+            }
+        }
+        return out
+    }
+
+    /// Remembers measured sizes (only for paths whose stamps were taken before measuring).
+    func storeCloneSizes(_ measured: [String: Int64], before: [String: (FileStamp, FileStamp)], now: Date = Date()) {
+        var fresh = ScanCacheFile()
+        for (path, size) in measured {
+            if let (f, g) = before[path] {
+                fresh.clones = (fresh.clones ?? []) + [ArtifactMeasurement(path: path, sizeBytes: size, folder: f, project: g,
+                                                                          measuredAt: now.timeIntervalSince1970)]
+            }
+        }
+        if fresh.clones != nil { measurementCache.save(fresh) }
     }
 
     /// Total sizes of working copies, for display on the Repos screen: remembered for up to a day while the
     /// working copy folder and its `.git` folder are unchanged (git rewrites files in `.git` whenever the
     /// index or HEAD changes), `du` for the rest.
     func measureClones(_ paths: [String], now: Date = Date()) async -> [String: Int64] {
-        let cache = measurementCache
-        let stored = Dictionary((cache.load().clones ?? []).map { ($0.path, $0) }, uniquingKeysWith: { a, _ in a })
-        let t = now.timeIntervalSince1970
-        // The second stamp is the folder git keeps this working copy's index and HEAD in: `.git` itself, or for
-        // a linked worktree the folder its `.git` file names. That text only picks a folder to lstat for the
-        // cache key; nothing is read from or run in it.
-        func stamps(_ path: String) -> (FileStamp, FileStamp)? {
-            let dotGit = path + "/.git"
-            var st = stat()
-            guard lstat(dotGit, &st) == 0, let f = FileStamp.of(path) else { return nil }
-            var gitDir = dotGit
-            if (st.st_mode & S_IFMT) == S_IFREG {
-                guard st.st_size < 4096, let data = FileManager.default.contents(atPath: dotGit),
-                      let text = String(data: data, encoding: .utf8), text.hasPrefix("gitdir: ") else { return nil }
-                let target = text.dropFirst("gitdir: ".count).trimmingCharacters(in: .newlines)
-                gitDir = target.hasPrefix("/") ? target : path + "/" + target
-            } else if (st.st_mode & S_IFMT) != S_IFDIR {
-                return nil
-            }
-            guard lstat(gitDir, &st) == 0, (st.st_mode & S_IFMT) == S_IFDIR, let g = FileStamp.of(gitDir) else { return nil }
-            return (f, g)
-        }
-        var sizes: [String: Int64] = [:]
-        var misses: [String] = []
-        var before: [String: (FileStamp, FileStamp)] = [:]
-        for path in Set(paths) {
-            let now2 = stamps(path)
-            if let e = stored[path], let now2, t - e.measuredAt < MeasurementCache.cloneSizeLifetime, e.measuredAt <= t + 60,
-               now2.0 == e.folder, now2.1 == e.project {
-                sizes[path] = e.sizeBytes
-            } else {
-                misses.append(path)
-                if let now2 { before[path] = now2 }
-            }
-        }
-        if misses.isEmpty { return sizes }
-        let measured = await Self.measure(misses)
+        let lookup = lookupCloneSizes(paths, now: now)
+        var sizes = lookup.sizes
+        if lookup.misses.isEmpty { return sizes }
+        let measured = await Self.measure(lookup.misses)
         if Task.isCancelled { return sizes }
-        var fresh = ScanCacheFile()
-        for path in misses {
-            guard let size = measured[path] else { continue }
-            sizes[path] = size
-            if let (f, g) = before[path] {
-                fresh.clones = (fresh.clones ?? []) + [ArtifactMeasurement(path: path, sizeBytes: size, folder: f, project: g, measuredAt: t)]
-            }
-        }
-        if fresh.clones != nil { cache.save(fresh) }
+        sizes.merge(measured) { a, _ in a }
+        storeCloneSizes(measured, before: lookup.before, now: now)
         return sizes
     }
 

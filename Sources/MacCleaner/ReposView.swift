@@ -181,7 +181,8 @@ struct ReposView: View {
                     .controlSize(.small)
                     .help("Select the fully backed-up copies, keeping the most recently used one")
             }
-            Text(Fmt.bytes(g.totalBytes)).font(.subheadline.weight(.medium)).monospacedDigit()
+            Text(g.clones.contains { $0.sizePending } ? "≥ \(Fmt.bytes(g.totalBytes))" : Fmt.bytes(g.totalBytes))
+                .font(.subheadline.weight(.medium)).monospacedDigit()
         }
         .padding(.vertical, 4).padding(.horizontal, multi ? 8 : 0)
         .background(multi ? Color.orange.opacity(0.10) : .clear, in: RoundedRectangle(cornerRadius: 6))
@@ -205,7 +206,7 @@ struct ReposView: View {
                 }
                 .lineLimit(1).truncationMode(.middle)
                 HStack(spacing: 5) {
-                    if c.wasInspected { Chip(text: c.branch ?? "detached", tone: .neutral, symbol: "arrow.triangle.branch") }
+                    if c.wasInspected && !c.inspectionPending { Chip(text: c.branch ?? "detached", tone: .neutral, symbol: "arrow.triangle.branch") }
                     if c.isLinkedWorktree { Chip(text: "worktree", tone: .info, symbol: "square.stack.3d.up") }
                     statusChips(c)
                 }
@@ -213,7 +214,9 @@ struct ReposView: View {
             .accessibilityElement(children: .combine)
             .accessibilityLabel(summary(c))
             Spacer(minLength: 8)
-            if !c.wasInspected {
+            if c.inspectionPending {
+                EmptyView()
+            } else if !c.wasInspected {
                 Text("Not removable here")
                     .font(.caption).foregroundStyle(.secondary)
                     .help("Its git configuration could run programs (\((c.untrustedConfigKeys ?? []).joined(separator: ", "))), so Mac Cleaner did not run git in it and cannot tell what it holds. Review the folder and delete it yourself if you want it gone.")
@@ -227,11 +230,17 @@ struct ReposView: View {
                                                     : "This copy holds work that exists nowhere else. Turn on to be able to select it.")
             }
             VStack(alignment: .trailing, spacing: 2) {
-                Text(Fmt.bytes(c.sizeBytes)).font(.body.weight(.medium)).monospacedDigit()
+                if c.sizePending && c.sizeBytes == 0 {
+                    Text("measuring…").font(.body).foregroundStyle(.secondary)
+                } else {
+                    Text(Fmt.bytes(c.sizeBytes)).font(.body.weight(.medium)).monospacedDigit()
+                        .foregroundStyle(c.sizePending ? .secondary : .primary)
+                }
                 if c.artifactBytes > 0 {
                     Text("\(Fmt.bytes(c.artifactBytes)) rebuildable").font(.caption).foregroundStyle(.secondary).monospacedDigit()
                 }
-                Text(c.wasInspected ? "commit \(Fmt.ago(c.lastCommit)) · idle \(Fmt.idle(c.idleDays))" : "idle \(Fmt.idle(c.idleDays))")
+                Text(c.inspectionPending ? "checking…"
+                     : c.wasInspected ? "commit \(Fmt.ago(c.lastCommit)) · idle \(Fmt.idle(c.idleDays))" : "idle \(Fmt.idle(c.idleDays))")
                     .font(.caption).foregroundStyle(.secondary).monospacedDigit()
             }
             .frame(minWidth: 130, alignment: .trailing)
@@ -247,7 +256,9 @@ struct ReposView: View {
     }
 
     @ViewBuilder private func statusChips(_ c: RepoClone) -> some View {
-        if !c.wasInspected {
+        if c.inspectionPending {
+            Chip(text: "checking git state…", tone: .neutral, symbol: "hourglass")
+        } else if !c.wasInspected {
             Chip(text: "untrusted git config — not inspected", tone: .bad, symbol: "exclamationmark.shield.fill")
         } else if c.isFullyBackedUp {
             Chip(text: c.unpushedCount == 0 ? "clean & pushed" : "clean", tone: .good, symbol: "checkmark.circle.fill")
@@ -274,9 +285,11 @@ struct ReposView: View {
 
     private func summary(_ c: RepoClone) -> String {
         var parts = [c.url.lastPathComponent]
-        if c.wasInspected { parts.append(c.branch ?? "detached head") }
+        if c.wasInspected && !c.inspectionPending { parts.append(c.branch ?? "detached head") }
         if c.isLinkedWorktree { parts.append("linked worktree") }
-        if !c.wasInspected {
+        if c.inspectionPending {
+            parts.append("git state is still being checked")
+        } else if !c.wasInspected {
             parts.append("untrusted git configuration, not inspected")
         } else if c.isFullyBackedUp {
             parts.append("clean and pushed")
@@ -288,7 +301,7 @@ struct ReposView: View {
             else if let n = c.unpushedCount, n > 0, !c.isLinkedWorktree { parts.append("\(n) unpushed commits") }
             if c.hasStash { parts.append("has stash") }
         }
-        parts.append(Fmt.bytes(c.sizeBytes))
+        parts.append(c.sizePending && c.sizeBytes == 0 ? "size is being measured" : Fmt.bytes(c.sizeBytes))
         return parts.joined(separator: ", ")
     }
 
