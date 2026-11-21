@@ -220,28 +220,50 @@ private struct EntryRow: View {
     }
 }
 
+/// What the running overlay shows. `now` comes from a one-second timeline, so the clock and the "time left" keep moving
+/// when no count changes (one huge file, a command, a Trash move).
 struct CleaningSheet: View {
     let progress: String
     let counts: DeleteProgress?
+    let items: CleanRunItems
+    let mode: DeleteMode
     let startedAt: Date
+    let now: Date
+    /// Seconds left as estimated at `estimateAt`; nil while unknown.
+    let timeLeft: TimeInterval?
+    let estimateAt: Date
+    let lastChange: Date
     let stopping: Bool
     var onStop: () -> Void
 
+    private var command: String? {
+        if case .command(let name)? = counts?.phase { return name }
+        return nil
+    }
+
     var body: some View {
-        VStack(spacing: 14) {
+        VStack(spacing: 12) {
             Text(stopping ? "Stopping…" : "Cleaning…").font(.headline)
             if let counts {
-                ProgressView(value: stopping ? nil : counts.fraction)
+                ProgressView(value: stopping ? nil : counts.displayFraction)
                     .progressViewStyle(.linear)
-                Text(Self.summary(counts, startedAt: startedAt))
+                Text(summary(counts))
                     .font(.callout).monospacedDigit().foregroundStyle(.secondary)
                     .lineLimit(1).minimumScaleFactor(0.8)
-                if let item = counts.currentItem {
-                    Text(item)
-                        .font(.caption).foregroundStyle(.tertiary)
-                        .lineLimit(1).truncationMode(.middle)
-                        .frame(maxWidth: .infinity)
+                    .frame(maxWidth: .infinity)
+                // One line of fixed height: the path (or the command) changes often and must not move what is below.
+                Group {
+                    if let command {
+                        Text("Running \(command) — this can take a few minutes")
+                    } else if let item = counts.currentItem {
+                        Text(item).truncationMode(.middle)
+                    } else {
+                        Text(" ")
+                    }
                 }
+                .font(.caption).foregroundStyle(command == nil ? .tertiary : .secondary)
+                .lineLimit(1)
+                .frame(maxWidth: .infinity, minHeight: 16)
             } else {
                 ProgressView().controlSize(.large)
                 Text(progress)
@@ -250,28 +272,128 @@ struct CleaningSheet: View {
                     .multilineTextAlignment(.center)
                     .frame(maxWidth: .infinity)
             }
-            Text(stopping ? "Finishing the entry it is on. What was already removed stays removed."
-                          : "Stopping keeps what was already removed.")
+            if !items.rows.isEmpty { ItemList(items: items) }
+            Text(footnote)
                 .font(.caption).foregroundStyle(.tertiary).multilineTextAlignment(.center)
+                .frame(maxWidth: .infinity, minHeight: 28, alignment: .top)
             Button("Stop", role: .cancel, action: onStop)
                 .keyboardShortcut(.cancelAction)
                 .disabled(stopping)
         }
-        .padding(28)
-        .frame(width: 440)
+        .padding(24)
+        .frame(width: 520)
         .interactiveDismissDisabled()
         .accessibilityElement(children: .contain)
     }
 
-    /// "3 of 8 items · 120,000 entries · 4.2 GB freed · 0:42" (elapsed time ticks on its own).
-    private static func summary(_ c: DeleteProgress, startedAt: Date) -> String {
-        let elapsed = max(0, Int(Date().timeIntervalSince(startedAt)))
-        let time = String(format: "%d:%02d", elapsed / 60, elapsed % 60)
-        var parts = ["\(c.itemsDone) of \(c.itemsTotal) item\(c.itemsTotal == 1 ? "" : "s")",
-                     "\(c.entriesRemoved.formatted()) entries", "\(Fmt.bytes(c.bytesFreed)) freed"]
-        if let total = c.expectedBytes, total > 0 { parts[2] += " of \(Fmt.bytes(total))" }
-        parts.append(time)
+    private var footnote: String {
+        if stopping {
+            return command != nil ? "Ending the command. What it already removed stays removed."
+                                  : "Finishing the entry it is on. What was already removed stays removed."
+        }
+        if command != nil { return "Stop ends the command; what it already removed stays removed." }
+        return "Stopping keeps what was already removed."
+    }
+
+    /// "12 of 40 items · 3.2 GB of 9.8 GB freed · 0:42 elapsed · about 1 min left"
+    private func summary(_ c: DeleteProgress) -> String {
+        let elapsed = max(0, Int(now.timeIntervalSince(startedAt)))
+        var parts = ["\(c.itemsDone) of \(c.itemsTotal) item\(c.itemsTotal == 1 ? "" : "s")"]
+        var size = Fmt.bytes(c.bytesFreed)
+        if let total = c.expectedBytes, total > 0 { size += " of \(Fmt.bytes(total))" }
+        parts.append(size + (mode == .trash ? " moved" : " freed"))
+        parts.append(Self.clock(elapsed) + " elapsed")
+        if let left = remaining() { parts.append(Self.timeLeft(left)) }
         return parts.joined(separator: " · ")
+    }
+
+    /// Hidden for a command, while warming up, and when nothing has moved for a while (the number would be a guess).
+    private func remaining() -> TimeInterval? {
+        guard !stopping, command == nil, let timeLeft, now.timeIntervalSince(lastChange) < 10 else { return nil }
+        return max(0, timeLeft - now.timeIntervalSince(estimateAt))
+    }
+
+    static func clock(_ seconds: Int) -> String {
+        seconds >= 3600 ? String(format: "%d:%02d:%02d", seconds / 3600, seconds % 3600 / 60, seconds % 60)
+                        : String(format: "%d:%02d", seconds / 60, seconds % 60)
+    }
+
+    static func timeLeft(_ s: TimeInterval) -> String {
+        if s < 10 { return "less than 10 s left" }
+        if s < 60 { return "about \(Int((s / 5).rounded()) * 5) s left" }
+        if s < 3600 { return "about \(Int((s / 60).rounded())) min left" }
+        return "about \(String(format: "%.1f", s / 3600)) h left"
+    }
+}
+
+/// The items of the run, each with a status icon; follows the item being worked on.
+private struct ItemList: View {
+    let items: CleanRunItems
+
+    var body: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(spacing: 0) {
+                    ForEach(items.rows) { row in
+                        ItemRow(item: row).equatable().id(row.id)
+                    }
+                }
+                .padding(.vertical, 4)
+            }
+            .frame(height: 176)
+            .background(.background.secondary, in: RoundedRectangle(cornerRadius: 8))
+            .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(.quaternary))
+            .onChange(of: items.activeID) { _, id in
+                guard let id else { return }
+                withAnimation(.easeOut(duration: 0.15)) { proxy.scrollTo(id, anchor: .center) }
+            }
+        }
+    }
+}
+
+struct ItemRow: View, Equatable {
+    let item: CleanItemEvent
+
+    var body: some View {
+        HStack(spacing: 8) {
+            StatusIcon(state: item.state, reason: item.reason).frame(width: 16, height: 16)
+            Text(item.name)
+                .font(.callout).lineLimit(1).truncationMode(.middle)
+                .foregroundStyle(item.state == .queued ? .secondary : .primary)
+            Spacer(minLength: 8)
+            if item.bytes > 0 {
+                Text(Fmt.bytes(item.bytes)).font(.caption).monospacedDigit().foregroundStyle(.secondary)
+            }
+        }
+        .padding(.horizontal, 10)
+        .frame(height: 22)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(item.name), \(StatusIcon.label(item.state))")
+    }
+}
+
+struct StatusIcon: View {
+    let state: CleanItemState
+    var reason: CleanItemReason?
+
+    var body: some View {
+        switch state {
+        case .queued: Image(systemName: "circle").foregroundStyle(.tertiary).font(.caption)
+        case .deleting: ProgressView().controlSize(.small).scaleEffect(0.6)
+        case .done: Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+        case .failed: Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+        case .skipped: Image(systemName: "minus.circle").foregroundStyle(.secondary)
+        }
+    }
+
+    static func label(_ state: CleanItemState) -> String {
+        switch state {
+        case .queued: "waiting"
+        case .deleting: "in progress"
+        case .done: "done"
+        case .failed: "failed"
+        case .skipped: "skipped"
+        }
     }
 }
 
@@ -282,7 +404,7 @@ struct ResultSheet: View {
 
     private var trash: Bool { summary.mode == .trash }
 
-    /// Lines that read like a failure get a warning icon; the engine only gives us free text.
+    /// Lines that read like a failure get a warning icon; the engine only gives us free text (used when it reports no items).
     private func isFailure(_ line: String) -> Bool {
         let l = line.lowercased()
         return ["fail", "refus", "could not", "couldn't", "cannot", "can't", "denied", "not permitted", "skipp", "error", "in use", "protected"]
@@ -294,23 +416,55 @@ struct ResultSheet: View {
         lines.filter(isFailure) + lines.filter { !isFailure($0) }
     }
 
+    private var hasItems: Bool { summary.plannedItems > 0 }
+
+    private var title: String {
+        let r = summary.result
+        if r.cancelled && hasItems {
+            return "Stopped — \(summary.removedCount) of \(summary.plannedItems) item\(summary.plannedItems == 1 ? "" : "s") \(trash ? "moved" : "removed")"
+        }
+        if r.cancelled { return "Stopped" }
+        if trash && r.freedBytes <= 0 { return "Moved to the Trash" }
+        return "Freed \(Fmt.bytes(r.freedBytes))"
+    }
+
+    private var subtitle: String {
+        let r = summary.result
+        if r.cancelled {
+            return trash ? "What was already moved stays in the Trash" : "\(Fmt.bytes(r.bytesRemoved)) removed; what was removed stays removed"
+        }
+        if trash && r.freedBytes <= 0 { return "Empty the Trash to free \(Fmt.bytes(summary.expectedBytes))" }
+        return "Change in free space on the volume"
+    }
+
+    private var problems: Bool {
+        let r = summary.result
+        return hasItems ? !(summary.failedItems.isEmpty && summary.skippedItems.isEmpty) : r.failedCount > 0
+    }
+
     var body: some View {
         let r = summary.result
         VStack(alignment: .leading, spacing: 14) {
             HStack(spacing: 12) {
-                Image(systemName: r.failedCount > 0 ? "exclamationmark.circle.fill" : "checkmark.circle.fill")
-                    .font(.largeTitle).foregroundStyle(r.failedCount > 0 ? Color.orange : Color.green)
+                Image(systemName: r.cancelled ? "stop.circle.fill" : (problems ? "exclamationmark.circle.fill" : "checkmark.circle.fill"))
+                    .font(.largeTitle).foregroundStyle(r.cancelled || problems ? Color.orange : Color.green)
                 VStack(alignment: .leading, spacing: 0) {
-                    if trash && r.freedBytes <= 0 {
-                        Text("Moved to the Trash").font(.title2.weight(.semibold))
-                        Text("Empty the Trash to free \(Fmt.bytes(summary.expectedBytes))").font(.caption).foregroundStyle(.secondary)
-                    } else {
-                        Text("Freed \(Fmt.bytes(r.freedBytes))").font(.title2.weight(.semibold)).monospacedDigit()
-                        Text("Change in free space on the volume").font(.caption).foregroundStyle(.secondary)
-                    }
+                    Text(title).font(.title2.weight(.semibold)).monospacedDigit()
+                    Text(subtitle).font(.caption).foregroundStyle(.secondary)
                 }
             }
-            if r.failedCount > 0 {
+            if hasItems {
+                HStack(spacing: 14) {
+                    Label("\(summary.doneItems.count) done", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
+                    if !summary.failedItems.isEmpty {
+                        Label("\(summary.failedItems.count) failed", systemImage: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+                    }
+                    if !summary.skippedItems.isEmpty {
+                        Label("\(summary.skippedItems.count) skipped", systemImage: "minus.circle").foregroundStyle(.secondary)
+                    }
+                }
+                .font(.callout).monospacedDigit()
+            } else if r.failedCount > 0 {
                 Label("\(r.failedCount) item\(r.failedCount == 1 ? "" : "s") could not be removed (in use or protected by macOS)",
                       systemImage: "exclamationmark.triangle")
                     .font(.callout).foregroundStyle(.orange)
@@ -320,31 +474,18 @@ struct ResultSheet: View {
                       systemImage: "info.circle")
                     .font(.callout).foregroundStyle(.secondary)
             }
-            if !r.messages.isEmpty {
+            if hasItems {
+                let notRemoved = summary.failedItems + summary.skippedItems
+                if !notRemoved.isEmpty { notRemovedList(notRemoved) }
+                if !r.messages.isEmpty { DisclosureGroup("Details") { messageList(r.messages, height: 120) }.font(.callout) }
+            } else if !r.messages.isEmpty {
                 VStack(alignment: .leading, spacing: 6) {
                     Text(r.failedCount > 0 ? "What went wrong" : "Details").font(.headline)
-                    ScrollView {
-                        VStack(alignment: .leading, spacing: 6) {
-                            ForEach(Array(orderedMessages(r.messages).enumerated()), id: \.offset) { _, line in
-                                HStack(alignment: .firstTextBaseline, spacing: 6) {
-                                    Image(systemName: isFailure(line) ? "exclamationmark.triangle.fill" : "info.circle")
-                                        .foregroundStyle(isFailure(line) ? Color.orange : Color.secondary)
-                                        .font(.caption)
-                                    Text(line).font(.caption.monospaced()).textSelection(.enabled)
-                                        .frame(maxWidth: .infinity, alignment: .leading)
-                                }
-                                .accessibilityElement(children: .combine)
-                            }
-                        }
-                        .padding(8)
-                    }
-                    .frame(height: min(190, CGFloat(r.messages.count) * 34 + 20))
-                    .background(.background.secondary, in: RoundedRectangle(cornerRadius: 8))
-                    .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(.quaternary))
+                    messageList(r.messages, height: min(190, CGFloat(r.messages.count) * 34 + 20))
                 }
             }
             HStack {
-                if !r.messages.isEmpty || r.failedCount > 0 {
+                if !r.messages.isEmpty || r.failedCount > 0 || problems {
                     Button(copied ? "Copied" : "Copy details") { copyDetails() }
                 }
                 Spacer()
@@ -355,12 +496,73 @@ struct ResultSheet: View {
         .frame(width: 520)
     }
 
+    /// Items that failed or were skipped, each with its reason.
+    private func notRemovedList(_ items: [CleanItemEvent]) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Not removed").font(.headline)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 8) {
+                    ForEach(items) { item in
+                        HStack(alignment: .top, spacing: 8) {
+                            StatusIcon(state: item.state, reason: item.reason).frame(width: 16, height: 16)
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(item.name).font(.callout).lineLimit(1).truncationMode(.middle)
+                                Text((item.reason ?? .other).text).font(.caption).foregroundStyle(.secondary)
+                                if let detail = item.detail, !detail.isEmpty, detail != (item.reason ?? .other).text {
+                                    Text(detail).font(.caption2).foregroundStyle(.tertiary)
+                                        .lineLimit(2).truncationMode(.middle).textSelection(.enabled)
+                                }
+                            }
+                            Spacer(minLength: 8)
+                            if item.bytes > 0 { Text(Fmt.bytes(item.bytes)).font(.caption).monospacedDigit().foregroundStyle(.secondary) }
+                        }
+                        .accessibilityElement(children: .combine)
+                    }
+                }
+                .padding(10)
+            }
+            .frame(height: min(200, CGFloat(items.count) * 46 + 20))
+            .background(.background.secondary, in: RoundedRectangle(cornerRadius: 8))
+            .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(.quaternary))
+        }
+    }
+
+    private func messageList(_ lines: [String], height: CGFloat) -> some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 6) {
+                ForEach(Array(orderedMessages(lines).enumerated()), id: \.offset) { _, line in
+                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                        Image(systemName: isFailure(line) ? "exclamationmark.triangle.fill" : "info.circle")
+                            .foregroundStyle(isFailure(line) ? Color.orange : Color.secondary)
+                            .font(.caption)
+                        Text(line).font(.caption.monospaced()).textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .accessibilityElement(children: .combine)
+                }
+            }
+            .padding(8)
+        }
+        .frame(height: height)
+        .background(.background.secondary, in: RoundedRectangle(cornerRadius: 8))
+        .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(.quaternary))
+    }
+
     private func copyDetails() {
         let r = summary.result
         var text = "Mac Cleaner result\n"
         text += "Mode: \(trash ? "Move to Trash" : "Delete permanently")\n"
         text += "Freed: \(Fmt.bytes(r.freedBytes))\n"
         text += "Failed: \(r.failedCount)\n"
+        if r.cancelled { text += "Stopped before it was done\n" }
+        if hasItems {
+            text += "Items: \(summary.doneItems.count) done, \(summary.failedItems.count) failed, \(summary.skippedItems.count) skipped\n"
+            for item in summary.failedItems + summary.skippedItems {
+                text += "\n\(item.state.rawValue): \(item.name) - \((item.reason ?? .other).text)"
+                if let d = item.detail, !d.isEmpty { text += " (\(d))" }
+            }
+            text += "\n"
+        }
         if !r.messages.isEmpty { text += "\n" + r.messages.joined(separator: "\n") + "\n" }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)

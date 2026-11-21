@@ -520,34 +520,128 @@ final class MockEngine: CleanerEngine, @unchecked Sendable {
     }
 
     func clean(categories cats: [CleanCategory], mode: DeleteMode, progress: @escaping ProgressHandler) async -> CleanResult {
-        var freed: Int64 = 0
-        var messages: [String] = []
+        await clean(categories: cats, mode: mode, progress: progress, deleteProgress: { _ in }, itemEvents: { _ in })
+    }
+
+    /// One step of a fake run: what the real engine would list as an item.
+    private struct MockStep {
+        var event: CleanItemEvent
+        var command: [String]?
+        /// How the fake run ends this step when it is not stopped.
+        var fate: CleanItemState = .done
+        var reason: CleanItemReason?
+        var detail: String?
+    }
+
+    /// Plays the steps one after another with the same events and progress reports as the real engine.
+    /// Files go at a pace that depends on their size; a command takes a few seconds and reports nothing until it ends.
+    private func play(_ steps: [MockStep], mode: DeleteMode, expected: Int64?, progress: @escaping ProgressHandler,
+                      deleteProgress: @escaping DeleteProgressHandler, itemEvents: @escaping CleanItemHandler) async -> (items: [CleanItemEvent], cancelled: Bool, freed: Int64) {
+        var items = steps.map(\.event)
+        for e in items { itemEvents(e) }
+        var bytes: Int64 = 0, entries = 0, done = 0
+        var cancelled = false
+        func report(_ current: String?, _ phase: DeletePhase = .removing) {
+            deleteProgress(DeleteProgress(itemsDone: done, itemsTotal: steps.count, entriesRemoved: entries, bytesFreed: bytes,
+                                          expectedBytes: expected, currentItem: current, phase: phase, movesWhole: mode == .trash))
+        }
+        func set(_ i: Int, _ state: CleanItemState, bytes b: Int64? = nil, entries n: Int = 0, reason: CleanItemReason? = nil, detail: String? = nil) {
+            items[i].state = state
+            if let b { items[i].bytes = b }
+            items[i].entries = n; items[i].reason = reason; items[i].detail = detail
+            itemEvents(items[i])
+        }
+        for (i, step) in steps.enumerated() {
+            if Task.isCancelled || cancelled {
+                cancelled = true
+                set(i, .skipped, reason: .cancelled)
+                continue
+            }
+            progress(step.command != nil ? "Running \(step.event.name)…" : "Deleting \(step.event.name)…")
+            set(i, .deleting)
+            let size = step.event.bytes
+            if let cmd = step.command {
+                report(nil, .command(cmd.prefix(2).joined(separator: " ")))
+                for _ in 0..<30 where !Task.isCancelled { await sleep(0.1) }
+                report(nil)
+                if Task.isCancelled { cancelled = true; set(i, .skipped, bytes: size, reason: .cancelled); continue }
+            } else {
+                let ticks = max(3, min(18, Int(Double(size) / Double(GB) * 6)))
+                let path = (step.event.path ?? "").replacingOccurrences(of: home, with: "~")
+                for _ in 1...ticks {
+                    if Task.isCancelled { break }
+                    await sleep(0.1)
+                    if mode == .permanent { bytes += size / Int64(ticks); entries += Int(size / MB) / ticks + 40 }
+                    report(path.isEmpty ? nil : String(path.dropFirst(path.hasPrefix("~") ? 2 : 0)))
+                }
+                if Task.isCancelled { cancelled = true; set(i, .skipped, bytes: size, reason: .cancelled); continue }
+            }
+            switch step.fate {
+            case .done:
+                if mode == .trash && step.command == nil { bytes += size }
+                done += 1
+                set(i, .done, bytes: size, entries: step.command == nil ? Int(size / MB) + 40 : 0)
+            default:
+                done += 1
+                set(i, step.fate, bytes: size, reason: step.reason, detail: step.detail)
+            }
+            report(nil)
+        }
+        return (items, cancelled, mode == .permanent ? bytes : 0)
+    }
+
+    func clean(categories cats: [CleanCategory], mode: DeleteMode, progress: @escaping ProgressHandler,
+               deleteProgress: @escaping DeleteProgressHandler, itemEvents: @escaping CleanItemHandler) async -> CleanResult {
+        var steps: [MockStep] = []
         for c in cats {
-            progress("Cleaning \(c.name)…")
-            await sleep(0.7)
-            freed += c.sizeIsUpperBound ? c.sizeBytes / 3 : c.sizeBytes
-            lock.withLock {
-                for i in c.items { removedItemIDs.insert(i.id) }
-                if !c.commands.isEmpty { removedCategories.insert(c.id) }
-                if c.items.isEmpty { removedCategories.insert(c.id) }
+            for i in c.items where i.deleteCommand == nil {
+                steps.append(MockStep(event: CleanItemEvent(id: c.id + "|" + i.id, name: i.displayName, path: i.url.path, bytes: i.sizeBytes)))
             }
             for i in c.items {
-                if let cmd = i.deleteCommand { messages.append("$ " + cmd.joined(separator: " ") + "\n(mock) done") }
+                guard let cmd = i.deleteCommand else { continue }
+                steps.append(MockStep(event: CleanItemEvent(id: c.id + "|run " + i.id, name: i.displayName, path: i.url.path, bytes: i.sizeBytes,
+                                                            isCommand: true), command: cmd))
             }
-            for cmd in c.commands { messages.append("$ " + cmd.joined(separator: " ") + "\n(mock) done") }
+            for (n, cmd) in c.commands.enumerated() {
+                steps.append(MockStep(event: CleanItemEvent(id: c.id + "|run " + cmd.joined(separator: " "), name: cmd.joined(separator: " "),
+                                                            bytes: n == 0 ? c.sizeBytes : 0, isCommand: true), command: cmd))
+            }
         }
-        let failed = cats.count > 2 ? 3 : 0
-        if failed > 0 {
-            messages.append("Could not remove ~/Library/Caches/com.apple.Safari/WebKitCache: Operation not permitted (protected by macOS)")
-            messages.append("Skipped ~/Library/Caches/com.docker.docker: in use by a running process")
-            messages.append("Failed to remove ~/Library/Caches/Homebrew/downloads/.lock: permission denied")
+        // With several categories the fake run also shows what a real one reports: a folder macOS protects and one a safety check refuses.
+        var messages: [String] = []
+        var failed = 0
+        if cats.count > 2 {
+            let paths = steps.indices.filter { steps[$0].command == nil }
+            if paths.count > 2 {
+                let a = paths[1], b = paths[2]
+                steps[a].fate = .failed; steps[a].reason = .partial
+                steps[a].detail = "3 entries in \(steps[a].event.name) could not be removed (in use or protected by macOS)"
+                steps[b].fate = .skipped; steps[b].reason = .refused
+                steps[b].detail = "Refused (protected): \(steps[b].event.name)"
+                failed = 2
+                messages += [steps[a].detail!, steps[b].detail!]
+            }
         }
+        let expected = steps.filter { $0.command == nil }.reduce(Int64(0)) { $0 + $1.event.bytes }
+        let r = await play(steps, mode: mode, expected: expected > 0 ? expected : nil, progress: progress,
+                           deleteProgress: deleteProgress, itemEvents: itemEvents)
+        var freed = r.items.filter { $0.state == .done }.reduce(Int64(0)) { $0 + $1.bytes }
+        for c in cats where !r.cancelled {
+            let skippedIDs = Set(zip(steps, r.items).filter { $0.1.state != .done }.map { $0.0.event.id })
+            lock.withLock {
+                for i in c.items where !skippedIDs.contains(c.id + "|" + i.id) && !skippedIDs.contains(c.id + "|run " + i.id) { removedItemIDs.insert(i.id) }
+                if !c.commands.isEmpty || c.items.isEmpty { removedCategories.insert(c.id) }
+            }
+        }
+        for step in steps where step.command != nil { messages.append("$ " + (step.command ?? []).joined(separator: " ") + "\n(mock) done") }
         if mode == .trash {
             messages.insert("(mock) Moved items to the Trash. Empty the Trash to free the space.", at: 0)
             freed = 0
         }
+        if r.cancelled { messages.append("The operation was stopped before it was done. What was already removed stays removed.") }
         lock.withLock { freedSoFar += freed }
-        return CleanResult(freedBytes: freed, failedCount: failed, messages: messages)
+        return CleanResult(freedBytes: freed, failedCount: failed, messages: messages, cancelled: r.cancelled,
+                           entriesRemoved: r.items.reduce(0) { $0 + $1.entries }, bytesRemoved: r.freed, items: r.items)
     }
 
     func delete(urls: [URL], progress: @escaping ProgressHandler) async -> CleanResult {
@@ -555,14 +649,21 @@ final class MockEngine: CleanerEngine, @unchecked Sendable {
     }
 
     func delete(urls: [URL], mode: DeleteMode, progress: @escaping ProgressHandler) async -> CleanResult {
-        for u in urls {
-            progress("\(mode == .trash ? "Moving to Trash" : "Deleting") \(u.abbreviatedPath)…")
-            await sleep(0.5)
-            lock.withLock { _ = removedPaths.insert(u.standardizedFileURL.path) }
+        await delete(urls: urls, mode: mode, purpose: .explorer, progress: progress, deleteProgress: { _ in }, itemEvents: { _ in })
+    }
+
+    func delete(urls: [URL], mode: DeleteMode, purpose: DeletePurpose, progress: @escaping ProgressHandler,
+                deleteProgress: @escaping DeleteProgressHandler, itemEvents: @escaping CleanItemHandler) async -> CleanResult {
+        let each = 2 * GB / Int64(max(urls.count, 1))
+        let steps = urls.map { MockStep(event: CleanItemEvent(id: $0.path, name: $0.lastPathComponent, path: $0.path, bytes: each)) }
+        let r = await play(steps, mode: mode, expected: mode == .trash ? each * Int64(urls.count) : nil, progress: progress,
+                           deleteProgress: deleteProgress, itemEvents: itemEvents)
+        lock.withLock {
+            for (u, e) in zip(urls, r.items) where e.state == .done { removedPaths.insert(u.standardizedFileURL.path) }
         }
-        let freed = mode == .trash ? 0 : 2 * GB
+        let freed = mode == .trash ? 0 : r.freed
         lock.withLock { freedSoFar += freed }
-        return CleanResult(freedBytes: freed, failedCount: 0, messages: [])
+        return CleanResult(freedBytes: freed, failedCount: 0, messages: [], cancelled: r.cancelled, items: r.items)
     }
 
     func removeClones(_ clones: [RepoClone], force: Bool, mode: DeleteMode, progress: @escaping ProgressHandler) async -> CleanResult {

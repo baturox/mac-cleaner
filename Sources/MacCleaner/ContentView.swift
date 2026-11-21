@@ -56,8 +56,11 @@ struct ContentView: View {
                                    onConfirm: { model.execute(plan) })
             case .running:
                 // The clock in the overlay needs a tick of its own: counts arrive ten times a second, but not while one file is slow.
-                TimelineView(.periodic(from: .now, by: 1)) { _ in
-                    CleaningSheet(progress: model.cleanProgress, counts: model.deleteProgress, startedAt: model.cleanStartedAt,
+                // `now` is passed in as a value: a body whose inputs do not change is not evaluated again.
+                TimelineView(.periodic(from: .now, by: 1)) { context in
+                    CleaningSheet(progress: model.cleanProgress, counts: model.deleteProgress, items: model.cleanItems,
+                                  mode: model.cleanMode, startedAt: model.cleanStartedAt, now: context.date,
+                                  timeLeft: model.cleanTimeLeft, estimateAt: model.cleanEstimateAt, lastChange: model.cleanLastChange,
                                   stopping: model.isStoppingClean, onStop: { model.stopCleaning() })
                 }
             case .result(let summary):
