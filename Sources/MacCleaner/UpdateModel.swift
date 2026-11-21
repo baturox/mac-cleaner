@@ -75,6 +75,9 @@ final class UpdateModel {
     private(set) var phase: UpdatePhase = .idle
     /// True from the moment the swap may start until the app quits: nothing else may start deleting.
     private(set) var isCommitting = false
+    /// Up while the swap and its checks run (from `isCommitting` until the install call returns, however it ends).
+    /// Quitting waits for it to come down: ending the process half way through the swap could leave no usable app.
+    let swapGate = QuitGate()
     var isInstalling: Bool {
         switch phase {
         case .working, .waitingForClean, .installing: true
@@ -214,13 +217,16 @@ final class UpdateModel {
                 }, waitForIdle: { [weak self] in
                     try await self?.waitUntilIdle(offer)
                 })
+                swapGate.end()
                 // Swapped and the relaunch helper is waiting for this process to exit.
                 NSApplication.shared.terminate(nil)
             } catch is CancellationError {
+                swapGate.end()
                 isCommitting = false
                 record(offer, "cancelled", nil)
                 phase = .available(offer)
             } catch {
+                swapGate.end()
                 isCommitting = false
                 if (error as? UpdateError) == .cancelled { phase = .available(offer); return }
                 let e = error as? UpdateError
@@ -252,6 +258,7 @@ final class UpdateModel {
         // tear down half way (its Gatekeeper step would be killed and reported as a rejection).
         try Task.checkCancellation()
         isCommitting = true
+        swapGate.begin()
         phase = .installing(offer)
     }
 

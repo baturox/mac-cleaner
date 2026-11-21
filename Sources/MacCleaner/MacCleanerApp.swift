@@ -46,6 +46,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Quitting while files are being deleted stops the deletion first and waits (a few seconds at most) for its
     /// outcome record, instead of ending the process between the "started" record and the outcome.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        // Quitting while an update is being swapped in waits for the swap and its checks to finish, then quits.
+        if let gate = Self.model?.update.swapGate, gate.isBusy {
+            let answered = Locked(false)
+            let reply: @MainActor () -> Void = {
+                guard !answered.value else { return }
+                answered.value = true
+                NSApplication.shared.reply(toApplicationShouldTerminate: true)
+            }
+            gate.whenIdle { DispatchQueue.main.async { reply() } }
+            // The swap has its own time limits; this only keeps a stuck one from holding the app open for good.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 180) { reply() }
+            return .terminateLater
+        }
         guard let model = Self.model, model.isCleaning else { return .terminateNow }
         let alert = NSAlert()
         alert.messageText = "A clean is still running"
