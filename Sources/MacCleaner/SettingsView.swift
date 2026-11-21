@@ -15,6 +15,7 @@ struct SettingsView: View {
     @AppStorage(Prefs.Key.showMenuBar, store: Prefs.store) private var showMenuBar = true
     @AppStorage(Prefs.Key.notifications, store: Prefs.store) private var notifications = true
     @AppStorage(Prefs.Key.recordAuditLog, store: Prefs.store) private var recordAudit = true
+    @AppStorage(Prefs.Key.automaticUpdateChecks, store: Prefs.store) private var autoUpdates = true
 
     #if DEBUG
     @State private var tab = Prefs.isMock ? (ProcessInfo.processInfo.environment["MACCLEANER_TAB"] ?? "general") : "general"
@@ -36,6 +37,7 @@ struct SettingsView: View {
             general.tabItem { Label("General", systemImage: "gearshape") }.tag("general")
             protection.tabItem { Label("Protection", systemImage: "lock.shield") }.tag("protection")
             scanning.tabItem { Label("Scanning", systemImage: "magnifyingglass") }.tag("scanning")
+            updates.tabItem { Label("Updates", systemImage: "arrow.triangle.2.circlepath") }.tag("updates")
         }
         .frame(width: 560, height: 520)
         .onChange(of: scanFingerprint) { model.settingsDidChange(scanRelevant: true) }
@@ -88,6 +90,32 @@ struct SettingsView: View {
             } header: { Text("History") }
         }
         .formStyle(.grouped)
+    }
+
+    // MARK: Updates
+
+    private var updates: some View {
+        Form {
+            Section {
+                Toggle("Automatically check for updates", isOn: $autoUpdates)
+                HStack {
+                    Text(updateStatus).font(.callout).foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Check Now") { model.update.checkManually() }
+                        .disabled(model.update.isChecking || model.update.isInstalling)
+                }
+                Text("Once a day Mac Cleaner asks GitHub for the newest release. Nothing about you or this Mac is sent. An update is only offered, never installed without asking, and is verified (checksum, signature, notarization) before it replaces the app.")
+                    .font(.callout).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } header: { Text("Updates") }
+        }
+        .formStyle(.grouped)
+    }
+
+    private var updateStatus: String {
+        let version = "Mac Cleaner \(model.update.currentVersion)."
+        guard let last = model.update.lastCheck else { return version + " Not checked yet." }
+        return version + " Last checked " + last.formatted(.relative(presentation: .named)) + "."
     }
 
     // MARK: Protection

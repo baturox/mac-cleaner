@@ -43,6 +43,7 @@ enum Prefs {
             Key.itemSort: "size",
             Key.collapsedGroups: "",
             Key.recordAuditLog: true,
+            Key.automaticUpdateChecks: true,
         ])
         return s
     }()
@@ -67,6 +68,8 @@ enum Prefs {
         static let itemSort = "itemSort"
         static let collapsedGroups = "collapsedGroups"
         static let recordAuditLog = "recordAuditLog"
+        /// The update policy (CleanerCore) reads and writes this one, with `lastUpdateCheck` and `skippedUpdateVersion`.
+        static let automaticUpdateChecks = DefaultsUpdateStateStore.automaticKey
     }
 
     // MARK: JSON-encoded string lists (AppStorage cannot hold arrays)

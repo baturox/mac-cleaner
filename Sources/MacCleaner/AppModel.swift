@@ -190,6 +190,8 @@ final class AppModel {
     let home: URL
     let explore: ExploreModel
     let history: HistoryModel
+    /// Checking for, downloading and installing updates.
+    let update: UpdateModel
     /// Totals from the audit log, for the Overview's "Freed so far".
     var auditStats = AuditStats()
     let notifier = LowSpaceNotifier()
@@ -304,14 +306,23 @@ final class AppModel {
         self.disk = engine.diskInfo()
         self.explore = ExploreModel(engine: engine, home: home)
         self.history = HistoryModel(engine: engine)
+        self.update = UpdateModel(isMock: isMock)
         if let raw = Prefs.store.string(forKey: Prefs.Key.lastSection), let s = AppSection(rawValue: raw) { section = s }
+        update.mustWait = { [weak self] in self?.updateMustWait ?? false }
         startMonitoring()
     }
 
     // MARK: Derived numbers
 
     var isScanning: Bool { isScanningCategories || isScanningProjects || isScanningRepos || isScanningApps }
-    var isBusy: Bool { sheet != nil }
+    /// While an update is being swapped in nothing else may start (the app quits right after).
+    var isBusy: Bool { sheet != nil || update.isCommitting }
+    /// An update never installs or relaunches while a deletion runs, or while the user is about to confirm one.
+    var updateMustWait: Bool {
+        if isCleaning { return true }
+        if case .confirm = sheet { return true }
+        return false
+    }
     /// A clean or delete is running. Scans neither start nor continue meanwhile: they would only compete for the disk.
     var isCleaning: Bool { if case .running = sheet { return true } else { return false } }
     func refreshAuditStats() {
@@ -1076,6 +1087,7 @@ final class AppModel {
     // MARK: Executing
 
     func execute(_ plan: DeletionPlan) {
+        guard !update.isCommitting else { return }
         cleanProgress = "Starting…"
         deleteProgress = nil
         cleanItems = CleanRunItems()

@@ -81,9 +81,9 @@ public final class UpdateInstaller: @unchecked Sendable {
     private let gatekeeper: any GatekeeperAssessing
     private let extractor: any ArchiveExtracting
     private let location: UpdateLocation
-    private let pendingStore: PendingUpdateStore
+    fileprivate let pendingStore: PendingUpdateStore
     private let freeBytes: @Sendable (URL) -> Int64?
-    private let swapHooks: BundleSwap.Hooks
+    fileprivate let swapHooks: BundleSwap.Hooks
 
     public init(config: UpdateConfiguration = .official, transport: any UpdateTransport,
                 signature: any BundleSignatureVerifying, gatekeeper: any GatekeeperAssessing,
@@ -228,5 +228,23 @@ public final class UpdateInstaller: @unchecked Sendable {
             throw error
         }
         return InstalledUpdate(pending: pending)
+    }
+}
+
+extension UpdateInstaller {
+    /// Undoes a committed update before the app was relaunched (for example when the helper could not be started).
+    public func rollback(_ done: InstalledUpdate) throws {
+        let p = done.pending
+        try BundleSwap.restore(installed: URL(fileURLWithPath: p.installedPath), backup: URL(fileURLWithPath: p.backupPath),
+                               failed: URL(fileURLWithPath: p.failedPath), hooks: swapHooks)
+        pendingStore.clear()
+        try? FileManager.default.removeItem(atPath: p.stageDir)
+    }
+}
+
+/// Where the update record and log live: next to the deletion history.
+public enum UpdateStorage {
+    public static var directory: URL {
+        URL(fileURLWithPath: AccountEnvironment.home + "/Library/Application Support/MacCleaner", isDirectory: true)
     }
 }

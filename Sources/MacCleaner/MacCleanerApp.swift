@@ -71,6 +71,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApplication.shared.setActivationPolicy(.regular)
         NSApplication.shared.activate(ignoringOtherApps: true)
+        // The update machinery starts last and waits a moment before it touches the network.
+        Self.model?.update.start()
     }
     /// With the menu bar item on, the app keeps running (and watching disk space) without a window.
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -111,6 +113,10 @@ struct MacCleanerApp: App {
         .commands {
             CommandGroup(replacing: .appInfo) {
                 Button("About Mac Cleaner") { AppInfo.showAbout() }
+            }
+            CommandGroup(after: .appInfo) {
+                Button("Check for Updates…") { model.update.checkManually() }
+                    .disabled(model.update.isChecking || model.update.isInstalling)
             }
             CommandGroup(replacing: .newItem) {
                 Button("Scan") { model.scanAll() }

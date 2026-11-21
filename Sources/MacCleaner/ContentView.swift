@@ -200,6 +200,8 @@ struct ContentView: View {
             model.section = .history
             await model.history.reload()
             for r in model.history.records.prefix(3).dropFirst() { model.history.expanded.insert(r.id) }
+        case "update", "updating", "updateverifying", "updatewaiting", "updated", "uptodate", "updatefailed", "updatedev":
+            model.update.showMock(step)
         case "settings":
             openSettings()
         case "focus":
