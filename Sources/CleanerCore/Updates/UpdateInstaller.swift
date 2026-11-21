@@ -167,6 +167,9 @@ public final class UpdateInstaller: @unchecked Sendable {
             return StagedUpdate(offer: offer, fromVersion: current.description, installedApp: installed, stageDir: dir, newApp: newApp)
         } catch {
             try? FileManager.default.removeItem(at: dir)
+            // A cancelled task also makes ditto or spctl fail (they are terminated): report that as the cancellation
+            // it is, not as a broken archive or a Gatekeeper rejection.
+            if Task.isCancelled { throw CancellationError() }
             throw error
         }
     }
@@ -196,7 +199,24 @@ public final class UpdateInstaller: @unchecked Sendable {
         guard stage == ["extract", "package.zip"] else { throw UpdateError.unexpectedArchive("unexpected files next to the download") }
     }
 
-    public func discard(_ staged: StagedUpdate) { try? FileManager.default.removeItem(at: staged.stageDir) }
+    /// Removes the staging folder, unless a failed swap or restore left the previous app in it.
+    public func discard(_ staged: StagedUpdate) {
+        guard !UpdateStageFolder.mustKeep(staged.stageDir) else { return }
+        try? FileManager.default.removeItem(at: staged.stageDir)
+    }
+
+    /// Puts the old app back after a failed commit. Only when that worked is the staging folder removed; otherwise
+    /// it is marked so that nothing ever deletes it, and the error says where the old app is.
+    private func undo(_ staged: StagedUpdate, oldNow: URL, failed: URL, error: Error) -> Error {
+        do {
+            try BundleSwap.restore(installed: staged.installedApp, backup: oldNow, failed: failed, hooks: swapHooks)
+        } catch {
+            UpdateStageFolder.markKeep(staged.stageDir)
+            return UpdateError.previousAppKept(oldNow.path)
+        }
+        try? FileManager.default.removeItem(at: staged.stageDir)
+        return error
+    }
 
     // MARK: Commit
 
@@ -206,16 +226,25 @@ public final class UpdateInstaller: @unchecked Sendable {
         try BundleIdentity.check(bundle: staged.newApp, bundleID: config.bundleID, version: staged.offer.version)
         let backup = staged.stageDir.appendingPathComponent("backup.app", isDirectory: true)
         let failed = staged.stageDir.appendingPathComponent("failed.app", isDirectory: true)
-        let oldNow = try BundleSwap.install(staged: staged.newApp, installed: staged.installedApp, backup: backup, hooks: swapHooks)
+        let oldNow: URL
+        do {
+            oldNow = try BundleSwap.install(staged: staged.newApp, installed: staged.installedApp, backup: backup, hooks: swapHooks)
+        } catch {
+            // Normally nothing changed. If the old app was moved aside and could not be moved back, it is the backup.
+            var st = stat()
+            if lstat(backup.path, &st) == 0 {
+                UpdateStageFolder.markKeep(staged.stageDir)
+                throw UpdateError.previousAppKept(backup.path)
+            }
+            throw error
+        }
         do {
             // What is at the installed path now must pass everything again.
             try signature.verifyBundle(at: staged.installedApp)
             try BundleIdentity.check(bundle: staged.installedApp, bundleID: config.bundleID, version: staged.offer.version)
             try await gatekeeper.assess(bundle: staged.installedApp)
         } catch {
-            try? BundleSwap.restore(installed: staged.installedApp, backup: oldNow, failed: failed, hooks: swapHooks)
-            try? FileManager.default.removeItem(at: staged.stageDir)
-            throw error
+            throw undo(staged, oldNow: oldNow, failed: failed, error: error)
         }
         let pending = PendingUpdate(fromVersion: staged.fromVersion, toVersion: staged.offer.version.description,
                                     installedPath: staged.installedApp.path, stageDir: staged.stageDir.path,
@@ -223,9 +252,7 @@ public final class UpdateInstaller: @unchecked Sendable {
                                     ackPath: staged.stageDir.appendingPathComponent("started").path,
                                     createdAt: Date(timeIntervalSince1970: Date().timeIntervalSince1970.rounded(.down)))
         do { try pendingStore.save(pending) } catch {
-            try? BundleSwap.restore(installed: staged.installedApp, backup: oldNow, failed: failed, hooks: swapHooks)
-            try? FileManager.default.removeItem(at: staged.stageDir)
-            throw error
+            throw undo(staged, oldNow: oldNow, failed: failed, error: error)
         }
         return InstalledUpdate(pending: pending)
     }
@@ -235,8 +262,13 @@ extension UpdateInstaller {
     /// Undoes a committed update before the app was relaunched (for example when the helper could not be started).
     public func rollback(_ done: InstalledUpdate) throws {
         let p = done.pending
-        try BundleSwap.restore(installed: URL(fileURLWithPath: p.installedPath), backup: URL(fileURLWithPath: p.backupPath),
-                               failed: URL(fileURLWithPath: p.failedPath), hooks: swapHooks)
+        do {
+            try BundleSwap.restore(installed: URL(fileURLWithPath: p.installedPath), backup: URL(fileURLWithPath: p.backupPath),
+                                   failed: URL(fileURLWithPath: p.failedPath), hooks: swapHooks)
+        } catch {
+            UpdateStageFolder.markKeep(URL(fileURLWithPath: p.stageDir, isDirectory: true))
+            throw UpdateError.previousAppKept(p.backupPath)
+        }
         pendingStore.clear()
         try? FileManager.default.removeItem(atPath: p.stageDir)
     }

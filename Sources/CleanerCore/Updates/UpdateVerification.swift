@@ -24,6 +24,9 @@ public struct SecurityBundleVerifier: BundleSignatureVerifying {
     public init(requirementText: String) { self.requirementText = requirementText }
     public init(config: UpdateConfiguration) { self.requirementText = config.requirementText }
 
+    static let validityFlags: UInt32 = kSecCSCheckAllArchitectures | kSecCSCheckNestedCode | kSecCSStrictValidate
+        | kSecCSRestrictSymlinks
+
     private func requirement() throws -> SecRequirement {
         var req: SecRequirement?
         let status = SecRequirementCreateWithString(requirementText as CFString, SecCSFlags(rawValue: 0), &req)
@@ -41,8 +44,10 @@ public struct SecurityBundleVerifier: BundleSignatureVerifying {
         var code: SecStaticCode?
         let created = SecStaticCodeCreateWithPath(url as CFURL, SecCSFlags(rawValue: 0), &code)
         guard created == errSecSuccess, let code else { throw UpdateError.signatureInvalid(describe(created, nil)) }
-        // Every architecture slice, every nested code item (the bundled command line tool), strict resource rules.
-        let flags = SecCSFlags(rawValue: kSecCSCheckAllArchitectures | kSecCSCheckNestedCode | kSecCSStrictValidate)
+        // Every architecture slice, every nested code item (the bundled command line tool), strict resource rules,
+        // and no symbolic link that points outside the bundle (like `codesign --verify --strict`; strict validation
+        // alone accepts a sealed link to, say, /tmp).
+        let flags = SecCSFlags(rawValue: Self.validityFlags)
         var errors: Unmanaged<CFError>?
         let status = SecStaticCodeCheckValidityWithErrors(code, flags, requirement, &errors)
         guard status == errSecSuccess else { throw UpdateError.signatureInvalid(describe(status, errors)) }

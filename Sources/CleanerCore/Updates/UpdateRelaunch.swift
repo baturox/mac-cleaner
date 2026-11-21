@@ -56,6 +56,20 @@ public enum UpdateStageFolder {
         guard lstat(candidate.path, &st) == 0, (st.st_mode & S_IFMT) == S_IFDIR, st.st_uid == getuid() else { return false }
         return true
     }
+
+    /// Written into a staging folder when a swap or a restore failed half way, so the folder may hold the only copy
+    /// of the previous app. Such a folder is never deleted automatically.
+    public static let keepMarker = "KEEP-previous-app-inside"
+
+    public static func mustKeep(_ dir: URL) -> Bool {
+        var st = stat()
+        return lstat(dir.appendingPathComponent(keepMarker).path, &st) == 0
+    }
+
+    static func markKeep(_ dir: URL) {
+        _ = FileManager.default.createFile(atPath: dir.appendingPathComponent(keepMarker).path, contents: Data(),
+                                           attributes: [.posixPermissions: 0o600])
+    }
 }
 
 public enum UpdateFinalizeOutcome: Equatable, Sendable {
@@ -74,7 +88,9 @@ public struct UpdateFinalizer: Sendable {
 
     private func remove(_ p: PendingUpdate, runningBundle: URL) {
         let dir = URL(fileURLWithPath: p.stageDir, isDirectory: true)
-        if UpdateStageFolder.isOurs(dir, besides: runningBundle) { try? FileManager.default.removeItem(at: dir) }
+        if UpdateStageFolder.isOurs(dir, besides: runningBundle), !UpdateStageFolder.mustKeep(dir) {
+            try? FileManager.default.removeItem(at: dir)
+        }
         store.clear()
     }
 
@@ -127,6 +143,7 @@ public struct UpdateFinalizer: Sendable {
         for name in names where name.hasPrefix(UpdateStageFolder.prefix) {
             let dir = parent.appendingPathComponent(name, isDirectory: true)
             guard dir.standardizedFileURL.path != keep, UpdateStageFolder.isOurs(dir, besides: runningBundle),
+                  !UpdateStageFolder.mustKeep(dir),
                   let m = (try? dir.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate,
                   now.timeIntervalSince(m) > 24 * 3600 else { continue }
             try? FileManager.default.removeItem(at: dir)
@@ -151,7 +168,7 @@ public enum UpdateRelauncher {
       n=$((n+1))
       if [ "$n" -gt "$steps" ]; then
         if [ -e "$backup" ] && mv "$app" "$failed"; then
-          mv "$backup" "$app" && "$opener" -n "$app"
+          if mv "$backup" "$app"; then "$opener" -n "$app"; else mv "$failed" "$app"; fi
         fi
         exit 0
       fi

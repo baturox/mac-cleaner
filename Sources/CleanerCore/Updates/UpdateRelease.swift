@@ -79,6 +79,8 @@ public enum UpdateError: Error, Equatable, LocalizedError, Sendable {
     case busy
     case cancelled
     case installFailed(String)
+    /// The swap or the way back failed half way; the previous app was kept at this path (never deleted automatically).
+    case previousAppKept(String)
 
     /// Plain-English text for the user.
     public var errorDescription: String? {
@@ -105,6 +107,9 @@ public enum UpdateError: Error, Equatable, LocalizedError, Sendable {
         case .busy: return "A clean is running. The update waits until it has finished."
         case .cancelled: return "The update was cancelled."
         case .installFailed(let d): return "The update could not be installed (\(d)). The previous version is untouched."
+        case .previousAppKept(let p):
+            return "The update could not be completed and the previous version could not be put back automatically. "
+                + "It is kept, unchanged, at \(p) (a hidden folder next to the app); move it back in place of Mac Cleaner.app to use it."
         }
     }
 

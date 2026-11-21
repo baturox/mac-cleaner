@@ -64,7 +64,7 @@ struct LiveUpdateBackend: UpdateBackend {
             throw error
         }
         do { try UpdateRelauncher.launchDetached(pending: done.pending) } catch {
-            try? installer.rollback(done)
+            do { try installer.rollback(done) } catch let kept { throw kept }   // say where the old app is
             throw error
         }
     }
@@ -248,6 +248,9 @@ final class UpdateModel {
             phase = .waitingForClean(offer)
             try await Task.sleep(nanoseconds: 500_000_000)
         }
+        // Cancel pressed just as the download finished: do not start a swap that the cancellation would then
+        // tear down half way (its Gatekeeper step would be killed and reported as a rejection).
+        try Task.checkCancellation()
         isCommitting = true
         phase = .installing(offer)
     }

@@ -31,6 +31,7 @@ public enum ReleaseNotes {
             var line = sanitize(String(rawLine)).trimmingCharacters(in: .whitespaces)
             if line.hasPrefix("```") { inFence.toggle(); continue }
             if inFence {
+                if line.count > maxLineLength { line = String(line.prefix(maxLineLength)) + "…" }
                 lines.append(ReleaseNotesLine(kind: .paragraph, runs: [ReleaseNotesRun("    " + line)]))
                 previousBlank = false
                 continue

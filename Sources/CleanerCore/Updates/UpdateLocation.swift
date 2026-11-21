@@ -75,6 +75,11 @@ public struct UpdateLocation: Sendable {
         if !probe.isWritableDirectory(parent) {
             return .refused("You cannot change the folder \(parent.path), which holds Mac Cleaner. Updating it needs write access to that folder.")
         }
+        // Moving a folder to another parent needs write access to the folder itself (its ".." changes): an app that
+        // belongs to another user could be downloaded and verified but never swapped in.
+        if !probe.isWritableDirectory(real) {
+            return .refused("Mac Cleaner.app belongs to another user or is locked, so it cannot be replaced from this account.")
+        }
         return .eligible(real)
     }
 }
