@@ -34,6 +34,17 @@ final class CommandTests: XCTestCase {
         XCTAssertEqual(r.code, 2)
     }
 
+    func testBareHelpFlagShowsTheTopLevelHelp() async {
+        for args in [["--help"], ["-h"], ["--json", "--help"]] {
+            let r = await invoke(args)
+            XCTAssertEqual(r.code, 0, "\(args)")
+            XCTAssertTrue(r.out.contains("COMMANDS"), "\(args): top-level help, not the help of `scan`")
+        }
+        let scan = await invoke(["scan", "--help"])
+        XCTAssertFalse(scan.out.contains("COMMANDS"))
+        XCTAssertTrue(scan.out.contains("scan"))
+    }
+
     func testVersionFileMatches() throws {
         let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
         let v = try String(contentsOf: root.appendingPathComponent("VERSION"), encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)

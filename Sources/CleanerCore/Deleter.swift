@@ -26,6 +26,8 @@ final class DeleteTally: @unchecked Sendable {
         var bytes: Int64
         var itemsDone: Int
         var current: String?
+        /// A helper program is running (short name); nil while files are being removed.
+        var command: String?
     }
     private struct LinkKey: Hashable { var dev: Int32; var ino: UInt64 }
     private let lock = NSLock()
@@ -33,6 +35,7 @@ final class DeleteTally: @unchecked Sendable {
     private var bytes: Int64 = 0
     private var itemsDone = 0
     private var current: String?
+    private var command: String?
     private var links = Set<LinkKey>()
 
     func add(entries e: Int, bytes b: Int64) {
@@ -44,6 +47,8 @@ final class DeleteTally: @unchecked Sendable {
     func itemFinished() { lock.lock(); itemsDone += 1; lock.unlock() }
     func itemFinishedByWalk() { if countsItems { itemFinished() } }
     func setCurrent(_ path: String) { lock.lock(); current = path; lock.unlock() }
+    /// A helper program starts (name) or ends (nil). While it runs there is no current path to show.
+    func setCommand(_ name: String?) { lock.lock(); command = name; if name != nil { current = nil }; lock.unlock() }
     /// Whether a regular file's allocated size is to be counted. A file with several names is counted once per
     /// operation (a second name frees nothing); links outside the deleted trees are not looked at. Asked right
     /// before the file is unlinked: the first name seen has `nlink > 1` and is remembered, a later name may
@@ -61,7 +66,7 @@ final class DeleteTally: @unchecked Sendable {
     }
     var snapshot: Snapshot {
         lock.lock(); defer { lock.unlock() }
-        return Snapshot(entries: entries, bytes: bytes, itemsDone: itemsDone, current: current)
+        return Snapshot(entries: entries, bytes: bytes, itemsDone: itemsDone, current: current, command: command)
     }
 }
 
@@ -238,6 +243,8 @@ struct Deleter: Sendable {
         var bytes: Int64 = 0
         /// The removal stopped because the operation was cancelled.
         var cancelled = false
+        /// Typed form of `reason` for front ends (nil: nothing went wrong, or it was already gone).
+        var kind: CleanItemReason?
     }
 
     /// Threads that share one deleting operation.
@@ -252,18 +259,29 @@ struct Deleter: Sendable {
 
     /// Like `remove`, with the outcome of every path (same order). When `flag` is set the removal stops at
     /// the next entry; what was not removed is reported as failed.
+    /// `observer` hears (index, nil) when the path at that index is started and (index, result) when it ends; both
+    /// come from the thread that handles the path, in that order for each path.
     func removeEach(_ paths: [String], mode: DeleteMode = .permanent, flag: CancelFlag? = nil,
-                    tally: DeleteTally? = nil, workers: Int = Deleter.defaultWorkers) -> [PathResult] {
+                    tally: DeleteTally? = nil, workers: Int = Deleter.defaultWorkers,
+                    observer: (@Sendable (Int, PathResult?) -> Void)? = nil) -> [PathResult] {
         let tally = tally ?? DeleteTally()
         let pool = workers > 1 ? WorkerPool(workers: workers) : nil
         // Moving to the Trash is a rename per item and stays one at a time, in order. Items that contain one another
         // are also taken one at a time (each may still use several threads inside), so no folder is walked twice at once.
         guard let pool, mode == .permanent, paths.count > 1, !Self.overlaps(paths) else {
-            return paths.map { removeOne($0, mode: mode, flag: flag, tally: tally, pool: pool) }
+            return paths.enumerated().map { i, path in
+                observer?(i, nil)
+                let r = removeOne(path, mode: mode, flag: flag, tally: tally, pool: pool)
+                observer?(i, r)
+                return r
+            }
         }
         let slots = ResultSlots(count: paths.count)
         pool.run(paths.count, make: { () }, work: { _, i in
-            slots.set(i, removeOne(paths[i], mode: mode, flag: flag, tally: tally, pool: pool))
+            observer?(i, nil)
+            let r = removeOne(paths[i], mode: mode, flag: flag, tally: tally, pool: pool)
+            slots.set(i, r)
+            observer?(i, r)
         }, finish: { _ in })
         return slots.all
     }
@@ -296,45 +314,46 @@ struct Deleter: Sendable {
         var res = PathResult(path: path)
         tally.setCurrent(path)
         defer { tally.itemFinishedByWalk() }
-        func fail(_ outcome: AuditOutcome, _ message: String) -> PathResult {
-            res.failed += 1; res.messages.append(message); res.outcome = outcome; res.reason = message
+        func fail(_ outcome: AuditOutcome, _ message: String, _ kind: CleanItemReason) -> PathResult {
+            res.failed += 1; res.messages.append(message); res.outcome = outcome; res.reason = message; res.kind = kind
             return res
         }
         if flag?.isSet == true {
             res.cancelled = true
-            return fail(.failed, "Not removed (the operation was cancelled): \(path)")
+            return fail(.failed, "Not removed (the operation was cancelled): \(path)", .cancelled)
         }
         let trashDir = env.home + "/.Trash/"
         let name = (path as NSString).lastPathComponent
         guard isAllowed(path), let (parent, last) = split(path) else {
-            return fail(.refused, "Refused (outside the allowed area, reached through a symlink, or protected): \(path)")
+            return fail(.refused, "Refused (outside the allowed area, reached through a symlink, or protected): \(path)", .refused)
         }
         // From here on the parent is held open; the path string is not resolved again.
         guard let parentFD = openDirectory(parent) else {
             var st = stat()
-            if lstat(parent, &st) != 0 && errno == ENOENT { res.reason = "already gone"; return res }
-            return fail(.refused, "Refused (its folder changed, is a symlink, or belongs to another user): \(path)")
+            if lstat(parent, &st) != 0 && errno == ENOENT { res.reason = "already gone"; res.kind = .alreadyGone; return res }
+            return fail(.refused, "Refused (its folder changed, is a symlink, or belongs to another user): \(path)", .refused)
         }
         defer { close(parentFD) }
         var st = stat()
         if fstatat(parentFD, last, &st, AT_SYMLINK_NOFOLLOW) != 0 {
-            if errno != ENOENT { return fail(.failed, "Could not access \(path)") }
+            if errno != ENOENT { return fail(.failed, "Could not access \(path)", .accessFailed) }
             res.reason = "already gone"
+            res.kind = .alreadyGone
             return res
         }
         let shared = env.sharedRoot(containing: path) != nil
-        if shared && env.owner(st) != env.uid { return fail(.refused, "Refused (belongs to another user): \(path)") }
-        if guardian.isProtectedID(FileID(st)) { return fail(.refused, "Refused (protected): \(path)") }
+        if shared && env.owner(st) != env.uid { return fail(.refused, "Refused (belongs to another user): \(path)", .refused) }
+        if guardian.isProtectedID(FileID(st)) { return fail(.refused, "Refused (protected): \(path)", .refused) }
         var walk = Walk(rootDev: st.st_dev, requiredOwner: shared ? env.uid : nil, guardian: guardian, env: env, flag: flag,
                         tally: tally, pool: pool)
         if mode == .trash && !path.hasPrefix(trashDir) {
             // The system moves the item by path, as one piece. Look inside first, read-only and by descriptor:
             // whatever the permanent walk would refuse to touch must not be carried to the Trash either.
             if let why = walk.obstacle(parentFD, last) {
-                return fail(.refused, "Refused to move \(name) to the Trash: \(why)")
+                return fail(.refused, "Refused to move \(name) to the Trash: \(why)", .refused)
             }
             do { try env.trash(URL(fileURLWithPath: path)); res.trashed = true } catch {
-                return fail(.failed, "Could not move \(name) to the Trash")
+                return fail(.failed, "Could not move \(name) to the Trash", .trashFailed)
             }
             res.entries = 1
             tally.add(entries: 1, bytes: 0)
@@ -355,6 +374,7 @@ struct Deleter: Sendable {
             res.messages.append(note)
             res.outcome = .failed
             res.reason = note
+            res.kind = walk.cancelled ? .cancelled : .partial
         }
         return res
     }

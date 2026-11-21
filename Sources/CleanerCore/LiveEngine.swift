@@ -139,9 +139,15 @@ public struct LiveEngine: CleanerEngine {
 
     public func clean(categories: [CleanCategory], mode: DeleteMode, progress: @escaping ProgressHandler,
                       deleteProgress: @escaping DeleteProgressHandler) async -> CleanResult {
+        await clean(categories: categories, mode: mode, progress: progress, deleteProgress: deleteProgress, itemEvents: { _ in })
+    }
+
+    public func clean(categories: [CleanCategory], mode: DeleteMode, progress: @escaping ProgressHandler,
+                      deleteProgress: @escaping DeleteProgressHandler, itemEvents: @escaping CleanItemHandler) async -> CleanResult {
         let flag = CancelFlag()
         return await withTaskCancellationHandler {
-            await cleanBody(categories: categories, mode: mode, flag: flag, progress: progress, deleteProgress: deleteProgress)
+            await cleanBody(categories: categories, mode: mode, flag: flag, progress: progress, deleteProgress: deleteProgress,
+                            itemEvents: itemEvents)
         } onCancel: { flag.set() }
     }
 
@@ -170,8 +176,40 @@ public struct LiveEngine: CleanerEngine {
         return out
     }
 
+    /// Item ids of a clean, in the order it runs them: `<category>|<path>` for removed paths, `<category>|run <argv>` for commands.
+    private static func pathID(_ cat: CleanCategory, _ item: CleanItem) -> String { cat.id + "|" + item.url.path }
+    private static func commandID(_ cat: CleanCategory, _ cmd: [String]) -> String { cat.id + "|run " + cmd.joined(separator: " ") }
+    private static let snapshotID = "|snapshots"
+
+    /// The events of everything a clean is about to do, in plan order (same order as `plannedAuditItems`).
+    private func plannedEvents(of categories: [CleanCategory]) -> [CleanItemEvent] {
+        var out: [CleanItemEvent] = []
+        for cat in categories {
+            for item in cat.items where item.deleteCommand == nil {
+                out.append(CleanItemEvent(id: Self.pathID(cat, item), name: item.displayName, path: item.url.path, bytes: item.sizeBytes))
+            }
+            for item in cat.items {
+                guard let cmd = item.deleteCommand else { continue }
+                out.append(CleanItemEvent(id: Self.commandID(cat, cmd), name: item.displayName, path: item.url.path,
+                                          bytes: item.sizeBytes, isCommand: true))
+            }
+            if cat.id == "snapshots" {
+                out.append(CleanItemEvent(id: cat.id + Self.snapshotID, name: cat.name, bytes: cat.sizeBytes, isCommand: true))
+            }
+            for (i, cmd) in cat.commands.enumerated() {
+                out.append(CleanItemEvent(id: Self.commandID(cat, cmd), name: cmd.joined(separator: " "),
+                                          bytes: i == 0 ? cat.sizeBytes : 0, isCommand: true))
+            }
+        }
+        return out
+    }
+
+    /// Short name of a command for "Running brew cleanup…".
+    static func commandName(_ cmd: [String]) -> String { cmd.prefix(2).joined(separator: " ") }
+
     private func cleanBody(categories: [CleanCategory], mode: DeleteMode, flag: CancelFlag,
-                           progress: @escaping ProgressHandler, deleteProgress: @escaping DeleteProgressHandler) async -> CleanResult {
+                           progress: @escaping ProgressHandler, deleteProgress: @escaping DeleteProgressHandler,
+                           itemEvents: @escaping CleanItemHandler) async -> CleanResult {
         var op: Operation
         switch await begin(kind: .cleanup, mode: mode, intended: plannedAuditItems(of: categories)) {
         case .refused(let result): return result
@@ -180,7 +218,11 @@ public struct LiveEngine: CleanerEngine {
         // What the bar counts: every item, command and snapshot step, and (when the scan knew them) the bytes.
         op.itemsTotal = categories.reduce(0) { $0 + $1.items.count + $1.commands.count + ($1.id == "snapshots" ? 1 : 0) }
         let expected = categories.reduce(Int64(0)) { sum, c in sum + c.items.filter { $0.deleteCommand == nil }.reduce(0) { $0 + $1.sizeBytes } }
-        op.expectedBytes = mode == .permanent && expected > 0 ? expected : nil
+        // Trash mode counts the scanned sizes of the items moved so far, so the bar can move without file counts.
+        op.expectedBytes = expected > 0 ? expected : nil
+        op.movesWhole = mode == .trash
+        let tracker = ItemTracker(planned: plannedEvents(of: categories), handler: itemEvents)
+        op.tracker = tracker
         let deleter = self.deleter
         var failed = 0
         var cancelled = false
@@ -188,6 +230,10 @@ public struct LiveEngine: CleanerEngine {
         let tally = op.tally
         let ticker = startProgressTicker(op, deleteProgress)
         defer { ticker.stop() }
+        // Item ids in the order the plan lists them; each step below takes the next ones.
+        let allIDs = tracker.ids
+        var nextID = 0
+        func takeIDs(_ n: Int) -> [String] { defer { nextID += n }; return Array(allIDs[nextID..<(nextID + n)]) }
         for (index, cat) in categories.enumerated() {
             if Task.isCancelled {
                 cancelled = true
@@ -196,9 +242,18 @@ public struct LiveEngine: CleanerEngine {
             }
             progress("Cleaning \(cat.name)…")
             let pathItems = cat.items.filter { $0.deleteCommand == nil }
+            let pathIDs = takeIDs(pathItems.count)
+            let commandItemCount = cat.items.count - pathItems.count
+            let commandItemIDs = takeIDs(commandItemCount)
+            let snapshotID = cat.id == "snapshots" ? takeIDs(1)[0] : nil
+            let commandIDs = takeIDs(cat.commands.count)
             if !pathItems.isEmpty {
                 let paths = pathItems.map { $0.url.path }
-                let results = await onBackground { deleter.removeEach(paths, mode: mode, flag: flag, tally: tally) }
+                let results = await onBackground {
+                    deleter.removeEach(paths, mode: mode, flag: flag, tally: tally, observer: { i, r in
+                        if let r { tracker.finish(pathIDs[i], r, scanned: pathItems[i].sizeBytes) } else { tracker.start(pathIDs[i]) }
+                    })
+                }
                 for (item, r) in zip(pathItems, results) {
                     failed += r.failed
                     messages += r.messages
@@ -209,61 +264,94 @@ public struct LiveEngine: CleanerEngine {
                                            entriesRemoved: r.entries))
                 }
             }
+            var commandItemIndex = 0
             for item in cat.items {
                 guard let cmd = item.deleteCommand else { continue }
+                let itemID = commandItemIDs[commandItemIndex]
+                commandItemIndex += 1
                 if Task.isCancelled {
                     cancelled = true
+                    tracker.finish(itemID, .skipped, bytes: item.sizeBytes, reason: .cancelled)
                     op.audit.add(AuditItem(path: item.url.path, name: item.displayName, categoryID: cat.id, sizeBytes: item.sizeBytes,
                                            action: .commandRun, command: cmd, outcome: .failed, reason: Self.cancelledReason))
                     continue
                 }
                 progress("Removing \(item.displayName)…")
+                tracker.start(itemID)
+                tally.setCommand(Self.commandName(cmd))
                 let r = await runAllowed(cmd, timeout: 600)
+                tally.setCommand(nil)
                 tally.itemFinished()
                 var reason: String?
+                // Stopping terminates the program (the child is signalled when the task is cancelled).
+                let stopped = !r.ok && Task.isCancelled
+                if stopped { cancelled = true }
                 if !r.ok {
                     failed += 1
-                    reason = Self.failureText(cmd, r)
+                    reason = stopped ? Self.cancelledReason : Self.failureText(cmd, r)
                     messages.append("\(item.displayName): \(reason ?? "")")
                 }
+                tracker.finish(itemID, r, scanned: item.sizeBytes, cancelled: stopped, detail: reason)
                 op.audit.add(AuditItem(path: item.url.path, name: item.displayName, categoryID: cat.id, sizeBytes: item.sizeBytes,
                                        action: .commandRun, command: cmd,
                                        outcome: r.ok ? .ok : (r.status == 126 && !r.launched ? .refused : .failed), reason: reason))
             }
             if cat.id == "snapshots", Task.isCancelled {
                 cancelled = true
+                if let snapshotID { tracker.finish(snapshotID, .skipped, bytes: cat.sizeBytes, reason: .cancelled) }
                 op.audit.add(Self.snapshotStep(cat, outcome: .failed, reason: Self.cancelledReason))
             } else if cat.id == "snapshots" {
+                if let snapshotID { tracker.start(snapshotID) }
+                tally.setCommand("tmutil")
                 let r = await GenericScanner.snapshotCleanup(env: env, progress: progress)
+                tally.setCommand(nil)
                 tally.itemFinished()
                 failed += r.failed
                 messages += r.messages
+                if let snapshotID {
+                    if r.failed == 0 {
+                        tracker.finish(snapshotID, .done, bytes: cat.sizeBytes)
+                    } else if Task.isCancelled {
+                        cancelled = true
+                        tracker.finish(snapshotID, .skipped, bytes: cat.sizeBytes, reason: .cancelled, detail: r.messages.first)
+                    } else {
+                        tracker.finish(snapshotID, .failed, bytes: cat.sizeBytes, reason: .commandFailed, detail: r.messages.first)
+                    }
+                }
                 op.audit.add(Self.snapshotStep(cat, outcome: r.failed > 0 ? .failed : .ok, reason: r.messages.first))
             }
             for (i, cmd) in cat.commands.enumerated() {
                 if Task.isCancelled {
                     cancelled = true
+                    tracker.finish(commandIDs[i], .skipped, bytes: i == 0 ? cat.sizeBytes : 0, reason: .cancelled)
                     op.audit.add(AuditItem(path: nil, name: cmd.joined(separator: " "), categoryID: cat.id, sizeBytes: i == 0 ? cat.sizeBytes : 0,
                                            action: .commandRun, command: cmd, outcome: .failed, reason: Self.cancelledReason))
                     continue
                 }
                 progress("Running \(cmd.joined(separator: " "))…")
+                tracker.start(commandIDs[i])
+                tally.setCommand(Self.commandName(cmd))
                 let r = await runAllowed(cmd, timeout: 1800)
+                tally.setCommand(nil)
                 tally.itemFinished()
                 var reason: String?
+                let stopped = !r.ok && Task.isCancelled
+                if stopped { cancelled = true }
                 if r.ok {
                     messages.append("\(cmd.joined(separator: " ")): \(String(r.lastLine.prefix(100)))")
                 } else {
                     failed += 1
-                    reason = Self.failureText(cmd, r)
+                    reason = stopped ? Self.cancelledReason : Self.failureText(cmd, r)
                     messages.append("\(cmd.joined(separator: " ")): \(reason ?? "")")
                 }
+                tracker.finish(commandIDs[i], r, scanned: i == 0 ? cat.sizeBytes : 0, cancelled: stopped, detail: reason)
                 op.audit.add(AuditItem(path: nil, name: cmd.joined(separator: " "), categoryID: cat.id, sizeBytes: i == 0 ? cat.sizeBytes : 0,
                                        action: .commandRun, command: cmd,
                                        outcome: r.ok ? .ok : (r.status == 126 && !r.launched ? .refused : .failed), reason: reason))
             }
         }
         ticker.stop()
+        tracker.finishRemaining()
         return await finish(op, failed: failed, messages: messages, cancelled: cancelled)
     }
 
@@ -309,14 +397,21 @@ public struct LiveEngine: CleanerEngine {
 
     public func delete(urls: [URL], mode: DeleteMode, purpose: DeletePurpose, progress: @escaping ProgressHandler,
                        deleteProgress: @escaping DeleteProgressHandler) async -> CleanResult {
+        await delete(urls: urls, mode: mode, purpose: purpose, progress: progress, deleteProgress: deleteProgress, itemEvents: { _ in })
+    }
+
+    public func delete(urls: [URL], mode: DeleteMode, purpose: DeletePurpose, progress: @escaping ProgressHandler,
+                       deleteProgress: @escaping DeleteProgressHandler, itemEvents: @escaping CleanItemHandler) async -> CleanResult {
         let flag = CancelFlag()
         return await withTaskCancellationHandler {
-            await deleteBody(urls: urls, mode: mode, purpose: purpose, flag: flag, progress: progress, deleteProgress: deleteProgress)
+            await deleteBody(urls: urls, mode: mode, purpose: purpose, flag: flag, progress: progress, deleteProgress: deleteProgress,
+                             itemEvents: itemEvents)
         } onCancel: { flag.set() }
     }
 
     private func deleteBody(urls: [URL], mode: DeleteMode, purpose: DeletePurpose, flag: CancelFlag,
-                            progress: @escaping ProgressHandler, deleteProgress: @escaping DeleteProgressHandler) async -> CleanResult {
+                            progress: @escaping ProgressHandler, deleteProgress: @escaping DeleteProgressHandler,
+                            itemEvents: @escaping CleanItemHandler) async -> CleanResult {
         progress("Deleting \(urls.count) \(urls.count == 1 ? "item" : "items")…")
         let paths = urls.map { $0.path }
         let deleter = self.deleter
@@ -336,15 +431,27 @@ public struct LiveEngine: CleanerEngine {
         case .started(let started): op = started
         }
         op.itemsTotal = paths.count
+        op.movesWhole = mode == .trash
+        let tracker = ItemTracker(planned: paths.map { p in
+            let i = item(p, action: .deleted, outcome: .pending, reason: nil)
+            return CleanItemEvent(id: p, name: i.name, path: p)
+        }, handler: itemEvents)
+        op.tracker = tracker
+        let ids = tracker.ids
         let tally = op.tally
         let ticker = startProgressTicker(op, deleteProgress)
         defer { ticker.stop() }
-        let results = await onBackground { deleter.removeEach(paths, mode: mode, flag: flag, tally: tally) }
+        let results = await onBackground {
+            deleter.removeEach(paths, mode: mode, flag: flag, tally: tally, observer: { i, r in
+                if let r { tracker.finish(ids[i], r, scanned: 0) } else { tracker.start(ids[i]) }
+            })
+        }
         for r in results {
             op.audit.add(item(r.path, action: r.trashed ? .movedToTrash : .deleted, outcome: r.outcome, reason: r.reason,
                               size: Self.recordedSize(r, scanned: 0), entries: r.entries))
         }
         ticker.stop()
+        tracker.finishRemaining()
         return await finish(op, failed: results.reduce(0) { $0 + $1.failed }, messages: results.flatMap { $0.messages },
                             cancelled: results.contains { $0.cancelled })
     }
@@ -372,14 +479,18 @@ public struct LiveEngine: CleanerEngine {
         let tally = op.tally
         let total = op.itemsTotal
         let expected = op.expectedBytes
+        let tracker = op.tracker
+        let movesWhole = op.movesWhole
         let home = env.home + "/"
         let last = LastSent()
         let emit: @Sendable () -> Void = {
             let s = tally.snapshot
             var shown = s.current
             if let p = shown, p.hasPrefix(home) { shown = String(p.dropFirst(home.count)) }
-            let value = DeleteProgress(itemsDone: s.itemsDone, itemsTotal: total, entriesRemoved: s.entries, bytesFreed: s.bytes,
-                                       expectedBytes: expected, currentItem: shown)
+            let bytes = movesWhole ? (tracker?.doneBytes ?? s.bytes) : s.bytes
+            let value = DeleteProgress(itemsDone: s.itemsDone, itemsTotal: total, entriesRemoved: s.entries, bytesFreed: bytes,
+                                       expectedBytes: expected, currentItem: shown, phase: s.command.map { .command($0) } ?? .removing,
+                                       movesWhole: movesWhole)
             if last.changed(to: value) { handler(value) }
         }
         let task = Task.detached {
@@ -434,6 +545,10 @@ public struct LiveEngine: CleanerEngine {
         var tally = DeleteTally()
         var itemsTotal = 0
         var expectedBytes: Int64?
+        /// Per-item states (cleanups and deletes of paths); nil for operations that do not report items.
+        var tracker: ItemTracker?
+        /// Items are moved to the Trash as one piece each, so the bytes shown are those of finished items.
+        var movesWhole = false
     }
 
     enum Beginning {
@@ -502,6 +617,7 @@ public struct LiveEngine: CleanerEngine {
         AuditActivity.end()
         walkCache.invalidate()
         return CleanResult(freedBytes: max(after - op.before, 0), failedCount: failed, messages: messages, auditRecorded: recorded,
-                           cancelled: cancelled, entriesRemoved: counted.entries, bytesRemoved: counted.bytes)
+                           cancelled: cancelled, entriesRemoved: counted.entries, bytesRemoved: counted.bytes,
+                           items: op.tracker?.all ?? [])
     }
 }

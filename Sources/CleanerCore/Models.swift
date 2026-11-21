@@ -387,11 +387,119 @@ public struct CleanResult: Sendable, Codable {
     /// hard links counts once; links outside the deleted folders are not considered, so this can exceed `freedBytes`.
     public var entriesRemoved: Int
     public var bytesRemoved: Int64
+    /// The last known state of every planned item, in plan order (empty when the engine does not report items).
+    /// Not part of the encoded form: it only feeds front ends that show a per-item summary.
+    public var items: [CleanItemEvent] = []
     public init(freedBytes: Int64, failedCount: Int, messages: [String], auditRecorded: Bool = false,
-                cancelled: Bool = false, entriesRemoved: Int = 0, bytesRemoved: Int64 = 0) {
+                cancelled: Bool = false, entriesRemoved: Int = 0, bytesRemoved: Int64 = 0, items: [CleanItemEvent] = []) {
         self.freedBytes = freedBytes; self.failedCount = failedCount; self.messages = messages
         self.auditRecorded = auditRecorded; self.cancelled = cancelled
-        self.entriesRemoved = entriesRemoved; self.bytesRemoved = bytesRemoved
+        self.entriesRemoved = entriesRemoved; self.bytesRemoved = bytesRemoved; self.items = items
+    }
+    private enum CodingKeys: String, CodingKey {
+        case freedBytes, failedCount, messages, auditRecorded, cancelled, entriesRemoved, bytesRemoved
+    }
+}
+
+/// What a deleting operation is doing right now.
+public enum DeletePhase: Sendable, Equatable {
+    /// Removing files itself (counts and the current path are live).
+    case removing
+    /// Waiting for a helper program (`brew cleanup`, `docker ...`); it reports nothing until it exits.
+    /// Cancelling the operation terminates the program. The value is a short name for it.
+    case command(String)
+}
+
+/// Why an item was not (completely) removed. Typed, so front ends do not read it out of message text.
+public enum CleanItemReason: String, Sendable, Codable, Equatable {
+    /// Not touched because the operation was stopped.
+    case cancelled
+    /// The safety checks refused it (outside the allowed area, a symlink, another user's, protected).
+    case refused
+    /// Some entries could not be removed (in use, or protected by macOS).
+    case partial
+    /// Moving it to the Trash failed.
+    case trashFailed
+    /// It could not be examined.
+    case accessFailed
+    /// It was already gone when its turn came.
+    case alreadyGone
+    case toolMissing
+    case timedOut
+    case commandFailed
+    case commandRefused
+    case other
+
+    /// A short sentence for the UI and the CLI.
+    public var text: String {
+        switch self {
+        case .cancelled: "Stopped before it was reached"
+        case .refused: "Refused by a safety check"
+        case .partial: "Some entries are in use or protected by macOS"
+        case .trashFailed: "Could not be moved to the Trash"
+        case .accessFailed: "Could not be examined"
+        case .alreadyGone: "Already gone"
+        case .toolMissing: "The tool is not installed"
+        case .timedOut: "The command timed out"
+        case .commandFailed: "The command failed"
+        case .commandRefused: "The command is not allowed"
+        case .other: "Not removed"
+        }
+    }
+}
+
+public enum CleanItemState: String, Sendable, Codable, Equatable {
+    case queued, deleting, done, failed, skipped
+    public var isFinal: Bool { self == .done || self == .failed || self == .skipped }
+}
+
+/// One planned item of a deleting operation and what became of it. Emitted when an item changes state
+/// (queued, started, finished), never per file.
+public struct CleanItemEvent: Sendable, Codable, Equatable, Identifiable {
+    public var id: String
+    public var name: String
+    /// Absolute path, or nil for a step that only runs a command.
+    public var path: String?
+    public var state: CleanItemState
+    /// Done: what was removed (or, in Trash mode, moved). Otherwise the scanned size, when known.
+    public var bytes: Int64
+    /// Files, links and folders removed.
+    public var entries: Int
+    public var reason: CleanItemReason?
+    /// The engine's own words about it (a refusal, a command's last lines), when it has some.
+    public var detail: String?
+    /// The item runs a helper program instead of removing files.
+    public var isCommand: Bool
+    public init(id: String, name: String, path: String? = nil, state: CleanItemState = .queued, bytes: Int64 = 0, entries: Int = 0,
+                reason: CleanItemReason? = nil, detail: String? = nil, isCommand: Bool = false) {
+        self.id = id; self.name = name; self.path = path; self.state = state; self.bytes = bytes; self.entries = entries
+        self.reason = reason; self.detail = detail; self.isCommand = isCommand
+    }
+}
+
+public typealias CleanItemHandler = @Sendable (CleanItemEvent) -> Void
+
+/// Smooths bytes/s (or items/s) into a time-left estimate. Feed it the amount done every tick.
+public struct ProgressEstimator: Sendable {
+    private var lastTime: TimeInterval?
+    private var lastDone: Double = 0
+    private var rate: Double?
+    public init() {}
+
+    /// `time` in seconds since the start; `done` in any unit that only grows.
+    public mutating func add(time: TimeInterval, done: Double) {
+        guard let t0 = lastTime else { lastTime = time; lastDone = done; return }
+        let dt = time - t0
+        guard dt >= 0.5 else { return }
+        let instant = max(0, done - lastDone) / dt
+        rate = rate.map { $0 * 0.7 + instant * 0.3 } ?? instant
+        lastTime = time; lastDone = done
+    }
+
+    /// Seconds left, or nil while the estimate is not trustworthy (first `warmup` seconds, no progress yet).
+    public func secondsLeft(remaining: Double, elapsed: TimeInterval, warmup: TimeInterval = 4) -> TimeInterval? {
+        guard elapsed >= warmup, let rate, rate > 0, remaining > 0 else { return nil }
+        return remaining / rate
     }
 }
 
@@ -406,10 +514,23 @@ public struct DeleteProgress: Sendable, Equatable {
     public var expectedBytes: Int64?
     /// What is being deleted right now, relative to the home folder.
     public var currentItem: String?
+    /// Removing files, or waiting for a helper program.
+    public var phase: DeletePhase
+    /// Items are moved as one piece (Trash mode): bytes only change when an item is finished.
+    public var movesWhole: Bool
     public init(itemsDone: Int, itemsTotal: Int, entriesRemoved: Int, bytesFreed: Int64, expectedBytes: Int64? = nil,
-                currentItem: String? = nil) {
+                currentItem: String? = nil, phase: DeletePhase = .removing, movesWhole: Bool = false) {
         self.itemsDone = itemsDone; self.itemsTotal = itemsTotal; self.entriesRemoved = entriesRemoved
         self.bytesFreed = bytesFreed; self.expectedBytes = expectedBytes; self.currentItem = currentItem
+        self.phase = phase; self.movesWhole = movesWhole
+    }
+
+    /// For the bar: nil means "no honest fraction" (a helper program is running, or one big item is moved whole),
+    /// so the bar is indeterminate instead of sitting at 0 %.
+    public var displayFraction: Double? {
+        if case .command = phase { return nil }
+        if movesWhole && itemsTotal <= 1 { return nil }
+        return fraction
     }
 
     /// 0...1: by bytes when the expected total is known, otherwise by items. Never reaches 1 before the end.
@@ -557,6 +678,17 @@ public protocol CleanerEngine: Sendable {
     func removeClones(_ clones: [RepoClone], force: Bool, mode: DeleteMode, progress: @escaping ProgressHandler,
                       deleteProgress: @escaping DeleteProgressHandler) async -> CleanResult
 
+    // ---- v9: one event per item (default implementations below ignore the handler) ----
+
+    /// Like the v6 `clean`, and `itemEvents` also gets one event per planned item when it is queued, when it starts
+    /// and when it ends (in that order for each item), never one per file. The result's `items` has the final states.
+    func clean(categories: [CleanCategory], mode: DeleteMode, progress: @escaping ProgressHandler,
+               deleteProgress: @escaping DeleteProgressHandler, itemEvents: @escaping CleanItemHandler) async -> CleanResult
+
+    /// Like the v6 `delete(urls:...)` with item events (see above).
+    func delete(urls: [URL], mode: DeleteMode, purpose: DeletePurpose, progress: @escaping ProgressHandler,
+                deleteProgress: @escaping DeleteProgressHandler, itemEvents: @escaping CleanItemHandler) async -> CleanResult
+
     // ---- v7: the repository scan reports each working copy as it is inspected (default implementation below) ----
 
     /// Like `scanRepos(root:progress:)`; `partial` is called (from any thread) after every inspected working
@@ -636,6 +768,14 @@ public extension CleanerEngine {
     func removeClones(_ clones: [RepoClone], force: Bool, mode: DeleteMode, progress: @escaping ProgressHandler,
                       deleteProgress: @escaping DeleteProgressHandler) async -> CleanResult {
         await removeClones(clones, force: force, mode: mode, progress: progress)
+    }
+    func clean(categories: [CleanCategory], mode: DeleteMode, progress: @escaping ProgressHandler,
+               deleteProgress: @escaping DeleteProgressHandler, itemEvents: @escaping CleanItemHandler) async -> CleanResult {
+        await clean(categories: categories, mode: mode, progress: progress, deleteProgress: deleteProgress)
+    }
+    func delete(urls: [URL], mode: DeleteMode, purpose: DeletePurpose, progress: @escaping ProgressHandler,
+                deleteProgress: @escaping DeleteProgressHandler, itemEvents: @escaping CleanItemHandler) async -> CleanResult {
+        await delete(urls: urls, mode: mode, purpose: purpose, progress: progress, deleteProgress: deleteProgress)
     }
     func scanRepos(root: URL, progress: @escaping ProgressHandler, partial: @escaping RepoScanHandler) async -> [RepoGroup] {
         await scanRepos(root: root, progress: progress)

@@ -58,6 +58,11 @@ func runCLI(arguments: [String],
         }
         if rest.first == "--" { rest.removeFirst() }
 
+        // `mac-cleaner --help` (no subcommand) shows the top-level help, not the help of the default `scan`.
+        if wantsHelp && rest.isEmpty {
+            printLines(Help.general())
+            return ExitCode.ok
+        }
         let name = rest.first ?? "scan"
         if !rest.isEmpty { rest.removeFirst() }
 
