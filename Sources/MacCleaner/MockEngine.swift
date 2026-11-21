@@ -712,10 +712,10 @@ final class MockEngine: CleanerEngine, @unchecked Sendable {
         func days(_ d: Double) -> Date { Date().addingTimeInterval(-d * 86_400) }
         func app(_ name: String, _ id: String, _ version: String, _ mb: Int64, opened: Date?, never: Bool = false, running: Bool = false,
                  mas: Bool = false, cask: String? = nil, block: AppRemovalBlock? = nil, folder: String = "/Applications",
-                 leftovers: [AppLeftover] = [], note: String? = nil) -> InstalledApp {
+                 leftovers: [AppLeftover] = [], note: String? = nil, activity: Date? = nil) -> InstalledApp {
             InstalledApp(url: URL(fileURLWithPath: "\(folder)/\(name).app"), name: name, bundleID: id, version: version, bundleBytes: mb * MB,
                          lastOpened: opened, neverOpened: never, isRunning: running, isAppStore: mas, homebrewCask: cask, removalBlock: block,
-                         device: 1, inode: UInt64(id.utf8.reduce(UInt64(7)) { $0 &* 31 &+ UInt64($1) } % 100_000 + 10), leftovers: leftovers, leftoverNote: note)
+                         device: 1, inode: UInt64(id.utf8.reduce(UInt64(7)) { $0 &* 31 &+ UInt64($1) } % 100_000 + 10), leftovers: leftovers, leftoverNote: note, lastActivity: activity)
         }
         let all: [InstalledApp] = [
             app("Xcode", "com.apple.dt.Xcode", "16.2", 12_800, opened: days(2), block: .apple,
@@ -741,7 +741,7 @@ final class MockEngine: CleanerEngine, @unchecked Sendable {
                                         sizeBytes: 55 * MB, selectedByDefault: false, note: "Shared with other apps from the same developer; never removed from here.")]),
             app("Old Notes Helper", "org.example.notehelper", "0.9", 35, opened: nil, never: true,
                 leftovers: [l("Application Support/org.example.notehelper", "Application Support", .data, 3)]),
-            app("Setapp Tool", "com.setapp.tool", "5.0", 130, opened: nil, folder: "/Applications/Setapp"),
+            app("Setapp Tool", "com.setapp.tool", "5.0", 130, opened: nil, folder: "/Applications/Setapp", activity: days(34)),
             app("Pixelmator Pro", "com.pixelmator.pro", "3.6", 640, opened: days(75), mas: true, block: .notOwned,
                 leftovers: [l("Containers/com.pixelmator.pro", "Container", .data, 2_100)]),
             app("Mac Cleaner", "io.github.baturox.mac-cleaner", "0.1.4", 18, opened: days(0), block: .macCleaner),

@@ -34,18 +34,35 @@ private struct AppIconView: View {
 }
 
 extension InstalledApp {
-    /// Sort key for the "Last opened" column: oldest first when ascending; never < dates < unknown.
+    /// Sort key for the "Last opened" column: oldest first when ascending; no record < dates (real or estimated).
     fileprivate var openedKey: Double {
-        if neverOpened { return -Double.greatestFiniteMagnitude }
-        return lastOpened?.timeIntervalSince1970 ?? Double.greatestFiniteMagnitude
+        if let lastOpened { return lastOpened.timeIntervalSince1970 }
+        if let lastActivity { return lastActivity.timeIntervalSince1970 }
+        return -Double.greatestFiniteMagnitude
     }
     fileprivate var lowerName: String { name.lowercased() }
 
+    /// The real launch date when Spotlight has it, "≈ <date>" for an estimate from the app's data files, else "no record".
+    /// "no record" covers both "Spotlight has no launch date" and "it could not say": either way nothing is known.
     fileprivate var openedText: String {
-        if neverOpened { return "no record" }
-        guard let lastOpened else { return "unknown" }
-        if Date().timeIntervalSince(lastOpened) < 86_400 { return "today" }
-        return Fmt.relative(lastOpened)
+        if let lastOpened { return Self.ago(lastOpened) }
+        if isRunning { return "running now" }
+        if let lastActivity { return "≈ " + Self.ago(lastActivity) }
+        return "no record"
+    }
+
+    fileprivate var openedHelp: String {
+        if lastOpened == nil, isRunning { return "The app is running now; macOS has no earlier launch date for it." }
+        if let lastOpened { return "Last opened " + lastOpened.formatted(date: .abbreviated, time: .omitted) + " (from Spotlight)." }
+        if let lastActivity {
+            return "Estimate: macOS has no launch date for this app. Its own data files last changed on "
+                + lastActivity.formatted(date: .abbreviated, time: .omitted) + ". This is not a launch date and is never used to call an app unused."
+        }
+        return "macOS has no launch date for this app, and it keeps no data files Mac Cleaner could use to estimate one."
+    }
+
+    private static func ago(_ d: Date) -> String {
+        Date().timeIntervalSince(d) < 86_400 ? "today" : Fmt.relative(d)
     }
 
     /// Opened at least `days` ago. An app Spotlight has no record for is not counted: nothing is claimed without one.
@@ -135,12 +152,12 @@ struct AppsView: View {
                         EmptyStateView(title: "No matches", message: "No app matches the current filters.", symbol: "line.3.horizontal.decrease.circle")
                     } else {
                         HSplitView {
-                            table(rows).frame(minWidth: 540, maxHeight: .infinity)
+                            table(rows).frame(minWidth: 480, maxHeight: .infinity)
                             if let app = model.apps.first(where: { $0.id == selection }) {
-                                AppDetail(model: model, app: app, ticked: tickBinding(app)).frame(minWidth: 300, idealWidth: 330, maxWidth: 420, maxHeight: .infinity)
+                                AppDetail(model: model, app: app, ticked: tickBinding(app)).frame(minWidth: 280, idealWidth: 370, maxWidth: 380, maxHeight: .infinity)
                             } else {
                                 EmptyStateView(title: "Select an app", message: "See what it keeps on this Mac and remove it with its leftovers.",
-                                               symbol: "app.badge").frame(minWidth: 300, idealWidth: 330, maxWidth: 420, maxHeight: .infinity)
+                                               symbol: "app.badge").frame(minWidth: 280, idealWidth: 370, maxWidth: 380, maxHeight: .infinity)
                             }
                         }
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -210,26 +227,27 @@ struct AppsView: View {
                     }
                 }
             }
-            .width(min: 150, ideal: 170)
+            .width(min: 110, ideal: 140)
             TableColumn("Version") { (a: InstalledApp) in
                 Text(a.version ?? "—").foregroundStyle(.secondary).lineLimit(1)
             }
-            .width(min: 50, ideal: 70, max: 100)
+            .width(min: 44, ideal: 52, max: 100)
             TableColumn("Size", value: \.bundleBytes) { (a: InstalledApp) in
                 Text(Fmt.bytes(a.bundleBytes)).monospacedDigit().frame(maxWidth: .infinity, alignment: .trailing)
             }
-            .width(min: 70, ideal: 80, max: 110)
+            .width(min: 62, ideal: 68, max: 110)
             TableColumn("Data", value: \.dataBytes) { (a: InstalledApp) in
                 Text(a.dataBytes > 0 ? Fmt.bytes(a.dataBytes) : "—").monospacedDigit().frame(maxWidth: .infinity, alignment: .trailing)
                     .foregroundStyle(a.dataBytes > 0 ? Color.primary : Color.secondary)
             }
-            .width(min: 70, ideal: 80, max: 110)
-            TableColumn("Last opened", value: \.openedKey) { (a: InstalledApp) in
+            .width(min: 62, ideal: 68, max: 110)
+            TableColumn("Last used", value: \.openedKey) { (a: InstalledApp) in
                 Text(a.openedText)
                     .foregroundStyle(a.unused(forAtLeast: 90) ? Color.primary : Color.secondary)
-                    .lineLimit(1)
+                    .lineLimit(1).minimumScaleFactor(0.85)
+                    .help(a.openedHelp)
             }
-            .width(min: 90, ideal: 120, max: 160)
+            .width(min: 104, ideal: 120, max: 160)
         }
     }
 }
@@ -299,7 +317,7 @@ private struct AppDetail: View {
             fact("Version", app.version ?? "—")
             fact("App size", Fmt.bytes(app.bundleBytes))
             fact("Data kept", Fmt.bytes(app.dataBytes) + (app.cacheBytes > 0 ? " (caches \(Fmt.bytes(app.cacheBytes)))" : ""))
-            fact("Last opened", app.openedText)
+            fact("Last used", app.openedText).help(app.openedHelp)
             fact("Location", app.url.abbreviatedPath)
         }
     }

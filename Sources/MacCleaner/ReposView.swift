@@ -228,6 +228,7 @@ struct ReposView: View {
                     .disabled(model.reposAreProvisional)
                     .help(model.reposAreProvisional ? "Available once the copies have been checked again."
                                                     : "This copy holds work that exists nowhere else. Turn on to be able to select it.")
+                    .fixedSize().frame(width: 104, alignment: .trailing)
             }
             VStack(alignment: .trailing, spacing: 2) {
                 if c.sizePending && c.sizeBytes == 0 {
@@ -243,7 +244,7 @@ struct ReposView: View {
                      : c.wasInspected ? "commit \(Fmt.ago(c.lastCommit)) · idle \(Fmt.idle(c.idleDays))" : "idle \(Fmt.idle(c.idleDays))")
                     .font(.caption).foregroundStyle(.secondary).monospacedDigit()
             }
-            .frame(minWidth: 130, alignment: .trailing)
+            .frame(width: 160, alignment: .trailing)
         }
         .padding(.vertical, 4)
         .opacity(selectable || selected ? 1 : 0.92)
