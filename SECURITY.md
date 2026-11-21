@@ -219,7 +219,8 @@ A repository's local configuration can make ordinary read-only git commands run 
 25. Everything is listed and confirmed before deletion; `--dry-run` shows the plan and changes nothing. Text
     printed by the CLI has control characters and escape sequences from file names and labels replaced. The
     mock engine and the `MACCLEANER_*` environment hooks used for screenshots exist in debug builds only. The
-    app and CLI send no telemetry; the only network use is the update check and install (see "Updater").
+    app and CLI send no telemetry; the only network use is the update check and install (see "Updater"), plus
+    whatever macOS itself asks Apple while Gatekeeper assesses a downloaded update.
 
 ## MCP server (`mac-cleaner mcp`)
 
@@ -306,6 +307,7 @@ where its files are.
    declared expanded size is capped (400 MB); it must contain exactly one app bundle with the expected name.
 5. SHA-256 equals the entry in the release's `SHA256SUMS`.
 6. Signature: `SecStaticCodeCheckValidityWithErrors` with all-architectures, nested-code and strict validation,
+   and symbolic links restricted to the bundle (`kSecCSRestrictSymlinks`, as `codesign --verify --strict` does),
    against `anchor apple generic and identifier "<bundle id>" and certificate leaf[subject.OU] = "<team>" and
    certificate 1[field.1.2.840.113635.100.6.2.6] and certificate leaf[field.1.2.840.113635.100.6.1.13]`;
    then bundle identifier and `CFBundleShortVersionString` must match (id: ours; version: the advertised one).
@@ -319,15 +321,20 @@ more right before the swap and again on the installed path right after it; a fai
 Nothing is copied between verification and use, and nothing is launched before it passed.
 
 **Where it works.** Only for an app in a folder the user can write to: not from a disk image, a read-only
-volume, an App Translocation path, a symlink or a folder the user cannot change. Then it refuses and offers a
+volume, an App Translocation path, a symlink, a folder the user cannot change or an app bundle that belongs to
+another user (moving a folder needs write access to the folder itself). Then it refuses and offers a
 manual download. It never asks for administrator rights and has no privileged helper.
 
 **Relaunch and rollback.** After the swap the old app sits in the private folder as a backup. A detached
 `/bin/sh` helper is started with fixed positional arguments (nothing is interpolated into the script): it waits
 for the old process to exit, opens the new app, and if the new app has not written its acknowledgement within
-about a minute, moves the failed app aside, puts the backup back and opens it. The new app deletes the backup
+about a minute, moves the failed app aside, puts the backup back and opens it (if the backup cannot be moved
+back, the new app is returned to its place: the installed path is never left empty). The new app deletes the backup
 (and the record `pending-update.json`) a few seconds after it started. Only folders named `.MacCleaner-update-*`
-that sit next to the app, are real directories (not links) and belong to the user are ever deleted.
+that sit next to the app, are real directories (not links) and belong to the user are ever deleted. When a swap or
+a way back fails half way (a rename refused by the file system), the staging folder may hold the only copy of the
+previous app: it is then marked (`KEEP-previous-app-inside`), never deleted automatically, and the error names the
+path of the previous app.
 
 **Quarantine.** Files fetched by the app carry no quarantine flag and the updater never removes one from
 anything. The new app is launched only after the checks above, including the Gatekeeper assessment.
