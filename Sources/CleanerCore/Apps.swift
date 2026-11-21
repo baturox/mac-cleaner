@@ -67,10 +67,12 @@ extension LiveEngine {
                                    label: p.label, kind: p.kind, match: p.match, sizeBytes: size, selectedByDefault: tick, note: note,
                                    cleanupCategoryID: p.match == .exact ? overlap[p.path] : nil)
             }
+            let activity = (date == nil && !running) ? AppCatalog.approximateActivity(bundleID: c.bundleID, index: setup.index) : nil
             apps.append(InstalledApp(url: URL(fileURLWithPath: c.path, isDirectory: true), name: c.name, bundleID: c.bundleID,
                                      version: c.info.version, bundleBytes: sizes[c.path] ?? 0, lastOpened: date, neverOpened: never,
                                      isRunning: running, isAppStore: c.isAppStore, homebrewCask: setup.casks[c.path],
-                                     removalBlock: c.block, device: c.device, inode: c.inode, leftovers: leftovers, leftoverNote: notes[i]))
+                                     removalBlock: c.block, device: c.device, inode: c.inode, leftovers: leftovers, leftoverNote: notes[i],
+                                     lastActivity: activity))
         }
         return apps.sorted { $0.totalBytes != $1.totalBytes ? $0.totalBytes > $1.totalBytes : $0.name.lowercased() < $1.name.lowercased() }
     }

@@ -88,9 +88,19 @@ enum AppsCommand {
         return list
     }
 
+    /// The text for the table and the detail view. An estimate from the app's data files is prefixed with "≈ ".
+    static func displayedOpenedText(_ app: InstalledApp, now: Date) -> String {
+        if app.lastOpened == nil, let d = app.lastActivity { return "≈ " + relativeText(d, now: now) }
+        return lastOpenedText(app, now: now)
+    }
+
     static func lastOpenedText(_ app: InstalledApp, now: Date) -> String {
         if app.neverOpened { return "no record" }
         guard let d = app.lastOpened else { return "unknown" }
+        return relativeText(d, now: now)
+    }
+
+    private static func relativeText(_ d: Date, now: Date) -> String {
         let days = max(0, Int(now.timeIntervalSince(d) / 86400))
         if days < 1 { return "today" }
         if days == 1 { return "yesterday" }
@@ -125,7 +135,7 @@ enum AppsCommand {
             return
         }
         let rows = listed.map { a -> [String] in
-            [a.name, a.version ?? "", formatBytes(a.bundleBytes), formatBytes(a.dataBytes), lastOpenedText(a, now: now), flags(a), a.bundleID]
+            [a.name, a.version ?? "", formatBytes(a.bundleBytes), formatBytes(a.dataBytes), displayedOpenedText(a, now: now), flags(a), a.bundleID]
         }
         for line in renderTable([TableColumn(title: "Name"), TableColumn(title: "Version"), TableColumn(title: "App", align: .right),
                                  TableColumn(title: "Data", align: .right), TableColumn(title: "Last opened"), TableColumn(title: "Flags"),
@@ -137,7 +147,8 @@ enum AppsCommand {
         ctx.out(s.bold("\(listed.count) app\(listed.count == 1 ? "" : "s"), \(formatBytes(listed.reduce(0) { $0 + $1.reclaimBytes })) "
                        + "(apps plus the data they keep, caches the Cleanup screen already lists left out); \(removable) removable"))
         ctx.out(s.dim("`mac-cleaner apps <bundle-id>` shows the data an app keeps; `--clear-caches` and `--remove` act on it. "
-                      + "\"no record\": macOS has no launch date for the app (often simply unknown); \"unknown\": it could not say."))
+                      + "\"no record\": macOS has no launch date for the app (often simply unknown); \"unknown\": it could not say; "
+                      + "\"≈\": an estimate from the newest change in the app's own data files, never used by --unused."))
     }
 
     static func showDetail(_ app: InstalledApp, _ ctx: Context, now: Date) -> Int32 {
@@ -146,7 +157,7 @@ enum AppsCommand {
         ctx.out("  Path:         \(app.url.path)")
         ctx.out("  App size:     \(formatBytes(app.bundleBytes))")
         ctx.out("  Data kept:    \(formatBytes(app.dataBytes))  (caches \(formatBytes(app.cacheBytes)))")
-        ctx.out("  Last opened:  \(lastOpenedText(app, now: now))")
+        ctx.out("  Last opened:  \(displayedOpenedText(app, now: now))")
         let f = flags(app)
         if !f.isEmpty { ctx.out("  Flags:        \(f)") }
         if let token = app.homebrewCask { ctx.out("  Remove with:  brew uninstall --cask \(token)") }

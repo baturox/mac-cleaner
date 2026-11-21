@@ -137,6 +137,77 @@ final class AppDiscoveryTests: EngineTestCase {
         XCTAssertFalse(gamma.isAppStore)
     }
 
+    // MARK: Approximate activity
+
+    func testNewestActivityPicksTheLatestAndIgnoresFutureAndMissingDates() {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let old = now.addingTimeInterval(-90 * 86400), recent = now.addingTimeInterval(-5 * 86400)
+        XCTAssertEqual(AppCatalog.newestActivity([old, nil, recent], now: now), recent)
+        XCTAssertNil(AppCatalog.newestActivity([nil, nil], now: now))
+        XCTAssertNil(AppCatalog.newestActivity([], now: now))
+        XCTAssertEqual(AppCatalog.newestActivity([old, now.addingTimeInterval(400 * 86400)], now: now), old, "a clock-skewed file is no evidence")
+    }
+
+    private func setMtime(_ path: String, daysAgo: Double) throws {
+        let d = Date(timeIntervalSinceNow: -daysAgo * 86400)
+        try FileManager.default.setAttributes([.modificationDate: d], ofItemAtPath: path)
+    }
+
+    func testApproximateActivityIsTheNewestExactDataEntry() async throws {
+        let fx = try Fixture()
+        try fx.app("Alpha", id: "com.acme.alpha")
+        let cache = try fx.lib("Caches/com.acme.alpha")
+        let state = try fx.lib("Saved Application State/com.acme.alpha.savedState")
+        let prefs = try fx.libFile("Preferences/com.acme.alpha.plist")
+        try fx.lib("Caches/com.acme.alphabet")     // another id with the same prefix: must not count
+        let other = try fx.lib("Application Support/com.acme.alpha")   // not one of the four sources
+        try setMtime(cache, daysAgo: 200); try setMtime(state, daysAgo: 40); try setMtime(prefs, daysAgo: 120)
+        try setMtime(fx.library + "/Caches/com.acme.alphabet", daysAgo: 1); try setMtime(other, daysAgo: 0)
+        fx.env.lastUsed = { _ in .unknown }
+        let app = try await fx.firstApp()
+        XCTAssertNil(app.lastOpened)
+        let got = try XCTUnwrap(app.lastActivity)
+        XCTAssertEqual(got.timeIntervalSinceNow, -40 * 86400, accuracy: 120)
+    }
+
+    func testApproximateActivityNeedsAReverseDNSIdAndAnyDataAtAll() async throws {
+        let fx = try Fixture()
+        try fx.app("Solo", id: "Solo")
+        try fx.app("Bare", id: "com.acme.bare")
+        try fx.lib("Caches/Solo")
+        fx.env.lastUsed = { _ in .never }
+        let apps = await fx.found()
+        XCTAssertNil(try XCTUnwrap(apps.first { $0.bundleID == "Solo" }).lastActivity, "one-word ids are never matched")
+        XCTAssertNil(try XCTUnwrap(apps.first { $0.bundleID == "com.acme.bare" }).lastActivity, "no data, no estimate")
+    }
+
+    func testARealLaunchDateWinsAndTheEstimateNeverMakesAnAppNeverOpened() async throws {
+        let fx = try Fixture()
+        try fx.app("Alpha", id: "com.acme.alpha")
+        try fx.app("Beta", id: "com.acme.beta")
+        try fx.lib("Caches/com.acme.alpha"); try fx.lib("Caches/com.acme.beta")
+        let when = Date(timeIntervalSinceNow: -3 * 86400)
+        fx.env.lastUsed = { $0.hasSuffix("Alpha.app") ? .date(when) : .never }
+        let apps = await fx.found()
+        let alpha = try XCTUnwrap(apps.first { $0.bundleID == "com.acme.alpha" })
+        XCTAssertNotNil(alpha.lastOpened)
+        XCTAssertNil(alpha.lastActivity, "only set when Spotlight has no date")
+        let beta = try XCTUnwrap(apps.first { $0.bundleID == "com.acme.beta" })
+        XCTAssertNil(beta.lastOpened, "an estimate is never stored as a launch date")
+        XCTAssertNotNil(beta.lastActivity)
+        XCTAssertTrue(beta.neverOpened, "the Spotlight answer is kept as is")
+    }
+
+    func testARunningAppGetsNoActivityEstimate() async throws {
+        let fx = try Fixture()
+        let a = try fx.app("Alpha", id: "com.acme.alpha")
+        try fx.lib("Caches/com.acme.alpha")
+        fx.env.lastUsed = { _ in .unknown }
+        fx.env.runningExecutables = { [a] in [a + "/Contents/MacOS/Alpha"] }
+        let app = try await fx.firstApp()
+        XCTAssertNil(app.lastActivity)
+    }
+
     func testARunningAppIsNeverReportedAsNeverOpened() async throws {
         let fx = try Fixture()
         let a = try fx.app("Alpha", id: "com.acme.alpha")

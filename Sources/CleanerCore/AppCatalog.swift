@@ -223,6 +223,29 @@ enum AppCatalog {
         func path(_ folder: String, _ name: String) -> String { library + "/" + folder + "/" + name }
     }
 
+    // MARK: Approximate activity
+
+    /// The newest of `dates`, ignoring nil and anything more than a day after `now` (a clock-skewed file is no evidence).
+    static func newestActivity(_ dates: [Date?], now: Date = Date()) -> Date? {
+        dates.compactMap { $0 }.filter { $0 <= now.addingTimeInterval(86_400) }.max()
+    }
+
+    /// A rough "last activity" for an app Spotlight has no launch date for: the newest modification time among its
+    /// exact-bundle-id Preferences plist, Container, Caches and Saved Application State entries. Only for reverse-DNS
+    /// bundle ids (a vendor-only id would pick up a shared folder). One `lstat` per entry, read-only; symlinks are ignored.
+    static func approximateActivity(bundleID: String, index: LibraryIndex, now: Date = Date()) -> Date? {
+        guard isMatchableIdentifier(bundleID) else { return nil }
+        let wanted: [(folder: String, name: String)] = [
+            ("Preferences", bundleID + ".plist"), ("Containers", bundleID), ("Caches", bundleID),
+            ("Saved Application State", bundleID + ".savedState"),
+        ]
+        let dates: [Date?] = wanted.map { w in
+            guard let e = index.entry(w.folder, w.name), !e.isLink else { return nil }
+            return modificationDate(index.path(w.folder, w.name))
+        }
+        return newestActivity(dates, now: now)
+    }
+
     // MARK: Leftovers
 
     static func isSafeIdentifier(_ id: String) -> Bool {

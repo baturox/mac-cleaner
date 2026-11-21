@@ -294,6 +294,10 @@ public struct InstalledApp: Identifiable, Hashable, Sendable, Codable {
     public var lastOpened: Date?
     /// Spotlight knows the bundle and has no launch record for it. False when it simply could not tell.
     public var neverOpened: Bool
+    /// An ESTIMATE, set only when `lastOpened` is nil: the newest modification time among the app's exact-bundle-id data
+    /// (Preferences plist, Container, Caches, Saved Application State). It is not a launch date and never makes an app
+    /// count as unused in filters or suggestions.
+    public var lastActivity: Date?
     public var isRunning: Bool
     public var isAppStore: Bool
     /// Cask token when Homebrew installed it: removal is left to `brew uninstall --cask <token>`.
@@ -322,7 +326,8 @@ public struct InstalledApp: Identifiable, Hashable, Sendable, Codable {
     public init(url: URL, name: String, bundleID: String, version: String?, bundleBytes: Int64, lastOpened: Date?,
                 neverOpened: Bool = false, isRunning: Bool = false, isAppStore: Bool = false, homebrewCask: String? = nil,
                 removalBlock: AppRemovalBlock? = nil, device: Int64 = 0, inode: UInt64 = 0, leftovers: [AppLeftover] = [],
-                leftoverNote: String? = nil) {
+                leftoverNote: String? = nil, lastActivity: Date? = nil) {
+        self.lastActivity = lastActivity
         self.url = url; self.name = name; self.bundleID = bundleID; self.version = version; self.bundleBytes = bundleBytes
         self.lastOpened = lastOpened; self.neverOpened = neverOpened; self.isRunning = isRunning; self.isAppStore = isAppStore
         self.homebrewCask = homebrewCask; self.removalBlock = removalBlock; self.device = device; self.inode = inode

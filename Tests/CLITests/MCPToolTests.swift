@@ -311,7 +311,7 @@ final class MCPToolTests: XCTestCase {
         let cache = makeLeftover(s.home + "/Library/Caches/com.acme.one", size: 3_000_000)
         engine.apps = [
             makeApp("com.acme.one", name: "One", bundle: 500_000_000, leftovers: [cache], lastOpened: Date().addingTimeInterval(-200 * 86_400)),
-            makeApp("com.acme.two", name: "Two", bundle: 100_000_000, never: true),
+            makeApp("com.acme.two", name: "Two", bundle: 100_000_000, never: true, activity: Date().addingTimeInterval(-400 * 86_400)),
             makeApp("com.acme.three", name: "Three", bundle: 50_000_000, lastOpened: Date()),
             makeApp("com.apple.Four", name: "Four", bundle: 10_000_000, block: .apple),
         ]
@@ -326,6 +326,10 @@ final class MCPToolTests: XCTestCase {
         XCTAssertEqual(apps.first?["leftovers"]?.array?.first?["kind"]?.string, "cache")
         XCTAssertEqual(apps.first { $0["name"]?.string == "Four" }?["removable"]?.bool, false)
         XCTAssertEqual(apps.first { $0["name"]?.string == "Two" }?["never_opened"]?.bool, true)
+        let two = apps.first { $0["name"]?.string == "Two" }
+        XCTAssertNotNil(two?["last_activity_estimate"]?.string, "approximate and optional")
+        XCTAssertTrue(two?["last_opened"] == .null || two?["last_opened"] == nil)
+        XCTAssertNil(apps.first { $0["name"]?.string == "One" }?["last_activity_estimate"])
         let unused = await h.callTool("list_apps", ["unused_days": 90])
         XCTAssertEqual(Set((unused.structured?["apps"]?.array ?? []).compactMap { $0["name"]?.string }), ["One"], "an app without a launch record is not claimed to be unused")
         let paged = await h.callTool("list_apps", ["limit": 3])

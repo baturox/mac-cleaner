@@ -165,11 +165,12 @@ func makeClone(_ path: String, branch: String? = "main", linked: Bool = false, u
 }
 
 func makeApp(_ id: String, name: String? = nil, path: String? = nil, bundle: Int64 = 100_000_000, leftovers: [AppLeftover] = [],
-             lastOpened: Date? = nil, never: Bool = false, running: Bool = false, block: AppRemovalBlock? = nil, cask: String? = nil) -> InstalledApp {
+             lastOpened: Date? = nil, never: Bool = false, running: Bool = false, block: AppRemovalBlock? = nil, cask: String? = nil,
+             activity: Date? = nil) -> InstalledApp {
     let n = name ?? id
     return InstalledApp(url: URL(fileURLWithPath: path ?? "/Applications/\(n).app"), name: n, bundleID: id, version: "1.0", bundleBytes: bundle,
                         lastOpened: lastOpened, neverOpened: never, isRunning: running, homebrewCask: cask, removalBlock: block,
-                        device: 1, inode: 2, leftovers: leftovers)
+                        device: 1, inode: 2, leftovers: leftovers, lastActivity: activity)
 }
 
 func makeLeftover(_ path: String, kind: AppLeftoverKind = .cache, match: AppLeftoverMatch = .exact, size: Int64 = 1_000_000,

@@ -182,7 +182,7 @@ final class MCPTools: @unchecked Sendable {
                  ]) { a, _ in a }),
                  output: Self.out(["groups": ["type": "array"], "total_groups": ["type": "integer"], "has_more": ["type": "boolean"]]),
                  readOnly: true, destructive: false, idempotent: true),
-            tool("list_apps", "List installed apps", "Installed applications (.app bundles in /Applications, /Applications/Utilities and ~/Applications) with bundle size, the size of the data each keeps in the user's Library (caches, settings, data), when it was last opened (Spotlight; null when unknown) and whether it is running, from the App Store, from Homebrew or removable. Read-only; nothing here can remove an app." + n,
+            tool("list_apps", "List installed apps", "Installed applications (.app bundles in /Applications, /Applications/Utilities and ~/Applications) with bundle size, the size of the data each keeps in the user's Library (caches, settings, data), when it was last opened (Spotlight; null when unknown; when null, an optional last_activity_estimate may give the newest change time of the app's own data files, an estimate that is never used for unused_days) and whether it is running, from the App Store, from Homebrew or removable. Read-only; nothing here can remove an app." + n,
                  input: Self.schema(Self.paging.merging([
                     "unused_days": Self.p("integer", "Only apps not opened for at least this many days (apps macOS has no launch record for are left out).", extra: ["minimum": 0]),
                     "sort": Self.p("string", "size (default, app plus data), data, opened (oldest first) or name.", extra: ["enum": ["size", "data", "opened", "name"]]),
@@ -473,6 +473,8 @@ final class MCPTools: @unchecked Sendable {
             ]
             if let v = app.version { o["version"] = .string(MCPSanitizer.text(v, max: 60)) }
             o["last_opened"] = app.lastOpened.map { JSON.iso($0) } ?? .null
+            // Optional and approximate: only when there is no launch date. Never used by `unused_days`.
+            if app.lastOpened == nil, let d = app.lastActivity { o["last_activity_estimate"] = JSON.iso(d) }
             if let token = app.homebrewCask { o["homebrew_cask"] = .string(MCPSanitizer.text(token, max: 100)) }
             if let block = app.removalBlock { o["not_removable_reason"] = .string(block.message) }
             if withLeftovers {

@@ -47,6 +47,20 @@ final class AppsCommandTests: XCTestCase {
         XCTAssertEqual(Set(names), ["Acme", "Pages", "Brewed"], "no launch record means unknown, not unused")
     }
 
+    func testAnEstimatedActivityIsMarkedAndNeverCountsAsUnused() async {
+        let e = FakeEngine()
+        e.apps = [makeApp("com.acme.est", name: "Estimated", bundle: 50_000_000, never: true, activity: Date().addingTimeInterval(-400 * day)),
+                  makeApp("com.acme.old", name: "Old", bundle: 40_000_000, lastOpened: Date().addingTimeInterval(-400 * day))]
+        let list = await invoke(["apps"], engine: e)
+        XCTAssertTrue(list.out.contains("≈ 1 years ago") || list.out.contains("≈ 13 months ago"), list.out)
+        let unused = await invoke(["apps", "--unused", "90", "--json"], engine: e)
+        XCTAssertEqual(apps(from: unused.out).map { $0["name"] as? String ?? "" }, ["Old"], "an estimate is not a launch record")
+        let json = await invoke(["apps", "--json"], engine: e)
+        let est = apps(from: json.out).first { $0["name"] as? String == "Estimated" }
+        XCTAssertNotNil(est?["lastActivity"], json.out)
+        XCTAssertEqual(est?["lastOpenedText"] as? String, "no record", "the existing field keeps its meaning")
+    }
+
     func testSortKeys() async {
         func names(_ key: String) async -> [String] {
             let r = await invoke(["apps", "--sort", key, "--json"], engine: engineWithApps())
