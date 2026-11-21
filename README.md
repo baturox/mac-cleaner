@@ -112,6 +112,33 @@ scripts/install-cli.sh           # symlinks into /usr/local/bin or ~/.local/bin
 
 Or build only the CLI with `swift build -c release --product mac-cleaner` and run `.build/release/mac-cleaner`.
 
+## Updates
+
+The app can update itself in place. You never have to download anything by hand.
+
+**What is contacted.** Only GitHub, over HTTPS: `api.github.com` (one request to `releases/latest` of this repository) and, when you choose to install, `github.com` and the hosts GitHub redirects release downloads to (`objects.githubusercontent.com` and similar). The request is anonymous: no account, no cookies, no identifier, no version or system information, a generic `User-Agent`. Nothing else is ever contacted.
+
+**When.** About 12 seconds after launch and then at most once every 24 hours while the app runs, if *Settings > Updates > Automatically check for updates* is on (the default). *Mac Cleaner > Check for Updates…* checks right now and always tells you the outcome. Being offline or rate limited is ignored silently by the automatic check. The time of the last check and the version you skipped are stored in the app's preferences on your Mac.
+
+**What you see.** When a newer version exists, a window shows *current → new*, the release notes (plain text; only `https://github.com` links are clickable) and three choices: **Install Update**, **Later** (ask again at the next check) and **Skip This Version** (no automatic prompt for that version; *Check for Updates…* still offers it). Nothing is installed without your click. If a clean is running, the update waits for it to finish: it never installs or relaunches during a deletion.
+
+**What is verified before anything is replaced.**
+
+1. The release must be the newest *published* one, strictly newer than the running version (no downgrade, no reinstall), and its asset (`MacCleaner-<version>.zip`) must come from this repository's release of that tag.
+2. The download is size-capped while it arrives and must have exactly the size GitHub lists.
+3. Its SHA-256 must equal the one in the release's `SHA256SUMS`.
+4. It is unpacked into a private folder next to the app, and the new bundle must satisfy a code-signing requirement that is **compiled into the app**: Apple-anchored, a *Developer ID Application* certificate of Team `35MD9KJ7ZQ`, bundle identifier `io.github.baturox.mac-cleaner`, with every nested executable and all resources intact (strict validation, Security framework). Its version must equal the advertised one.
+5. macOS must accept it as **notarized** Developer ID software (`spctl --assess`).
+6. After the swap, what is now installed is verified again, and the old app is put back if anything fails.
+
+Then Mac Cleaner relaunches into the new version, shows *Updated to X*, and deletes the backup of the old version once the new one has been running for a few seconds. If the new version does not start within about a minute, the old one is put back and reopened.
+
+**When it refuses.** Development, ad-hoc or otherwise not Developer-ID-signed builds (including `swift run`) never update themselves. An app that runs from a disk image, from a read-only volume, from a translocated location (a quarantined app that was never moved) or from a folder you cannot write to is not updated either: the window says why and offers **Download manually**. Mac Cleaner never asks for an administrator password and has no privileged helper.
+
+**Turning it off.** *Settings > Updates > Automatically check for updates*. With it off, only *Check for Updates…* contacts GitHub. If you use Homebrew, `brew upgrade --cask mac-cleaner` works as before (the cask can declare `auto_updates true`). `mac-cleaner update --check` (exit code 0 up to date, 10 newer version exists, 1 check failed; `--json`) only reports; the command line tool is part of the app and is updated with it.
+
+The threat model and the residual risks are in [SECURITY.md](SECURITY.md#updater).
+
 ## Full Disk Access
 
 macOS hides parts of your home folder (Mail, Messages, Safari data, some app containers) from programs that have not been granted **Full Disk Access**. Without it, some sizes come out too small and some deletions fail with "operation not permitted". Mac Cleaner works without it, and the Overview tells you when it is missing.
@@ -146,6 +173,7 @@ mac-cleaner [command] [options]
   history    What Mac Cleaner deleted (the local audit log); `history clear` erases it
   mcp        MCP server on stdio for AI coding agents
   doctor     Explain the disk numbers and report the environment
+  update     Check whether a newer release exists (`update --check`; installing is done by the app)
 ```
 
 Global options: `--json`, `--no-color`, `--protect <path>`, `--version`, `-h/--help` (also `mac-cleaner help <command>`). Colors appear only on a terminal.
@@ -309,7 +337,7 @@ All documents carry `"schemaVersion": 1`; fields are only ever added within a sc
 Every clean, delete and clone removal made through the engine (the app, the CLI and the MCP server alike) is recorded in `~/Library/Application Support/MacCleaner/audit.jsonl`, unless you turned the history off. An operation writes two JSON lines with the same id: a *started* line with the items it is about to handle, written and flushed to disk **before anything is deleted**, and a *finished* line with what happened. If the second line is missing (the process crashed, was killed, or you pressed Ctrl-C twice), the operation is shown as **interrupted, outcome unknown**, with the items it intended to remove. An operation you stop (the Stop button, quitting the app during a clean, one Ctrl-C) still writes its finished line, marked `cancelled`; it is shown as **stopped**, not interrupted. A finished line holds the start and end time, who did it (`app`, `cli`, `mcp`) and the app version, the kind of operation, permanent or Trash, free space before and after, and for every item its path, name, category or build-folder kind, size, what was done (deleted, moved to the Trash, or the command that ran) and the outcome (`ok`, `failed`, `refused` with the reason). Newer finished lines also carry the number of entries removed and, per item, the allocated size counted while deleting (optional fields; older lines without them read the same). For clones it also records the remote, the branch, whether the copy was fully backed up and whether it was forced. A huge clean is capped at 5,000 listed items plus a count and size of the rest.
 
 - **The remembered last scan holds paths too.** `last-scan.json` (see above) lists the folders and working copies the last scan found. It is created readable by you only (mode 0600) in the same 0700 folder, never leaves your Mac, and is removed by *Clear history…* and `mac-cleaner history clear` (the next scan writes a new one).
-- **Paths are sensitive.** They can reveal project names, client names and what you work on. The file is created readable by you only (mode 0600); its folder is created with mode 0700, or set to 0700 the next time Mac Cleaner writes into it. It never leaves your Mac (this project contains no network code), and file *contents* are never recorded. If you share the machine, or export the history to send it somewhere, look at it first.
+- **Paths are sensitive.** They can reveal project names, client names and what you work on. The file is created readable by you only (mode 0600); its folder is created with mode 0700, or set to 0700 the next time Mac Cleaner writes into it. It never leaves your Mac (the only network use in this project is the update check, see [Updates](#updates)), and file *contents* are never recorded. If you share the machine, or export the history to send it somewhere, look at it first.
 - **You are in control.** *Clear history…* in the app and `mac-cleaner history clear` erase it (with confirmation). *Settings > General > Keep a history of what is deleted* turns recording off (default on); the setting lives in the shared settings file, so the CLI and the MCP server obey it too.
 - **The log cannot be deleted by the tool itself.** `~/Library/Application Support/MacCleaner` is on the built-in protected list.
 - **Robust and concurrent.** Records are appended under an advisory lock with one `write` per line and an `fsync`, so the app, the CLI and the MCP server can write at the same time; the log rotates at about 10 MB (`audit.jsonl` and `audit.1.jsonl`); a truncated or corrupt line is skipped (and counted) when reading. In the app and the CLI a failure to write the log does not stop or undo a deletion; it is reported with the result. The MCP server is stricter: it checks that the log can be written before it starts and deletes nothing if it cannot.
@@ -442,7 +470,7 @@ Mac Cleaner deletes files. These are the rules it follows, and the reasons you c
 - **Recent AI sessions are kept.** Session data newer than the retention period (default 30 days) is never offered.
 - **A local audit log.** Unless you turn it off, every deleting operation is recorded (paths, sizes, outcomes, who asked) in a file only you can read: first what it is about to do, before anything is deleted, then what happened. An operation that was cut short shows up as interrupted. If the log cannot be written, the app and the CLI say so in the result; the MCP server refuses to delete. See [History and privacy](#history-and-privacy).
 - **AI agents get less than you do.** The MCP server is read-only unless you start it with `--allow-clean`, and even then an agent can only plan and apply a cleanup of safe categories and idle projects' build folders, in two steps, with limits, and never name a path to delete; see [Use it from your AI agent](#use-it-from-your-ai-agent-mcp).
-- **No network access, no telemetry.** Mac Cleaner makes no network connections and sends nothing anywhere. It runs local tools (`du`, `git`, `docker`, `ollama`, `tmutil`, `diskutil`) for what it reports.
+- **No telemetry, one optional network use.** The only network connection Mac Cleaner makes is the update check (see [Updates](#updates)), which you can turn off; nothing about you or your Mac is sent. It runs local tools (`du`, `git`, `docker`, `ollama`, `tmutil`, `diskutil`) for what it reports.
 
 What this does **not** protect against is listed under "Known limitations" in [SECURITY.md](SECURITY.md): above all, another program already running as you can do anything Mac Cleaner can.
 

@@ -9,6 +9,9 @@
 #                                                      a non-universal build is an error)
 #   dist/SHA256SUMS
 #
+# The in-app updater (Sources/CleanerCore/Updates) installs from the .zip and checks it against SHA256SUMS: keep
+# the names MacCleaner-<version>.zip and SHA256SUMS, and keep the zip made from the stapled app.
+#
 # Notarization runs only when credentials are present AND the app was signed with a Developer ID
 # (CODESIGN_IDENTITY at build time):
 #   NOTARY_PROFILE                                    a keychain profile made with
@@ -19,7 +22,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
-case "${1:-}" in -h|--help) sed -n '2,18p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;; esac
+case "${1:-}" in -h|--help) sed -n '2,21p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;; esac
 
 VERSION="$(tr -d '[:space:]' < VERSION)"
 DIST="$ROOT/dist"

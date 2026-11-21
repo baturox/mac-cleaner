@@ -564,3 +564,57 @@ final class UpdateServiceTests: XCTestCase {
         XCTAssertEqual(t.requested.map(\.absoluteString), ["https://api.github.com/repos/baturox/mac-cleaner/releases/latest"])
     }
 }
+
+/// The whole stage + commit path with the REAL signature check, REAL Gatekeeper assessment, real ditto and the real
+/// atomic swap, on a copy of the installed release app (a stand-in for "the next release"). Skipped when the app is
+/// not installed. The installed app is only read; everything is written under a throw-away folder.
+final class UpdateRealBundleTests: XCTestCase {
+    /// Real verification of bundles; the running test process is not an app, so that one check is waived.
+    private struct WaivedRunning: BundleSignatureVerifying {
+        let real = SecurityBundleVerifier(config: .official)
+        func verifyBundle(at url: URL) throws { try real.verifyBundle(at: url) }
+        func verifyRunningApp() throws {}
+    }
+
+    func testRealReleaseAppSurvivesTheWholePipelineAndSwap() async throws {
+        let source = URL(fileURLWithPath: "/Applications/Mac Cleaner.app")
+        guard FileManager.default.fileExists(atPath: source.path) else { throw XCTSkip("Mac Cleaner is not installed") }
+        let plist = NSDictionary(contentsOf: source.appendingPathComponent("Contents/Info.plist"))
+        guard let version = plist?["CFBundleShortVersionString"] as? String, SemanticVersion(version) != nil else { throw XCTSkip("no version") }
+        do { try SecurityBundleVerifier(config: .official).verifyBundle(at: source) } catch { throw XCTSkip("not an official build") }
+
+        let s = try UpdateScratch()
+        let apps = try s.dir("Applications")
+        let installed = try makeFixtureApp(at: apps.appendingPathComponent("Mac Cleaner.app"), version: "0.0.1", marker: "old")
+        let copy = s.url("src/Mac Cleaner.app")
+        try FileManager.default.createDirectory(at: copy.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let ditto = Process(); ditto.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+        ditto.arguments = [source.path, copy.path]; try ditto.run(); ditto.waitUntilExit()
+        let zip = s.url("MacCleaner-\(version).zip")
+        try makeZip(of: copy, to: zip)
+        try FileManager.default.removeItem(at: copy.deletingLastPathComponent())
+        let data = try Data(contentsOf: zip)
+
+        let transport = FakeTransport()
+        let cfg = UpdateConfiguration.official
+        let tag = "v\(version)"
+        let zipURL = cfg.assetURL(tag: tag, name: "MacCleaner-\(version).zip")!
+        let sumsURL = cfg.assetURL(tag: tag, name: "SHA256SUMS")!
+        transport.files[zipURL] = data
+        transport.documents[sumsURL] = Data("\(try UpdateChecksums.sha256(of: zip))  MacCleaner-\(version).zip\n".utf8)
+        let offer = try ReleaseParser.parse(releaseJSON(tag: tag, assets: [
+            ("MacCleaner-\(version).zip", zipURL.absoluteString, Int64(data.count), "uploaded"),
+            ("SHA256SUMS", sumsURL.absoluteString, 100, "uploaded")]), config: cfg)
+        let installer = UpdateInstaller(config: cfg, transport: transport, signature: WaivedRunning(), gatekeeper: SpctlGatekeeper(),
+                                        pendingStore: PendingUpdateStore(directory: s.url("hist")))
+
+        let staged = try await installer.stage(offer: offer, runningVersion: "0.0.1", runningBundle: installed, progress: { _ in })
+        XCTAssertEqual(marker(of: installed), "old")
+        let done = try await installer.commit(staged)
+        // The installed path now holds the real signed app, and it still verifies there; the fixture is the backup.
+        XCTAssertNoThrow(try SecurityBundleVerifier(config: .official).verifyBundle(at: installed))
+        XCTAssertEqual(marker(of: URL(fileURLWithPath: done.pending.backupPath)), "old")
+        try installer.rollback(done)
+        XCTAssertEqual(marker(of: installed), "old", "rollback puts the previous app back")
+    }
+}

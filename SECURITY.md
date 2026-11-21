@@ -38,6 +38,7 @@ Treated as hostile input:
 - **Files the scanners parse**: simulator `device.plist`, Ollama manifests, editor `workspace.json`, tool
   version files, Docker's and `simctl`'s output.
 - **Environment variables** of the process that starts the app or CLI, as far as listed under property 19.
+- **Everything the updater receives**: the release description, the release notes, the checksum file, the downloaded archive and the app inside it, and the network path to GitHub (see "Updater").
 
 Not defended against (see "Known limitations"): code that is already running as the same user.
 
@@ -218,7 +219,7 @@ A repository's local configuration can make ordinary read-only git commands run 
 25. Everything is listed and confirmed before deletion; `--dry-run` shows the plan and changes nothing. Text
     printed by the CLI has control characters and escape sequences from file names and labels replaced. The
     mock engine and the `MACCLEANER_*` environment hooks used for screenshots exist in debug builds only. The
-    app and CLI make no network connections and send no telemetry.
+    app and CLI send no telemetry; the only network use is the update check and install (see "Updater").
 
 ## MCP server (`mac-cleaner mcp`)
 
@@ -280,6 +281,82 @@ plan) can be adversarial, and that the model's judgment is not a security bounda
 running as the same user can read, edit or delete it (see "Same-user attackers"): it is an aid for the user,
 not tamper-proof evidence.
 
+## Updater
+
+The app can replace itself with a newer release (`Sources/CleanerCore/Updates/`). This is the one place where
+Mac Cleaner downloads and runs code, so it is built to need no trust in the network.
+
+**What is trusted.** Only constants compiled into the app: the repository (`baturox/mac-cleaner`), the Apple Team
+ID (`35MD9KJ7ZQ`), the bundle identifier, the asset name pattern and the size caps. Nothing is read from the
+network or from the download to decide what to accept. The release JSON only says which version is newest and
+where its files are.
+
+**Checks, in order** (all must pass; any failure discards the download and leaves the installed app untouched):
+
+1. The running app must itself satisfy the Developer ID requirement (a development, ad-hoc or unsigned build
+   never updates itself, so it cannot be tricked into replacing itself).
+2. Strict semantic version comparison: the offered version must be strictly greater than the running one; drafts,
+   prereleases and malformed tags are ignored.
+3. Transport: HTTPS only, default system trust evaluation, no cookies or credentials, generic `User-Agent`.
+   Requests start at `api.github.com` or `github.com`; redirects are followed only to GitHub's own hosts and its
+   release-asset hosts (`objects.githubusercontent.com`, `release-assets.githubusercontent.com`,
+   `github-releases.githubusercontent.com`), at most five, never from HTTPS to anything else. The asset URL must
+   equal `https://github.com/baturox/mac-cleaner/releases/download/<tag>/MacCleaner-<version>.zip` exactly.
+4. The download is capped (120 MB) while it streams and must match the size the release lists; the archive's
+   declared expanded size is capped (400 MB); it must contain exactly one app bundle with the expected name.
+5. SHA-256 equals the entry in the release's `SHA256SUMS`.
+6. Signature: `SecStaticCodeCheckValidityWithErrors` with all-architectures, nested-code and strict validation,
+   against `anchor apple generic and identifier "<bundle id>" and certificate leaf[subject.OU] = "<team>" and
+   certificate 1[field.1.2.840.113635.100.6.2.6] and certificate leaf[field.1.2.840.113635.100.6.1.13]`;
+   then bundle identifier and `CFBundleShortVersionString` must match (id: ours; version: the advertised one).
+7. Gatekeeper: `spctl --assess --type execute` must accept it and report `source=Notarized Developer ID`.
+
+**No gap between checking and using.** The archive is unpacked into a private folder (`mkdtemp`, mode 0700,
+a sibling of the installed app so the final step is a rename on one volume). The bundle is moved to `new.app`
+there and verified **at that path**; the same directory is then swapped with the installed app in one atomic
+`renamex_np(RENAME_SWAP)` (two renames with rollback where the volume lacks it). The signature is checked once
+more right before the swap and again on the installed path right after it; a failure swaps the old app back.
+Nothing is copied between verification and use, and nothing is launched before it passed.
+
+**Where it works.** Only for an app in a folder the user can write to: not from a disk image, a read-only
+volume, an App Translocation path, a symlink or a folder the user cannot change. Then it refuses and offers a
+manual download. It never asks for administrator rights and has no privileged helper.
+
+**Relaunch and rollback.** After the swap the old app sits in the private folder as a backup. A detached
+`/bin/sh` helper is started with fixed positional arguments (nothing is interpolated into the script): it waits
+for the old process to exit, opens the new app, and if the new app has not written its acknowledgement within
+about a minute, moves the failed app aside, puts the backup back and opens it. The new app deletes the backup
+(and the record `pending-update.json`) a few seconds after it started. Only folders named `.MacCleaner-update-*`
+that sit next to the app, are real directories (not links) and belong to the user are ever deleted.
+
+**Quarantine.** Files fetched by the app carry no quarantine flag and the updater never removes one from
+anything. The new app is launched only after the checks above, including the Gatekeeper assessment.
+
+**No deletion without a stop.** An update never installs or relaunches while a clean or delete runs (or while the
+confirmation for one is open); it waits. Once the swap may start, new cleans are refused until the app quits.
+
+**What is recorded.** Update attempts (from version, to version, result) go to `updates.jsonl` next to the audit
+log, mode 0600, last 200 entries. No identifier is sent anywhere and nothing is collected.
+
+**Residual risks (not fixed):**
+
+- A process running as the same user can modify the staged bundle between verification and the swap, or the
+  installed app at any time. The re-verification right before the swap and the verification of the installed path
+  right after it narrow the first window; they cannot close it (the same attacker could simply edit the app).
+- A compromise of the GitHub account or of the signing identity is not detected: the checksum file is published
+  next to the download, so it protects against corruption and a tampering CDN, not against the publisher. The
+  signature and notarization checks bind the release to the Developer ID key, not to a particular build.
+- Revocation: Gatekeeper's assessment may consult Apple's revocation data; the Security framework check itself
+  does not require network access, so a certificate revoked very recently may be accepted while offline.
+- A downgrade or replay by an attacker who controls the network is refused (strictly newer only, TLS, host
+  allowlist), but a user-visible "no update" can be forced by blocking GitHub (a denial of service, not a
+  compromise).
+- If the app is quit while an update is being downloaded, its private staging folder (a few MB) can remain; it is
+  removed at a later launch once it is a day old.
+- The rollback helper decides by a missing acknowledgement file. A new version that starts but takes longer than a
+  minute to run its first lines would be rolled back although it works; the old version is then simply back.
+- The release notes are untrusted text shown as plain text; only `https://github.com` links are clickable.
+
 ## Release process
 
 - The release workflow has two jobs. The first has `contents: read` and no secrets: it builds, tests and
@@ -303,7 +380,8 @@ close one.
   Developer ID and notarized; signed with a Developer ID but not notarized; or ad-hoc signed (macOS cannot
   tell who built it). Unless they say "notarized", Gatekeeper has to be bypassed on first launch.
 - **Checksums without provenance.** `SHA256SUMS` is published next to the downloads by the same workflow, so
-  it detects a corrupted download, not a compromised release. There is no signed build attestation yet.
+  it detects a corrupted download, not a compromised release. There is no signed build attestation yet. The
+  in-app updater adds the Developer ID signature and notarization checks on top (see "Updater").
 - **Secrets on command lines in the release workflow.** `security` only accepts passwords as arguments. The
   certificate password (`security import -P`) and the temporary keychain's random password
   (`create-keychain`, `unlock-keychain`, `set-key-partition-list`) are visible in the process list of the
