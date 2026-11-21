@@ -16,6 +16,7 @@ All notable changes to this project are documented here. The format is based on
 - The result sheet counts done / failed / skipped items and lists each one that was not removed with its reason. A stopped run reads "Stopped — 14 of 40 items removed".
 - Engine API (additive): `CleanItemEvent`, `CleanItemState` and `CleanItemReason` (typed reasons instead of message text), `CleanerEngine.clean(...itemEvents:)` and `delete(...itemEvents:)` (one event per item when it is queued, starts and ends; never per file), `CleanResult.items`, `DeleteProgress.phase` (`removing` or `command(name)`) and `displayFraction`. The mock engine emits the same events. `--json` output is unchanged.
 - CLI on a terminal: the progress line shows the amount of the total, the time left, and what a running command is, and a clean ends with a list of the items that failed or were skipped and why. Piped output keeps its shape.
+- **Apps: approximate "last activity".** When Spotlight has no launch date, the Apps screen shows `≈ <date>`, the newest change time among the app's own data files (Preferences plist, Container, Caches, Saved Application State; reverse-DNS bundle ids only, read-only, no new permissions), with a tooltip saying it is an estimate. It never counts an app as unused. Additive fields: `InstalledApp.lastActivity` (in `apps --json`, under `app`) and `last_activity_estimate` in the MCP `list_apps` result; `mac-cleaner apps` prefixes it with `≈`.
 
 ### Changed
 
@@ -23,6 +24,8 @@ All notable changes to this project are documented here. The format is based on
 - Fewer git processes per working copy: one `git status --porcelain=v2 --branch` gives the branch and the changes together, the stash is read from the ref files, and the second pass for ignored files is skipped when nothing could ignore a file (no `.gitignore`, no `info/exclude`, no global ignore file). Up to 8 git processes run at once (4 when the machine is busy), at low priority. Anything unclear still counts as "not backed up".
 - A copy cannot be selected, allowed or removed while its row is a placeholder; nothing about git state is remembered between scans, and every removal still re-inspects the copy right before acting.
 - Quitting the app while an update is being swapped in now waits (up to 3 minutes) for the swap and its checks to finish, instead of ending the process half way.
+- Apps: the column is now "Last used", fits at the default window width (it was clipped), and "unknown" and "no record" are one label, "no record" (the tooltip says what is known). The README now opens with the pitch, a screenshot, a three-line install block, a short comparison table and a refreshed screenshot set (mock data).
+- Repos: the "Allow removal" checkbox and the size column no longer shift from row to row.
 
 ### Added (diagnostics)
 
